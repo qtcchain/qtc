@@ -1,0 +1,141 @@
+// Copyright (c) 2026 The QTC developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#include <shielded/note.h>
+
+#include <consensus/amount.h>
+#include <crypto/common.h>
+#include <crypto/sha256.h>
+#include <shielded/lattice/polyvec.h>
+#include <shielded/ringct/proof_encoding.h>
+#include <streams.h>
+#include <support/cleanse.h>
+
+#include <algorithm>
+#include <ios>
+
+namespace lattice = shielded::lattice;
+
+namespace {
+constexpr const char* NOTE_TAG_INNER{"QTC_Note_Inner_V1"};
+constexpr const char* NOTE_TAG_COMMIT{"QTC_Note_Commit_V1"};
+constexpr const char* NOTE_TAG_COMMIT_V2{"QTC_Note_Commit_V2"};
+constexpr const char* NOTE_TAG_NULLIFIER{"QTC_Note_Nullifier_V1"};
+constexpr std::array<unsigned char, 8> NOTE_MODERN_RHO_MARKER{{'S', 'M', '2', 'R', 'H', 'O', 'V', '2'}};
+constexpr std::array<unsigned char, 8> NOTE_MODERN_RCM_MARKER{{'S', 'M', '2', 'R', 'C', 'M', 'V', '2'}};
+} // namespace
+
+uint256 ShieldedNote::GetCommitment() const
+{
+    // inner = SHA256("QTC_Note_Inner_V1" || LE64(value) || pk_hash)
+    unsigned char value_le[8];
+    WriteLE64(value_le, static_cast<uint64_t>(value));
+
+    uint256 inner;
+    CSHA256()
+        .Write(reinterpret_cast<const unsigned char*>(NOTE_TAG_INNER), sizeof("QTC_Note_Inner_V1") - 1)
+        .Write(value_le, sizeof(value_le))
+        .Write(recipient_pk_hash.begin(), uint256::size())
+        .Finalize(inner.begin());
+
+    if (spend_anchor.empty()) {
+        // Legacy v1: cm = SHA256("QTC_Note_Commit_V1" || inner || rho || rcm).
+        // This path is byte-identical to the original commitment.
+        uint256 cm;
+        CSHA256()
+            .Write(reinterpret_cast<const unsigned char*>(NOTE_TAG_COMMIT), sizeof("QTC_Note_Commit_V1") - 1)
+            .Write(inner.begin(), uint256::size())
+            .Write(rho.begin(), uint256::size())
+            .Write(rcm.begin(), uint256::size())
+            .Finalize(cm.begin());
+        return cm;
+    }
+
+    // v2: bind the spend anchor into the commitment so the ring-member anchor a
+    // spender presents is consensus-fixed by the note (closes the anchor-swap gap).
+    //   anchor_hash = SHA256(spend_anchor)
+    //   cm = SHA256("QTC_Note_Commit_V2" || inner || rho || rcm || anchor_hash)
+    uint256 anchor_hash;
+    CSHA256()
+        .Write(spend_anchor.data(), spend_anchor.size())
+        .Finalize(anchor_hash.begin());
+
+    uint256 cm;
+    CSHA256()
+        .Write(reinterpret_cast<const unsigned char*>(NOTE_TAG_COMMIT_V2), sizeof("QTC_Note_Commit_V2") - 1)
+        .Write(inner.begin(), uint256::size())
+        .Write(rho.begin(), uint256::size())
+        .Write(rcm.begin(), uint256::size())
+        .Write(anchor_hash.begin(), uint256::size())
+        .Finalize(cm.begin());
+    return cm;
+}
+
+uint256 ShieldedNote::GetNullifier(Span<const unsigned char> spending_key) const
+{
+    const uint256 cm{GetCommitment()};
+
+    uint256 nf;
+    // Use an explicit hasher so we can cleanse internal state after processing
+    // spending key material (defense-in-depth against stack residue).
+    CSHA256 hasher;
+    hasher.Write(reinterpret_cast<const unsigned char*>(NOTE_TAG_NULLIFIER), sizeof("QTC_Note_Nullifier_V1") - 1)
+          .Write(spending_key.data(), spending_key.size())
+          .Write(rho.begin(), uint256::size())
+          .Write(cm.begin(), uint256::size())
+          .Finalize(nf.begin());
+    memory_cleanse(&hasher, sizeof(hasher));
+    return nf;
+}
+
+bool ShieldedNote::IsValid() const
+{
+    if (!MoneyRange(value)) return false;
+    if (recipient_pk_hash.IsNull()) return false;
+    if (rho.IsNull()) return false;
+    if (rcm.IsNull()) return false;
+    if (memo.size() > MAX_SHIELDED_MEMO_SIZE) return false;
+    if (!spend_anchor.empty()) {
+        if (spend_anchor.size() > MAX_SHIELDED_SPEND_ANCHOR_SIZE) return false;
+        lattice::PolyVec anchor;
+        if (!GetNoteSpendAnchor(*this, anchor)) return false;
+    }
+    return true;
+}
+
+bool UsesModernShieldedNoteDerivation(const ShieldedNote& note)
+{
+    return std::equal(NOTE_MODERN_RHO_MARKER.begin(), NOTE_MODERN_RHO_MARKER.end(), note.rho.begin()) &&
+           std::equal(NOTE_MODERN_RCM_MARKER.begin(), NOTE_MODERN_RCM_MARKER.end(), note.rcm.begin());
+}
+
+void MarkShieldedNoteForModernDerivation(ShieldedNote& note)
+{
+    std::copy(NOTE_MODERN_RHO_MARKER.begin(), NOTE_MODERN_RHO_MARKER.end(), note.rho.begin());
+    std::copy(NOTE_MODERN_RCM_MARKER.begin(), NOTE_MODERN_RCM_MARKER.end(), note.rcm.begin());
+}
+
+void SetNoteSpendAnchor(ShieldedNote& note, const lattice::PolyVec& anchor)
+{
+    // Serialize the anchor with the same fixed mod-q encoding used for anchors /
+    // key-images on the ring-signature path, so the bytes are canonical.
+    MarkShieldedNoteForModernDerivation(note);
+    DataStream ss;
+    shielded::ringct::SerializePolyVecModQ23(ss, anchor, "SetNoteSpendAnchor");
+    const auto bytes = MakeUCharSpan(ss);
+    note.spend_anchor.assign(bytes.begin(), bytes.end());
+}
+
+bool GetNoteSpendAnchor(const ShieldedNote& note, lattice::PolyVec& out_anchor)
+{
+    if (note.spend_anchor.empty()) return false; // legacy / no anchor
+    try {
+        DataStream ss{note.spend_anchor};
+        shielded::ringct::UnserializePolyVecModQ23(ss, out_anchor, "GetNoteSpendAnchor");
+        if (!ss.empty()) return false; // trailing garbage => malformed
+    } catch (const std::ios_base::failure&) {
+        return false;
+    }
+    return lattice::IsValidPolyVec(out_anchor) && out_anchor.size() == lattice::MODULE_RANK;
+}

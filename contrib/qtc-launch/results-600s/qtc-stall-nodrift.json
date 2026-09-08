@@ -1,0 +1,33 @@
+{
+ "variant": "nodrift",
+ "floor": "03ffff0000000000000000000000000000000000000000000000000000000000",
+ "floor_bits": "0x2003ffff",
+ "blocks": 2024,
+ "tighten": 864,
+ "stall_halflives": 6.0,
+ "post": 1100,
+ "pre_stall_log2": -2.9992,
+ "first_poststall": {
+  "phase": "P3_poststall",
+  "height": 896,
+  "time": 1297743402,
+  "mediantime": 1296706745,
+  "dt_prev": 0,
+  "time_minus_prev_mtp": 1036657,
+  "mocktime": 1297743402,
+  "bits": "0x2003ffff",
+  "log2_ratio_obs": 0.0,
+  "log2_ratio_expected": 0.0,
+  "model_err": 0.0,
+  "above_floor": false,
+  "wall_s": 0.064
+ },
+ "floor_reached_at": 896,
+ "blocks_at_floor": 863,
+ "final_log2": -0.82173,
+ "max_model_err": 0.000195,
+ "any_above_floor": false,
+ "failures": [],
+ "wall_s": 233,
+ "csv": "/Users/gavinwhyte/Documents/btx/qtc-chain/contrib/qtc-launch/results-600s/qtc-stall-nodrift.csv"
+}

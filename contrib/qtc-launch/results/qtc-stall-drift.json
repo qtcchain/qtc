@@ -1,0 +1,33 @@
+{
+ "variant": "drift",
+ "floor": "03ffff0000000000000000000000000000000000000000000000000000000000",
+ "floor_bits": "0x2003ffff",
+ "blocks": 1140,
+ "tighten": 480,
+ "stall_halflives": 6.0,
+ "post": 600,
+ "pre_stall_log2": -2.9945,
+ "first_poststall": {
+  "phase": "P3_poststall",
+  "height": 512,
+  "time": 1296694981,
+  "mediantime": 1296691381,
+  "dt_prev": 0,
+  "time_minus_prev_mtp": 3600,
+  "mocktime": 1296777702,
+  "bits": "0x2000977c",
+  "log2_ratio_obs": -2.75697,
+  "log2_ratio_expected": -2.75704,
+  "model_err": 7.4e-05,
+  "above_floor": false,
+  "wall_s": 0.165
+ },
+ "floor_reached_at": 590,
+ "blocks_at_floor": 396,
+ "final_log2": -0.75093,
+ "max_model_err": 0.000183,
+ "any_above_floor": false,
+ "failures": [],
+ "wall_s": 115,
+ "csv": "contrib/qtc-launch/results/qtc-stall-drift.csv"
+}

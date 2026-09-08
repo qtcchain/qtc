@@ -1,0 +1,123 @@
+// Copyright (c) 2026 The QTC developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#include <chainparams.h>
+#include <common/args.h>
+#include <consensus/amount.h>
+#include <primitives/block.h>
+#include <test/util/setup_common.h>
+#include <util/chaintype.h>
+#include <validation.h>
+
+#include <boost/test/unit_test.hpp>
+
+#include <limits>
+
+#include <cstdint>
+
+BOOST_FIXTURE_TEST_SUITE(matmul_subsidy_tests, BasicTestingSetup)
+
+BOOST_AUTO_TEST_CASE(subsidy_height_0_is_20)
+{
+    const auto params = CreateChainParams(ArgsManager{}, ChainType::MAIN)->GetConsensus();
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(0, params), 50 * COIN);
+}
+
+BOOST_AUTO_TEST_CASE(subsidy_halves_at_525k)
+{
+    const auto params = CreateChainParams(ArgsManager{}, ChainType::MAIN)->GetConsensus();
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(209'999, params), 50 * COIN);
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(210'000, params), 25 * COIN);
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(419'999, params), 25 * COIN);
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(420'000, params), CAmount{1'250'000'000});
+}
+
+BOOST_AUTO_TEST_CASE(subsidy_zero_after_64_halvings)
+{
+    const auto params = CreateChainParams(ArgsManager{}, ChainType::MAIN)->GetConsensus();
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(210'000 * 64, params), 0);
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(210'000 * 100, params), 0);
+}
+
+BOOST_AUTO_TEST_CASE(subsidy_first_50k_blocks_total_is_2_5m)
+{
+    const auto params = CreateChainParams(ArgsManager{}, ChainType::MAIN)->GetConsensus();
+    CAmount total{0};
+    for (int h = 0; h < 50'000; ++h) {
+        total += GetBlockSubsidy(h, params);
+    }
+    BOOST_CHECK_EQUAL(total, 2'500'000 * COIN); // 50,000 blocks x 50 coins (Bitcoin's schedule)
+}
+
+BOOST_AUTO_TEST_CASE(max_supply_never_exceeded)
+{
+    const auto params = CreateChainParams(ArgsManager{}, ChainType::MAIN)->GetConsensus();
+    CAmount total{0};
+    for (int halving = 0; halving < 64; ++halving) {
+        total += (params.nInitialSubsidy >> halving) * params.nSubsidyHalvingInterval;
+    }
+    BOOST_CHECK(total <= 21'000'000 * COIN);
+    BOOST_CHECK(total > 20'999'999 * COIN);
+}
+
+BOOST_AUTO_TEST_CASE(empty_block_subsidy_caps_activate_at_130k_strict_at_130500_and_end_at_132k)
+{
+    // QTC D8: QTC's penalty window (130,000 / strict 130,500 / rolled back at
+    // 132,000) is never active on QTC mainnet; the schedule is exercised on a copy.
+    auto params = CreateChainParams(ArgsManager{}, ChainType::MAIN)->GetConsensus();
+    BOOST_CHECK_EQUAL(params.nEmptyBlockSubsidyPenaltyHeight, std::numeric_limits<int32_t>::max());
+    BOOST_CHECK_EQUAL(params.nEmptyBlockSubsidyStrictPenaltyHeight, std::numeric_limits<int32_t>::max());
+    BOOST_CHECK_EQUAL(params.nEmptyBlockSubsidyPenaltyEndHeight, std::numeric_limits<int32_t>::max());
+    params.nEmptyBlockSubsidyPenaltyHeight = 130'000;
+    params.nEmptyBlockSubsidyStrictPenaltyHeight = 130'500;
+    params.nEmptyBlockSubsidyPenaltyEndHeight = 132'000;
+    BOOST_CHECK_EQUAL(params.nEmptyBlockSubsidyMaxHalvings, 2);
+
+    CBlock empty_block;
+    empty_block.vtx.resize(1);
+    CBlock non_empty_block;
+    non_empty_block.vtx.resize(2);
+
+    CBlockIndex non_empty_prev;
+    non_empty_prev.nTx = 2;
+    BOOST_CHECK_EQUAL(GetBlockSubsidyForBlock(129'999, empty_block, &non_empty_prev, params), 50 * COIN);
+    BOOST_CHECK_EQUAL(GetBlockSubsidyForBlock(130'000, non_empty_block, &non_empty_prev, params), 50 * COIN);
+    BOOST_CHECK_EQUAL(GetBlockSubsidyForBlock(130'000, empty_block, &non_empty_prev, params), 25 * COIN);
+
+    CBlockIndex first_empty_prev;
+    first_empty_prev.nTx = 1;
+    first_empty_prev.pprev = &non_empty_prev;
+    BOOST_CHECK_EQUAL(GetBlockSubsidyForBlock(130'001, empty_block, &first_empty_prev, params), CAmount{1'250'000'000});
+
+    CBlockIndex second_empty_prev;
+    second_empty_prev.nTx = 1;
+    second_empty_prev.pprev = &first_empty_prev;
+    BOOST_CHECK_EQUAL(GetBlockSubsidyForBlock(130'002, empty_block, &second_empty_prev, params), CAmount{1'250'000'000});
+
+    CBlockIndex third_empty_prev;
+    third_empty_prev.nTx = 1;
+    third_empty_prev.pprev = &second_empty_prev;
+    BOOST_CHECK_EQUAL(GetBlockSubsidyForBlock(130'003, empty_block, &third_empty_prev, params), CAmount{1'250'000'000});
+    BOOST_CHECK_EQUAL(GetBlockSubsidyForBlock(130'004, non_empty_block, &third_empty_prev, params), 50 * COIN);
+
+    BOOST_CHECK_EQUAL(GetBlockSubsidyForBlock(130'500, empty_block, &non_empty_prev, params), 25 * COIN);
+    BOOST_CHECK_EQUAL(GetBlockSubsidyForBlock(130'501, empty_block, &first_empty_prev, params), CAmount{1'250'000'000});
+    BOOST_CHECK_EQUAL(GetBlockSubsidyForBlock(130'502, empty_block, &second_empty_prev, params), CAmount{1'250'000'000});
+    BOOST_CHECK_EQUAL(GetBlockSubsidyForBlock(130'503, empty_block, &third_empty_prev, params), CAmount{1'250'000'000});
+    BOOST_CHECK_EQUAL(GetBlockSubsidyForBlock(130'504, non_empty_block, &third_empty_prev, params), 50 * COIN);
+
+    BOOST_CHECK_EQUAL(GetBlockSubsidyForBlock(131'999, empty_block, &third_empty_prev, params), CAmount{1'250'000'000});
+    BOOST_CHECK_EQUAL(GetBlockSubsidyForBlock(132'000, empty_block, &third_empty_prev, params), 50 * COIN);
+    BOOST_CHECK_EQUAL(GetBlockSubsidyForBlock(132'000, empty_block, &non_empty_prev, params), 50 * COIN);
+}
+
+BOOST_AUTO_TEST_CASE(money_range_enforces_cap)
+{
+    BOOST_CHECK(MoneyRange(21'000'000 * COIN));
+    BOOST_CHECK(!MoneyRange(21'000'001 * COIN));
+    BOOST_CHECK(!MoneyRange(-1));
+    BOOST_CHECK(MoneyRange(0));
+}
+
+BOOST_AUTO_TEST_SUITE_END()

@@ -1,0 +1,325 @@
+# QTC Fast-Start Validating Nodes
+
+This directory contains the first-run bootstrap wrapper for operators who want
+to:
+
+1. fetch the latest matching snapshot for a chain,
+2. load it with `loadtxoutset`,
+3. keep an eye on background validation with `getchainstates`.
+
+The scripts are intentionally small and composable. They do not try to invent a
+canonical snapshot distribution system for QTC. Instead, they support either:
+
+- a direct `--snapshot-url` plus `--snapshot-sha256`, or
+- a JSON manifest that maps each chain name to the published snapshot metadata, or
+- the compact per-release `snapshot.manifest.json` emitted by
+  `contrib/devtools/generate_assumeutxo.py`.
+
+For release installs, use the latest snapshot bundle published with the same
+QTC release as the binary. The compact manifest records `snapshot_file_version`
+for troubleshooting; the wrapper and `loadtxoutset` read the snapshot file
+directly and do not require operators to choose a snapshot format manually.
+
+Entry points
+
+- `qtc-agent-setup.py` installs the right published binary archive for the
+  current platform from a GitHub release bundle and can immediately hand off to
+  the fast-start bootstrap flow.
+- `miner-faststart.sh` starts the bootstrap flow with the miner-oriented preset.
+- `service-faststart.sh` starts the bootstrap flow with the service-oriented preset.
+- `qtc-faststart.py` is the shared orchestrator and can be called directly.
+
+Current support matrix
+
+- `main`: supported with compiled assumeutxo metadata and published release snapshots
+- `regtest`: supported for default-consensus dev/test flows
+- `testnet`, `testnet4`, `signet`: unsupported for fast-start until `src/kernel/chainparams.cpp` gains real assumeutxo entries for those chains
+
+For a detailed from-scratch mining-node procedure using generic `/var/qtc/`
+paths, see [QTC Mining Node Snapshot Runbook](../../doc/qtc-mining-node-snapshot-runbook.md).
+
+Presets
+
+- `miner` keeps the node in a compact, mining-friendly state:
+  `prune=4096`, `blockfilterindex=1`, `coinstatsindex=1`,
+  `retainshieldedcommitmentindex=1`, and conservative outbound-peer floors for
+  mining.
+- `service` keeps the node in a service-oriented state:
+  `prune=0`, `txindex=1`, `blockfilterindex=1`, `coinstatsindex=1`, and
+  `retainshieldedcommitmentindex=1`.
+
+QTC now treats retained shielded commitment indexing as the normal
+operator-facing posture because it keeps restart and snapshot recovery fast for
+wallet, mining, and service users. The fast-start presets still write
+`retainshieldedcommitmentindex=1` explicitly so the generated config remains
+clear and portable; use `retainshieldedcommitmentindex=0` only if you
+intentionally want the slower externalized path.
+
+The recommended miner fast-start config shape is:
+
+```ini
+server=1
+listen=1
+rpcbind=127.0.0.1
+rpcallowip=127.0.0.1
+dnsseed=1
+fixedseeds=1
+addnode=node.qtc.dev:19335
+addnode=node.qtcchain.org:19335
+addnode=node.qtc.tools:19335
+prune=4096
+blockfilterindex=1
+coinstatsindex=1
+# keep shielded commitment index on disk (faster restart; default).
+retainshieldedcommitmentindex=1
+# chain guard reports mining risk and self-heals peers; it does not stop work.
+miningchainguard=1
+miningminoutboundpeers=0
+miningminsyncedoutboundpeers=0
+miningmaxheaderlag=8
+```
+
+Use DNS names rather than hard-coded peer IP addresses in configs and runbooks.
+Peer IPs can change or disappear; DNS bootstrap names can be updated without
+requiring every miner to edit local config. Use all three public bootstrap DNS
+names so honest miners converge on the same peer fabric quickly. Avoid
+`connect=`-only production mining topologies because they bypass normal peer
+diversity and can increase stale block risk. Mining-chain guard keeps honest
+miners working through fork-risk warnings, IBD, network-disabled, no-tip, and
+local-behind-peer-median states. Those states are reported through mining RPCs
+and trigger peer recovery where possible instead of turning unattended miners
+off.
+
+For horizontally scaled service gateways, add
+`--matmul-service-challenge-file=/shared/path/matmul_service_challenges.dat`
+so every issuer/redeemer node points at the same shared challenge registry.
+
+The wrapper writes its generated config and downloaded snapshot under
+`<datadir>/faststart/`, so the workflow is isolated from an operator's existing
+`qtc.conf`.
+
+By default `qtc-agent-setup.py` keeps its download cache in a sibling
+`<install-dir>-agent-setup-cache` directory so the extracted install tree stays
+clean. Pass `--cache-dir` if you want that cache somewhere else.
+
+Published release bundles should also include `qtc-release-manifest.json`.
+That manifest advertises `platform_assets`, which map the release archives for
+Linux/macOS/Windows to stable platform ids such as `linux-x86_64` and
+`macos-arm64`. Linux CUDA release archives use the explicit ids
+`linux-x86_64-cuda12` and `linux-x86_64-cuda13`; see
+[`doc/linux-release-builds.md`](../../doc/linux-release-builds.md) for the
+hardware and driver matrix. `qtc-agent-setup.py` consumes that manifest so
+binary users can install the right archive without hard-coding filenames. For
+remote release URLs, the installer now treats `SHA256SUMS` as the source of
+truth for the manifest, archive, and snapshot-manifest hashes, and it verifies
+`SHA256SUMS.asc` when the release advertises one. Use
+`--allow-unsigned-release` only for intentionally unsigned test bundles.
+If the GitHub repository or release is private, export `QTC_GITHUB_TOKEN`,
+`GITHUB_TOKEN`, or `GH_TOKEN` before running the installer so it can
+authenticate the manifest and archive downloads through the GitHub release
+asset API. `qtc-faststart.py` honors the same env vars for private snapshot
+manifest and snapshot asset URLs.
+The canonical platform archives also now include the helper scripts in this
+directory, the mining helpers under `contrib/mining/`, and
+`doc/qtc-download-and-go.md`, so a direct archive extraction still gives the
+operator the documented fast-start entry points without needing a second repo
+checkout.
+Release bundles may also publish signer-qualified Guix attestation assets under
+the manifest's `attestation_assets` list. The installer ignores those
+provenance files, but they are part of the intended operator-facing release
+contract for reproducible major-architecture builds.
+
+One-shot install + bootstrap
+
+```bash
+python3 contrib/faststart/qtc-agent-setup.py \
+  --repo qtcchain/qtc \
+  --release-tag v0.33.0 \
+  --preset service \
+  --datadir="$HOME/.qtc-service"
+```
+
+That flow:
+
+1. downloads `qtc-release-manifest.json`,
+2. verifies the manifest against `SHA256SUMS` and `SHA256SUMS.asc` for remote releases,
+3. selects the matching binary archive for the current platform,
+4. verifies the archive and `snapshot.manifest.json`,
+5. extracts `qtcd` / `qtc-cli` plus the bundled helper scripts/docs,
+6. runs `qtc-faststart.py` with the chosen preset.
+
+Machine-readable install summary
+
+`qtc-agent-setup.py --json` now keeps bootstrap chatter on stderr and prints a
+clean JSON summary to stdout. That makes it safe for agentic installers to
+capture the installed binary paths and the generated fast-start config before
+handing off to mining or service automation:
+
+```bash
+SETUP_JSON="$(python3 contrib/faststart/qtc-agent-setup.py \
+  --repo qtcchain/qtc \
+  --release-tag v0.33.0 \
+  --preset miner \
+  --datadir="$HOME/.qtc" \
+  --json)"
+
+QTC_CLI="$(printf '%s' "$SETUP_JSON" | jq -r '.qtc_cli')"
+QTCD="$(printf '%s' "$SETUP_JSON" | jq -r '.qtcd')"
+FASTSTART_CONF="$(printf '%s' "$SETUP_JSON" | jq -r '.faststart_conf')"
+
+contrib/mining/start-live-mining.sh \
+  --datadir="$HOME/.qtc" \
+  --conf="$FASTSTART_CONF" \
+  --chain=main \
+  --cli="$QTC_CLI" \
+  --daemon="$QTCD" \
+  --wallet=miner \
+  --should-mine-command='/usr/local/bin/qtc-should-mine-now'
+```
+
+When `--preset miner` is used, the JSON summary also includes
+`start_live_mining_command` and `stop_live_mining_command` arrays for direct
+handoff into unattended mining supervisors.
+
+Manifest shape
+
+The preferred per-release manifest emitted by
+`contrib/devtools/generate_assumeutxo.py` includes the snapshot height, base
+block hash, file version, and checksum:
+
+```json
+{
+  "chain": "main",
+  "height": 123456,
+  "blockhash": "...",
+  "snapshot_file_version": 7,
+  "snapshot_sha256": "...",
+  "asset_url": "https://.../snapshot.dat"
+}
+```
+
+The wrapper also accepts a chain-mapped manifest:
+
+```json
+{
+  "main": {
+    "url": "https://.../main-snapshot.dat",
+    "sha256": "..."
+  },
+  "regtest": {
+    "url": "https://.../regtest-snapshot.dat",
+    "sha256": "..."
+  }
+}
+```
+
+You can keep a local copy as `contrib/faststart/snapshot-manifest.json`, or
+pass `--snapshot-manifest=/path/to/manifest.json` or
+`--snapshot-url=https://...` directly. If those URLs point at a private GitHub
+release, `qtc-faststart.py` also honors `QTC_GITHUB_TOKEN`, `GITHUB_TOKEN`, or
+`GH_TOKEN` for the manifest and snapshot asset downloads.
+
+A manifest entry by itself is not enough for public test chains. `loadtxoutset`
+will still reject snapshots for `testnet`, `testnet4`, or `signet` until the
+corresponding serialized hash and block metadata are compiled into
+`src/kernel/chainparams.cpp`.
+
+Example
+
+```bash
+contrib/faststart/miner-faststart.sh \
+  --datadir="$HOME/.qtc" \
+  --chain=main \
+  --snapshot-manifest="$HOME/qtc-snapshot-manifest.json"
+```
+
+The wrapper will stop only after `loadtxoutset` succeeds and the chainstate
+poller sees the snapshot chain disappear, unless `--follow` is set. If the
+daemon reaches a better active chainstate before `loadtxoutset` runs, the
+wrapper now treats the snapshot as superseded and continues instead of failing.
+Daemon-side RPC connection overrides such as `--daemon-arg=-rpcport=...` are
+also mirrored into the wrapper's internal `qtc-cli` calls automatically.
+The snapshot base block must be known in the local header chain before
+`loadtxoutset` can activate it; the wrapper waits for headers using the
+manifest block hash and does not require the full base block to be downloaded.
+
+Service-gateway example with a shared redeem registry:
+
+```bash
+contrib/faststart/service-faststart.sh \
+  --datadir="$HOME/.qtc-service-a" \
+  --chain=main \
+  --snapshot-manifest="$HOME/qtc-snapshot-manifest.json" \
+  --matmul-service-challenge-file=/srv/qtc-shared/matmul_service_challenges.dat
+```
+
+Adaptive service-challenge example:
+
+```bash
+qtc-cli listmatmulservicechallengeprofiles 0.25 0.75 0.25 6 1 adaptive_window 24 4 35
+qtc-cli getmatmulservicechallengeprofile balanced 0.25 0.75 0.25 6 1 adaptive_window 24 4 35
+qtc-cli getmatmulservicechallengeplan solves_per_hour 600 0.25 0.75 adaptive_window 24 0.25 6 4 35
+qtc-cli issuematmulservicechallengeprofile \
+  rate_limit \
+  "signup:/v1/messages" \
+  "user:alice@example.com" \
+  normal \
+  300 \
+  0.25 \
+  0.75 \
+  0.25 \
+  6 \
+  1 \
+  adaptive_window \
+  24 \
+  4 \
+  35
+qtc-cli getmatmulservicechallenge \
+  rate_limit \
+  "signup:/v1/messages" \
+  "user:alice@example.com" \
+  1.0 \
+  300 \
+  0.25 \
+  0.75 \
+  adaptive_window \
+  24 \
+  0.5 \
+  3.0 \
+  4 \
+  35
+```
+
+Real admission control should still use `redeemmatmulserviceproof`; the local
+`solvematmulservicechallenge` RPC is mainly for integration testing and
+agent-controlled clients. The profile-based issuance path is the recommended
+operator default because it maps directly onto the built-in `easy`, `normal`,
+`hard`, and `idle` tiers, returns average-node pacing estimates, and now
+includes operator-capacity guidance for planning how much challenge volume a
+node can sustain during idle-time or service-gateway workloads.
+`getmatmulservicechallengeplan` adds the inverse planner for “I need N
+solves/hour with this worker budget”; it returns the direct issuance defaults
+plus the closest built-in profile matches for the current network state.
+
+For agentic clients that do solve locally, `solvematmulservicechallenge` now
+accepts optional `time_budget_ms` and `solver_threads` arguments so a client
+can cap how long or how wide the local solver runs in the background.
+High-volume verification services can keep proof checking stateless by passing
+`false` as the final argument to `verifymatmulserviceproof` or
+`verifymatmulserviceproofs`, which skips the local/shared issued-challenge
+registry lookup and omits the local issuance/redeem fields from the result.
+
+Operators can watch `getdifficultyhealth` for
+`service_challenge_registry.status`, `healthy`, `path`, and `quarantine_path`.
+If a shared registry file is unreadable or on an unsupported version, the node
+now quarantines that file instead of silently reusing it.
+
+For the miner preset, `contrib/mining/start-live-mining.sh` now understands the
+fast-start-generated `--conf`, `--chain`, and custom `--rpcport` settings, and
+it auto-provisions the named mining wallet plus an address file when you do not
+pass `--address` / `--address-file`. The mining helpers now also support
+`--help`, which is useful when an installed binary bundle is being driven by an
+agent instead of a hand-maintained shell profile. Auto-provisioned mining
+wallets are added to the node's load-on-startup list so supervised daemon
+restarts keep mining working, and the launcher now fails early if the
+background loop dies before its initial startup check completes.

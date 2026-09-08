@@ -1,0 +1,116 @@
+#!/sbin/openrc-run
+
+# backward compatibility for existing layout
+#
+if [ -d "/var/lib/qtc/.qtc" ]; then
+	QTCD_DEFAULT_DATADIR="/var/lib/qtc/.qtc"
+else
+	QTCD_DEFAULT_DATADIR="/var/lib/qtcd"
+fi
+
+QTCD_CONFIGFILE=${QTCD_CONFIGFILE:-/etc/qtc/qtc.conf}
+QTCD_PIDDIR=${QTCD_PIDDIR:-/run/qtcd}
+QTCD_PIDFILE=${QTCD_PIDFILE:-${QTCD_PIDDIR}/${SVCNAME}.pid}
+QTCD_DATADIR=${QTCD_DATADIR:-${QTCD_DEFAULT_DATADIR}}
+QTCD_LOGDIR=${QTCD_LOGDIR:-/var/log/qtcd}
+QTCD_USER=${QTCD_USER:-qtc}
+QTCD_GROUP=${QTCD_GROUP:-qtc}
+QTCD_BIN=${QTCD_BIN:-/usr/bin/qtcd}
+QTCD_NICE=${QTCD_NICE:-${NICELEVEL:-0}}
+QTCD_OPTS="${QTCD_OPTS:-}"
+
+name="QTC daemon"
+description="QTC post-quantum blockchain P2P network daemon"
+
+required_files="${QTCD_CONFIGFILE}"
+pidfile="${QTCD_PIDFILE}"
+in_background_fake="start"
+
+depend() {
+	need localmount net
+}
+
+# verify
+# 1) that the datadir exists and is writable (or create it)
+# 2) that a directory for the pid exists and is writable
+# 3) ownership and permissions on the config file
+start_pre() {
+	checkpath \
+	-d \
+	--mode 0750 \
+	--owner "${QTCD_USER}:${QTCD_GROUP}" \
+	"${QTCD_DATADIR}"
+
+	checkpath \
+	-d \
+	--mode 0755 \
+	--owner "${QTCD_USER}:${QTCD_GROUP}" \
+	"${QTCD_PIDDIR}"
+
+	checkpath -f \
+	-o "${QTCD_USER}:${QTCD_GROUP}" \
+	-m 0660 \
+	"${QTCD_CONFIGFILE}"
+
+	checkpath -d --mode 0755 --owner "${QTCD_USER}:${QTCD_GROUP}" "${QTCD_LOGDIR}"
+
+	checkconfig || return 1
+}
+
+start() {
+	ebegin "Starting ${name} in background"
+	mark_service_inactive
+	if start-stop-daemon \
+		--pidfile="${QTCD_PIDFILE}" \
+		--chdir="${QTCD_DATADIR}" \
+		--user="${QTCD_USER}:${QTCD_GROUP}" \
+		--nice="${QTCD_NICE}" \
+		--exec="${QTCD_BIN}" \
+		-- \
+		-pid="${QTCD_PIDFILE}" \
+		-conf="${QTCD_CONFIGFILE}" \
+		-datadir="${QTCD_DATADIR}" \
+		-daemonwait \
+		-debuglogfile="${QTCD_LOGDIR}/debug.log" \
+		-rpccookieperms=group \
+		${QTCD_OPTS}
+	then
+		IN_BACKGROUND=yes rc-service "${SVCNAME}" --quiet start
+	else
+		rc-service "${SVCNAME}" --quiet zap
+	fi &
+}
+
+stop() {
+	ebegin "Stopping ${name}"
+	start-stop-daemon --stop \
+		--pidfile="${QTCD_PIDFILE}" \
+		--retry="${QTCD_SIGTERM_TIMEOUT}" \
+		--exec="${QTCD_BIN}"
+	eend $?
+}
+
+checkconfig()
+{
+	if grep -qs '^rpcuser=' "${QTCD_CONFIGFILE}" && \
+		! grep -qs '^rpcpassword=' "${QTCD_CONFIGFILE}" ; then
+		eerror ""
+		eerror "ERROR: You must set a secure rpcpassword to run qtcd."
+		eerror "The setting must appear in ${QTCD_CONFIGFILE}"
+		eerror ""
+		eerror "This password is security critical to securing wallets "
+		eerror "and must not be the same as the rpcuser setting."
+		eerror "You can generate a suitable random password using the following "
+		eerror "command from the shell:"
+		eerror ""
+		eerror "bash -c 'tr -dc a-zA-Z0-9 < /dev/urandom | head -c32 && echo'"
+		eerror ""
+		eerror "It is recommended that you also set alertnotify so you are "
+		eerror "notified of problems:"
+		eerror ""
+		eerror "ie: alertnotify=echo %%s | mail -s \"QTC Alert\"" \
+			"admin@foo.com"
+		eerror ""
+		return 1
+	fi
+}
