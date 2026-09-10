@@ -194,6 +194,7 @@ public:
         // that re-enables compact serving; that would require a payload-carrying P2P
         // extension (getmatmulproof/matmulproof, qtc-matmul-pow-spec.md S13.3).
         consensus.fMatMulRequireProductPayload = false;
+        consensus.fMatMulRejectLegacyPayloadVectors = true; // QTC security review N-5
         // QTC D8: all QTC hardening active from genesis (no flag-day replay).
         consensus.nMatMulFreivaldsBindingHeight = 0;
         consensus.nMatMulProductDigestHeight = 0;
@@ -294,7 +295,10 @@ public:
         consensus.nShieldedDirectSendPublicFlowDisableHeight = 0;
         consensus.nShieldedV2SendZeroOutputExitActivationHeight =
             QTC_SHIELDED_V2_SEND_ZERO_OUTPUT_EXIT_ACTIVATION_HEIGHT;
-        consensus.nShieldedRecoveryExitActivationHeight = 0; // QTC D9 (>= sunset)
+        // QTC security review: the pool is sunset from genesis and can never hold value, so no recovery exit can
+        // ever succeed; disable the whole shielded surface (S-1/S-2/C-3/C-4) instead of exercising it.
+        consensus.nShieldedRecoveryExitActivationHeight = std::numeric_limits<int32_t>::max();
+        consensus.fShieldedPoolDisabled = true;
         // v0.32.0-v0.32.12: shielded unshield (z->t) velocity cap from the 125,000
         // sunset through block 134,999. The v0.32.11 minimum-cap floor still starts at
         // 132,000, and v0.32.12 ends the quota at 135,000 after the recovery window has
@@ -347,7 +351,7 @@ public:
         m_assumed_chain_state_size = 1;
 
         genesis = CreateQTCGenesisBlock(
-            1773878400,  // Mar 19, 2026 00:00:00 UTC — SMILE v2 chain restart
+            1789063200,  // Sep 10, 2026 18:00:00 UTC — consensus fork v0.0.5 (REGENERATE AGAIN within hours of the real launch, security review H1)
             0,
             1,
             0x1e013333,  // == compact(powLimit); QTC Option B at 600 s
@@ -356,7 +360,7 @@ public:
             static_cast<uint16_t>(consensus.nMatMulDimension),
             uint256{"07226e4fdc368a067ef904b9fdddf9763e2782fda4e695788240077805643edd"});
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"c53432768f1d1898dfa336fde028b527fef96a44319ee3f8b6c483aa1b8af8e3"});
+        assert(consensus.hashGenesisBlock == uint256{"44c4f064d67cca8053e7dfe74f8935b146ce913f81bf87ec7ba65db69f1504d4"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
 
         // QTC address prefixes (distinct from QTC). PUBKEY 58 → base58 'Q' lead;
@@ -442,6 +446,7 @@ public:
         consensus.fMatMulFreivaldsEnabled = true;
         consensus.nMatMulFreivaldsRounds = 2;
         consensus.fMatMulRequireProductPayload = true;
+        consensus.fMatMulRejectLegacyPayloadVectors = true; // QTC security review N-5
         consensus.nMatMulFreivaldsBindingHeight = 61'000;
         consensus.nMatMulProductDigestHeight = 61'000;
         consensus.nMaxReorgDepth = 12;
@@ -536,7 +541,7 @@ public:
         m_assumed_chain_state_size = 0;
 
         genesis = CreateQTCGenesisBlock(
-            1773878400,  // Mar 19, 2026 — SMILE v2 chain restart
+            1789063200,  // Sep 10, 2026 18:00:00 UTC — consensus fork v0.0.5 (REGENERATE AGAIN within hours of the real launch, security review H1)
             0,
             238,
             0x20027525,
@@ -545,7 +550,7 @@ public:
             static_cast<uint16_t>(consensus.nMatMulDimension),
             uint256{"00230371b05217711a10cf44983c2ffc3d82da06369fd0e640b6d20c033e38da"});
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"ac4518b8cdd24b4f82789b1136d6735ebd5d2d260d40b61abd49ee11f54140e2"});
+        assert(consensus.hashGenesisBlock == uint256{"2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
 
         // Testnet DNS seeds mirror mainnet domains; fixed seeds provide fallback.
@@ -621,6 +626,7 @@ public:
         consensus.fMatMulFreivaldsEnabled = true;
         consensus.nMatMulFreivaldsRounds = 2;
         consensus.fMatMulRequireProductPayload = true;
+        consensus.fMatMulRejectLegacyPayloadVectors = true; // QTC security review N-5
         consensus.nMatMulFreivaldsBindingHeight = 61'000;
         consensus.nMatMulProductDigestHeight = 61'000;
         consensus.nMaxReorgDepth = 12;
@@ -714,7 +720,7 @@ public:
         m_assumed_chain_state_size = 0;
 
         genesis = CreateQTCGenesisBlock(
-            1773878400,  // Mar 19, 2026 — SMILE v2 chain restart
+            1789063200,  // Sep 10, 2026 18:00:00 UTC — consensus fork v0.0.5 (REGENERATE AGAIN within hours of the real launch, security review H1)
             0,
             238,
             0x20027525,
@@ -723,7 +729,7 @@ public:
             static_cast<uint16_t>(consensus.nMatMulDimension),
             uint256{"00230371b05217711a10cf44983c2ffc3d82da06369fd0e640b6d20c033e38da"});
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"ac4518b8cdd24b4f82789b1136d6735ebd5d2d260d40b61abd49ee11f54140e2"});
+        assert(consensus.hashGenesisBlock == uint256{"2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
 
         vSeeds.clear();
@@ -831,6 +837,7 @@ public:
         consensus.fMatMulFreivaldsEnabled = true;
         consensus.nMatMulFreivaldsRounds = 2;
         consensus.fMatMulRequireProductPayload = true;
+        consensus.fMatMulRejectLegacyPayloadVectors = true; // QTC security review N-5
         consensus.nMatMulFreivaldsBindingHeight = 61'000;
         consensus.nMatMulProductDigestHeight = 61'000;
         consensus.nMaxReorgDepth = 12;
@@ -922,7 +929,7 @@ public:
 
         // Reuse the testnet genesis block for signet.
         genesis = CreateQTCGenesisBlock(
-            1773878400,  // Mar 19, 2026 — SMILE v2 chain restart
+            1789063200,  // Sep 10, 2026 18:00:00 UTC — consensus fork v0.0.5 (REGENERATE AGAIN within hours of the real launch, security review H1)
             0,
             238,
             0x20027525,
@@ -931,7 +938,7 @@ public:
             static_cast<uint16_t>(consensus.nMatMulDimension),
             uint256{"00230371b05217711a10cf44983c2ffc3d82da06369fd0e640b6d20c033e38da"});
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"ac4518b8cdd24b4f82789b1136d6735ebd5d2d260d40b61abd49ee11f54140e2"});
+        assert(consensus.hashGenesisBlock == uint256{"2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
 
         m_assumeutxo_data = {};
@@ -993,6 +1000,7 @@ public:
         consensus.fMatMulFreivaldsEnabled = true;
         consensus.nMatMulFreivaldsRounds = 2;
         consensus.fMatMulRequireProductPayload = true;
+        consensus.fMatMulRejectLegacyPayloadVectors = false; // QTC security review N-5 (regtest keeps legacy payload tests)
         consensus.nMatMulFreivaldsBindingHeight = 0;
         consensus.nMatMulProductDigestHeight = 0;
         consensus.nMatMulPreHashEpsilonBits = 0; // Disable pre-hash filter for fast regtest mining
@@ -1357,6 +1365,7 @@ public:
         consensus.fMatMulFreivaldsEnabled = true;
         consensus.nMatMulFreivaldsRounds = 2;
         consensus.fMatMulRequireProductPayload = true;
+        consensus.fMatMulRejectLegacyPayloadVectors = false; // QTC security review N-5 (dev chain keeps legacy payload tests)
         consensus.nMatMulFreivaldsBindingHeight = 0;
         consensus.nMatMulProductDigestHeight = 0;
         consensus.nMatMulPreHashEpsilonBits = 0;

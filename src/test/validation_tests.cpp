@@ -432,7 +432,9 @@ BOOST_AUTO_TEST_CASE(mainnet_velocity_cap_active_at_sunset_and_expires_at_v03212
     BOOST_CHECK(consensus.IsShieldedPoolCreditDisabled(0));
     BOOST_CHECK(consensus.IsShieldedSunsetActive(0));
     BOOST_CHECK(consensus.IsShieldedDirectSendPublicFlowDisabled(0));
-    BOOST_CHECK(consensus.IsShieldedRecoveryExitActive(0));
+    // Security-review fork: mainnet disables the shielded surface entirely; no recovery exit.
+    BOOST_CHECK(consensus.fShieldedPoolDisabled);
+    BOOST_CHECK(!consensus.IsShieldedRecoveryExitActive(0));
     BOOST_CHECK_EQUAL(consensus.nShieldedUnshieldVelocityActivationHeight, std::numeric_limits<int32_t>::max());
     BOOST_CHECK_EQUAL(consensus.nShieldedUnshieldVelocityEndHeight, std::numeric_limits<int32_t>::max());
     BOOST_CHECK_EQUAL(consensus.nShieldedUnshieldVelocityMinCapHeight, std::numeric_limits<int32_t>::max());
@@ -471,6 +473,13 @@ BOOST_AUTO_TEST_CASE(recovery_exit_activates_with_shielded_sunset_on_production_
         const auto params = CreateChainParams(args, net);
         BOOST_REQUIRE(params);
         const auto& consensus = params->GetConsensus();
+        if (consensus.fShieldedPoolDisabled) {
+            // Security-review fork (mainnet): the pool never holds value, the shielded surface is
+            // disabled and the recovery exit never activates.
+            BOOST_CHECK_EQUAL(consensus.nShieldedRecoveryExitActivationHeight, std::numeric_limits<int32_t>::max());
+            BOOST_CHECK(!consensus.IsShieldedRecoveryExitActive(consensus.nShieldedSunsetHeight));
+            continue;
+        }
         BOOST_CHECK_EQUAL(consensus.nShieldedRecoveryExitActivationHeight, consensus.nShieldedSunsetHeight);
         BOOST_CHECK(!consensus.IsShieldedRecoveryExitActive(consensus.nShieldedSunsetHeight - 1));
         BOOST_CHECK(consensus.IsShieldedRecoveryExitActive(consensus.nShieldedSunsetHeight));

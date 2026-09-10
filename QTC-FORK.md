@@ -365,3 +365,10 @@ on an M5 CPU because the one-lane oracle was not skippable). Fix chosen after mo
 * Genesis blocks unchanged (no MatMul fields); regtest assumeutxo @110 unchanged (regtest mining skips MatMul).
 * Verified: matmul_*/pow/validation/pq_genesis suites green; Python-vs-C++ v4 known answer agrees; 5 regtest blocks
   mined and accepted under `-test=matmulstrict`. Full suite: see commit message.
+
+### Stage: security-review consensus fork (2026-09-10)
+N-1 PQ sigop accounting (annex mirrored, CSFS counted and cached, annex rejected), M-8 SLH-DSA weight 1,000, N-5
+legacy payload vectors rejected, mainnet shielded surface disabled (`fShieldedPoolDisabled`, recovery exit INT32_MAX),
+hysteresis depth 1, genesis regenerated at nTime 1789063200 (main 44c4f064…, test nets 2532b498…). Full detail in
+QTC-LAUNCH-SAFETY.md §12. Unit suite: see commit. Regenerate genesis again at launch (H1); size powLimit after the GPU
+kernel port (H2).

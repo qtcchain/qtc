@@ -120,36 +120,6 @@ std::pair<matmul::Matrix, uint256> ManualCanonical(
     return {std::move(C), digest};
 }
 
-std::vector<matmul::field::Element> ManualCompressedTranscriptWords(
-    const matmul::Matrix& A,
-    const matmul::Matrix& B,
-    uint32_t b,
-    const uint256& sigma)
-{
-    const uint32_t n = A.rows();
-    const uint32_t N = n / b;
-    const auto v = matmul::transcript::DeriveCompressionVector(sigma, b);
-
-    matmul::Matrix C(n, n);
-    std::vector<matmul::field::Element> compressed;
-    compressed.reserve(static_cast<size_t>(N) * N * N);
-
-    for (uint32_t i = 0; i < N; ++i) {
-        for (uint32_t j = 0; j < N; ++j) {
-            for (uint32_t ell = 0; ell < N; ++ell) {
-                const matmul::Matrix a_block = A.block(i, ell, b);
-                const matmul::Matrix b_block = B.block(ell, j, b);
-                matmul::Matrix c_block = C.block(i, j, b);
-                c_block = c_block + (a_block * b_block);
-                C.set_block(i, j, b, c_block);
-                compressed.push_back(matmul::transcript::CompressBlock(c_block, v));
-            }
-        }
-    }
-
-    return compressed;
-}
-
 uint256 ManualVariantOrderHash(
     const matmul::Matrix& A,
     const matmul::Matrix& B,

@@ -118,7 +118,7 @@ inline ReorgProtectionProfileSettings GetReorgProtectionProfileSettings(ReorgPro
             .warn_depth = 3,
             .park_depth = REORG_PROTECTION_DEPTH_DISABLED,
             .finality_depth = 72,
-            .hysteresis_depth = 0,
+            .hysteresis_depth = 1, // QTC security review C-2: follow most-work in one-block races; margin applies to depth >= 2
             .hysteresis_work_margin = 2,
         };
     }

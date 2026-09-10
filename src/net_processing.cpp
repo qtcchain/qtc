@@ -251,9 +251,12 @@ bool IsMatMulPhase2Failure(const BlockValidationState& state)
     //     header is fine but the SENDER substituted a garbage or absent Freivalds
     //     payload (security audit N-3). The header must stay valid (an attacker
     //     could otherwise invalidate honest blocks), but the sender is culpable.
+    //   - BLOCK_MUTATED "bad-matmul-legacy-payload": the SENDER appended legacy A/B payload
+    //     vectors that are not header-committed (security review N-5); same reasoning.
     const std::string& reason = state.GetRejectReason();
     if (state.GetResult() == BlockValidationResult::BLOCK_MUTATED) {
-        return reason == "invalid-product-payload" || reason == "missing-product-payload";
+        return reason == "invalid-product-payload" || reason == "missing-product-payload" ||
+               reason == "bad-matmul-legacy-payload";
     }
     return reason == "high-hash" &&
         state.GetDebugMessage().find("matmul phase2 proof of work failed") != std::string::npos;

@@ -1319,7 +1319,19 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                         HashWriter hasher = HASHER_CSFS;
                         hasher.write(MakeByteSpan(msg));
                         const uint256 hash = hasher.GetSHA256();
-                        success = CPQPubKey{*algo, pubkey}.Verify(hash, sig, (flags & SCRIPT_VERIFY_SLHDSA_FIPS205) != 0);
+                        // Route through the checker rather than CPQPubKey::Verify directly so
+                        // CachingTransactionSignatureChecker's salted signature cache covers
+                        // CSFS like every other PQ opcode (QTC-SECURITY-REVIEW N-1). The cache
+                        // key mixes in the algorithm and the SLH-DSA FIPS-205 mode
+                        // (sigcache.cpp ComputeEntryPQ), so an entry is only ever reused for
+                        // the same (hash, algo, mode, pubkey, sig) tuple.
+                        //
+                        // Note on SCRIPT_VERIFY_CHECKSIGFROMSTACK: every consensus and policy
+                        // flag set in tree includes it (validation.cpp GetBlockScriptFlags,
+                        // policy.h STANDARD_SCRIPT_VERIFY_FLAGS) and the opcode is a native
+                        // P2MR opcode excluded from IsOpSuccessP2MR, so it is not NOP-gated on
+                        // the flag here; the flag only records intent for callers.
+                        success = checker.VerifyPQSignature(sig, pubkey, *algo, hash, (flags & SCRIPT_VERIFY_SLHDSA_FIPS205) != 0);
                     }
 
                     if (!success && (flags & SCRIPT_VERIFY_NULLFAIL) && !sig.empty()) {
@@ -2059,11 +2071,16 @@ bool GenericTransactionSignatureChecker<T>::CheckPQSignature(Span<const unsigned
     return VerifyPQSignature(sig, pubkey, algo, sighash, slhdsa_fips205);
 }
 
-template <class T>
-bool GenericTransactionSignatureChecker<T>::VerifyPQSignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, PQAlgorithm algo, const uint256& sighash, bool slhdsa_fips205) const
+bool BaseSignatureChecker::VerifyPQSignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, PQAlgorithm algo, const uint256& sighash, bool slhdsa_fips205) const
 {
     const CPQPubKey pq_pubkey{algo, pubkey};
     return pq_pubkey.Verify(sighash, sig, slhdsa_fips205);
+}
+
+template <class T>
+bool GenericTransactionSignatureChecker<T>::VerifyPQSignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, PQAlgorithm algo, const uint256& sighash, bool slhdsa_fips205) const
+{
+    return BaseSignatureChecker::VerifyPQSignature(sig, pubkey, algo, sighash, slhdsa_fips205);
 }
 
 template <class T>
@@ -2341,13 +2358,17 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY);
         }
 
+        // QTC-SECURITY-REVIEW N-1: an annex has no defined semantics in P2MR and is
+        // rejected at consensus (policy already rejects it as "p2mr-annex"). It used
+        // to be popped here, ahead of the element-size check, which let an
+        // arbitrarily large annex inflate the per-input validation budget and moved
+        // the leaf script away from the position WitnessSigOps scanned. The
+        // detection condition is shared verbatim with WitnessSigOps and
+        // IsWitnessStandard. The sighash still commits to "no annex".
         if (stack.size() >= 3 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
-            const valtype& annex = SpanPopBack(stack);
-            execdata.m_annex_hash = (HashWriter{} << annex).GetSHA256();
-            execdata.m_annex_present = true;
-        } else {
-            execdata.m_annex_present = false;
+            return set_error(serror, SCRIPT_ERR_P2MR_ANNEX_UNSUPPORTED);
         }
+        execdata.m_annex_present = false;
         execdata.m_annex_init = true;
 
         const valtype& control = SpanPopBack(stack);
@@ -2518,8 +2539,26 @@ size_t static WitnessSigOps(int witversion, const std::vector<unsigned char>& wi
     }
 
     if (witversion == 2 && witprogram.size() == WITNESS_V2_P2MR_SIZE && witness.stack.size() >= 2) {
-        const auto& leaf_script_bytes = witness.stack[witness.stack.size() - 2];
+        // This must mirror VerifyWitnessProgram's P2MR branch exactly
+        // (QTC-SECURITY-REVIEW N-1). An annex-tagged trailing element is detected
+        // with the executor's condition; the executor rejects such a witness
+        // (SCRIPT_ERR_P2MR_ANNEX_UNSUPPORTED), and we skip over it here so the leaf
+        // script is always read from the position the executor would use. Before
+        // this, appending an annex made the counter scan the control block and
+        // report zero PQ sigops for an input that still verified every signature.
+        Span<const valtype> stack{witness.stack};
+        if (stack.size() >= 3 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
+            SpanPopBack(stack);
+        }
+        // stack = [inputs..., leaf_script, control]
+        const valtype& leaf_script_bytes = stack[stack.size() - 2];
         CScript leaf_script(leaf_script_bytes.begin(), leaf_script_bytes.end());
+
+        // Every opcode that can invoke a PQ verification in EvalScript's P2MR path
+        // is charged here at (at least) the weight the executor charges. The
+        // reserved Falcon slots are OP_SUCCESSx in P2MR and verify nothing.
+        static_assert(VALIDATION_WEIGHT_PER_SLHDSA_SIGOP >= VALIDATION_WEIGHT_PER_MLDSA_SIGOP,
+                      "CSFS static count must dominate the executor's charge for either algorithm");
 
         size_t n_sigops{0};
         CScript::const_iterator pc = leaf_script.begin();
@@ -2538,6 +2577,13 @@ size_t static WitnessSigOps(int witversion, const std::vector<unsigned char>& wi
                 break;
             case OP_CHECKSIGADD_SLHDSA:
                 n_sigops += VALIDATION_WEIGHT_PER_SLHDSA_MULTISIG_SIGOP;
+                break;
+            case OP_CHECKSIGFROMSTACK:
+                // The algorithm is selected at run time from the pubkey size on the
+                // stack (ML-DSA-44: 1312 bytes, SLH-DSA-128s: 32 bytes), which a static
+                // scan cannot see. Count the conservative maximum, the SLH-DSA weight;
+                // an ML-DSA CSFS is thus over-counted by the block budget, never under.
+                n_sigops += VALIDATION_WEIGHT_PER_SLHDSA_SIGOP;
                 break;
             default:
                 break;

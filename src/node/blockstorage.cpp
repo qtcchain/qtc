@@ -1362,8 +1362,20 @@ bool BlockManager::ReadRawBlock(std::vector<uint8_t>& block, const FlatFilePos& 
     return true;
 }
 
-FlatFilePos BlockManager::WriteBlock(const CBlock& block, int nHeight)
+FlatFilePos BlockManager::WriteBlock(const CBlock& block_in, int nHeight)
 {
+    // QTC security review N-5 (defence in depth): CheckBlock already rejects blocks carrying the legacy
+    // MatMul payload vectors on chains that set fMatMulRejectLegacyPayloadVectors, but never let them
+    // reach disk on such a chain. The vectors are not header-committed, so the block hash is unchanged.
+    std::optional<CBlock> stripped;
+    if (GetConsensus().fMatMulRejectLegacyPayloadVectors && HasMatMulV2Payload(block_in)) {
+        stripped.emplace(block_in);
+        stripped->matrix_a_data.clear();
+        stripped->matrix_b_data.clear();
+        LogDebug(BCLog::VALIDATION, "Stripping legacy matmul payload vectors from block %s before writing\n",
+                 block_in.GetHash().ToString());
+    }
+    const CBlock& block{stripped ? *stripped : block_in};
     const unsigned int block_size{static_cast<unsigned int>(GetSerializeSize(TX_WITH_WITNESS(block)))};
     FlatFilePos pos{FindNextBlockPos(block_size + BLOCK_SERIALIZATION_HEADER_SIZE, nHeight, block.GetBlockTime())};
     if (pos.IsNull()) {

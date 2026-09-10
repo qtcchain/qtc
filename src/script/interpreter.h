@@ -319,6 +319,16 @@ public:
         return false;
     }
 
+    /**
+     * Verify a raw post-quantum signature over a 32-byte message. Unlike
+     * CheckPQSignature this needs no transaction context; it is used by
+     * OP_CHECKSIGFROMSTACK, whose message is the CSFS-tagged hash of a stack
+     * element. The default performs an uncached verification;
+     * CachingTransactionSignatureChecker overrides it so the salted signature
+     * cache covers CSFS like every other PQ opcode (QTC-SECURITY-REVIEW N-1).
+     */
+    virtual bool VerifyPQSignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, PQAlgorithm algo, const uint256& sighash, bool slhdsa_fips205 = false) const;
+
     virtual bool CheckLockTime(const CScriptNum& nLockTime) const
     {
          return false;
@@ -358,7 +368,7 @@ private:
 protected:
     virtual bool VerifyECDSASignature(const std::vector<unsigned char>& vchSig, const CPubKey& vchPubKey, const uint256& sighash) const;
     virtual bool VerifySchnorrSignature(Span<const unsigned char> sig, const XOnlyPubKey& pubkey, const uint256& sighash) const;
-    virtual bool VerifyPQSignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, PQAlgorithm algo, const uint256& sighash, bool slhdsa_fips205 = false) const;
+    bool VerifyPQSignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, PQAlgorithm algo, const uint256& sighash, bool slhdsa_fips205 = false) const override;
 
 public:
     GenericTransactionSignatureChecker(const T* txToIn, unsigned int nInIn, const CAmount& amountIn, MissingDataBehavior mdb) : txTo(txToIn), m_mdb(mdb), nIn(nInIn), amount(amountIn), txdata(nullptr) {}

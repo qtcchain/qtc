@@ -186,6 +186,10 @@ struct Params {
      *  matmul_digest remains transcript-bound unless a separate digest
      *  commitment upgrade explicitly says otherwise. */
     bool fMatMulRequireProductPayload{true};
+    /** QTC security review N-5: the legacy MatMul v2 payload vectors (matrix_a_data / matrix_b_data) are not
+     *  header-committed and are never needed on chains with deterministic seeds. When set, any block carrying
+     *  non-empty vectors is rejected as mutated (like witness malleation: the header is not invalidated). */
+    bool fMatMulRejectLegacyPayloadVectors{false};
     /** Height at which Freivalds-verified blocks must also pass full
      *  transcript recomputation to bind matmul_digest to the claimed work. */
     int32_t nMatMulFreivaldsBindingHeight{std::numeric_limits<int32_t>::max()};
@@ -315,6 +319,10 @@ struct Params {
      *  when set.
      *  See doc/recovery_exit_125000_spec.md. */
     int32_t nShieldedRecoveryExitActivationHeight{std::numeric_limits<int32_t>::max()};
+    /** QTC security review S-1/S-2/C-3/C-4: when set, every shielded bundle is rejected before any parsing beyond
+     *  structure, value-balance or proof work, and shielded transactions are non-standard. True on chains whose
+     *  pool is sunset from genesis and can never hold value. */
+    bool fShieldedPoolDisabled{false};
     /** RECOVERY_EXIT membership anchor: the consensus-PINNED shielded note-commitment tree root of the
      *  frozen 125,000 ceiling when known at release time. A recovery claim's Merkle witness must
      *  authenticate the spent commitment against this root, or against the immutable live tree root after

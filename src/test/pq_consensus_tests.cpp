@@ -11,6 +11,8 @@
 #include <script/pqm.h>
 #include <script/script.h>
 #include <script/script_error.h>
+#include <script/sigcache.h>
+#include <serialize.h>
 #include <shielded/v2_bundle.h>
 #include <streams.h>
 #include <test/util/shielded_account_registry_test_util.h>
@@ -643,7 +645,14 @@ BOOST_AUTO_TEST_CASE(p2mr_reserved_falcon_opsuccess_slot_discouraged_by_flag)
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_DISCOURAGE_OP_SUCCESS);
 }
 
-BOOST_AUTO_TEST_CASE(p2mr_annex_signature_hash_commits_to_annex)
+// QTC-SECURITY-REVIEW N-1: a P2MR annex used to be consensus-valid (popped before
+// the element-size check, so it could be arbitrarily large and inflate the
+// per-input validation budget) while WitnessSigOps did not pop it and therefore
+// scanned the control block and counted zero PQ sigops. The annex is now rejected
+// at consensus with SCRIPT_ERR_P2MR_ANNEX_UNSUPPORTED, whether or not the
+// signature committed to it. The sighash function itself still commits to the
+// annex hash when told one is present, which is what the first check pins.
+BOOST_AUTO_TEST_CASE(p2mr_annex_rejected_at_consensus)
 {
     CPQKey key;
     key.MakeNewKey(PQAlgorithm::ML_DSA_44);
@@ -667,19 +676,53 @@ BOOST_AUTO_TEST_CASE(p2mr_annex_signature_hash_commits_to_annex)
     BOOST_REQUIRE(key.Sign(*sighash_without_annex, sig_without_annex));
 
     {
+        // Control: the same leaf spends fine without an annex.
         CScriptWitness witness;
-        witness.stack = {sig_with_annex, leaf_script, {P2MR_LEAF_VERSION}, annex};
+        witness.stack = {sig_without_annex, leaf_script, {P2MR_LEAF_VERSION}};
         ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
         BOOST_CHECK(VerifyP2MRSpend(ctx, witness, err));
         BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
     }
 
     {
+        // Signature that committed to the annex: rejected before any signature check.
+        CScriptWitness witness;
+        witness.stack = {sig_with_annex, leaf_script, {P2MR_LEAF_VERSION}, annex};
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifyP2MRSpend(ctx, witness, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_ANNEX_UNSUPPORTED);
+    }
+
+    {
+        // Signature that did not commit to the annex: same rejection, not SIG_MLDSA.
         CScriptWitness witness;
         witness.stack = {sig_without_annex, leaf_script, {P2MR_LEAF_VERSION}, annex};
         ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
         BOOST_CHECK(!VerifyP2MRSpend(ctx, witness, err));
-        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_SIG_MLDSA);
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_ANNEX_UNSUPPORTED);
+    }
+
+    {
+        // An oversized annex can no longer buy validation budget: it is rejected as
+        // an annex, before the element-size check that it used to bypass.
+        std::vector<unsigned char> big_annex(5 * MAX_P2MR_ELEMENT_SIZE, 0x00);
+        big_annex.front() = ANNEX_TAG;
+        CScriptWitness witness;
+        witness.stack = {sig_without_annex, leaf_script, {P2MR_LEAF_VERSION}, big_annex};
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifyP2MRSpend(ctx, witness, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_ANNEX_UNSUPPORTED);
+    }
+
+    {
+        // Only a third-or-later trailing element is an annex candidate (the shared
+        // detection condition is stack.size() >= 3). A two-element witness whose
+        // control block happens to start with 0x50 is a bad leaf version, not an annex.
+        CScriptWitness witness;
+        witness.stack = {leaf_script, {ANNEX_TAG}};
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifyP2MRSpend(ctx, witness, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_WRONG_LEAF_VERSION);
     }
 }
 
@@ -1858,6 +1901,11 @@ BOOST_AUTO_TEST_CASE(csfs_write_vs_stream_operator_hashing_differs)
     BOOST_CHECK(hash_write != hash_stream);
 }
 
+// CSFS has no transaction context, so it must not go through the sighash-computing
+// CheckPQSignature path. Since QTC-SECURITY-REVIEW N-1 it goes through
+// BaseSignatureChecker::VerifyPQSignature instead (see
+// csfs_routes_verification_through_checker_verifypqsignature below); a checker that
+// only overrides CheckPQSignature therefore still performs a real verification here.
 BOOST_AUTO_TEST_CASE(csfs_does_not_use_checkpqsignature_path)
 {
     CPQKey key;
@@ -2232,6 +2280,339 @@ BOOST_AUTO_TEST_CASE(consensus_rejects_oversized_serialized_blocks)
     BlockValidationState state;
     BOOST_CHECK(!CheckBlock(block, state, consensus, /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/false));
     BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-blk-length");
+}
+
+// ---------------------------------------------------------------------------
+// QTC-SECURITY-REVIEW N-1 (PQ sigop accounting) and M-8 (PQ validation weights)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr unsigned int SIGOP_COUNT_FLAGS = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS;
+
+//! Checker that records the arguments OP_CHECKSIGFROMSTACK hands to
+//! VerifyPQSignature and returns a fixed result, proving the opcode is routed
+//! through the (cacheable) checker hook rather than calling CPQPubKey directly.
+class RecordingPQVerifyChecker final : public BaseSignatureChecker
+{
+public:
+    explicit RecordingPQVerifyChecker(bool result) : m_result(result) {}
+
+    bool VerifyPQSignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, PQAlgorithm algo, const uint256& hash, bool slhdsa_fips205) const override
+    {
+        ++calls;
+        last_sig.assign(sig.begin(), sig.end());
+        last_pubkey.assign(pubkey.begin(), pubkey.end());
+        last_algo = algo;
+        last_hash = hash;
+        last_fips205 = slhdsa_fips205;
+        return m_result;
+    }
+
+    mutable size_t calls{0};
+    mutable std::vector<unsigned char> last_sig;
+    mutable std::vector<unsigned char> last_pubkey;
+    mutable std::optional<PQAlgorithm> last_algo;
+    mutable std::optional<uint256> last_hash;
+    mutable bool last_fips205{false};
+
+private:
+    const bool m_result;
+};
+
+//! Concatenate `copies` copies of a leaf fragment; only used for static sigop
+//! counting, so the result need not be executable.
+std::vector<unsigned char> RepeatLeaf(const std::vector<unsigned char>& fragment, size_t copies)
+{
+    std::vector<unsigned char> out;
+    out.reserve(fragment.size() * copies);
+    for (size_t i = 0; i < copies; ++i) out.insert(out.end(), fragment.begin(), fragment.end());
+    return out;
+}
+
+//! Static PQ sigop count for a single-leaf P2MR spend whose witness is
+//! [inputs..., leaf, control(, annex)].
+size_t CountP2MRLeafSigOps(const std::vector<unsigned char>& leaf_script, size_t n_inputs, const std::vector<unsigned char>* annex = nullptr)
+{
+    const uint256 leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION, leaf_script);
+    const CScript script_pub_key = BuildP2MROutput(ComputeP2MRMerkleRoot({leaf_hash}));
+    CScriptWitness witness;
+    for (size_t i = 0; i < n_inputs; ++i) witness.stack.emplace_back();
+    witness.stack.push_back(leaf_script);
+    witness.stack.push_back({P2MR_LEAF_VERSION});
+    if (annex != nullptr) witness.stack.push_back(*annex);
+    return CountWitnessSigOps(CScript{}, script_pub_key, &witness, SIGOP_COUNT_FLAGS);
+}
+
+//! Leaf that verifies one witness SLH-DSA signature `k` times against the same key:
+//!   (OP_DUP <pk> OP_CHECKSIG_SLHDSA OP_VERIFY) x k  OP_DROP OP_1
+//! Each pass costs VALIDATION_WEIGHT_PER_SLHDSA_SIGOP while the witness carries a
+//! single signature, so k can exhaust the per-input budget.
+std::vector<unsigned char> BuildRepeatedSLHDSAChecksigLeaf(Span<const unsigned char> pubkey, size_t k)
+{
+    const std::vector<unsigned char> pk(pubkey.begin(), pubkey.end());
+    CScript script;
+    for (size_t i = 0; i < k; ++i) {
+        script << OP_DUP << pk << OP_CHECKSIG_SLHDSA << OP_VERIFY;
+    }
+    script << OP_DROP << OP_1;
+    return {script.begin(), script.end()};
+}
+
+int64_t P2MRInputBudget(const CScriptWitness& witness)
+{
+    return static_cast<int64_t>(::GetSerializeSize(witness.stack)) + VALIDATION_WEIGHT_OFFSET;
+}
+
+} // namespace
+
+// M-8: pin the weights this fork ships with, and the invariant that keeps every
+// PQ opcode spendable: a per-signature charge must not exceed the validation
+// budget that one signature of that algorithm contributes to its own input
+// (signature bytes + 3-byte compactsize prefix). This is why the SLH-DSA
+// OP_CHECKSIGADD weight was NOT scaled 10x with the single-sig weight.
+static_assert(VALIDATION_WEIGHT_PER_MLDSA_SIGOP == 50, "QTC-SECURITY-REVIEW M-8: ML-DSA-44 weight");
+static_assert(VALIDATION_WEIGHT_PER_SLHDSA_SIGOP == 1000, "QTC-SECURITY-REVIEW M-8: SLH-DSA-128s weight raised from 500");
+static_assert(VALIDATION_WEIGHT_PER_MLDSA_MULTISIG_SIGOP == 500, "QTC-SECURITY-REVIEW M-8: ML-DSA-44 CHECKSIGADD weight");
+static_assert(VALIDATION_WEIGHT_PER_SLHDSA_MULTISIG_SIGOP == 5000, "QTC-SECURITY-REVIEW M-8: SLH-DSA-128s CHECKSIGADD weight");
+static_assert(VALIDATION_WEIGHT_PER_MLDSA_SIGOP <= static_cast<int64_t>(MLDSA44_SIGNATURE_SIZE) + 3, "ML-DSA CHECKSIG would be unspendable");
+static_assert(VALIDATION_WEIGHT_PER_MLDSA_MULTISIG_SIGOP <= static_cast<int64_t>(MLDSA44_SIGNATURE_SIZE) + 3, "ML-DSA CHECKSIGADD would be unspendable");
+static_assert(VALIDATION_WEIGHT_PER_SLHDSA_SIGOP <= static_cast<int64_t>(SLHDSA128S_SIGNATURE_SIZE) + 3, "SLH-DSA CHECKSIG would be unspendable");
+static_assert(VALIDATION_WEIGHT_PER_SLHDSA_MULTISIG_SIGOP <= static_cast<int64_t>(SLHDSA128S_SIGNATURE_SIZE) + 3, "SLH-DSA CHECKSIGADD would be unspendable");
+// N-1: the static CSFS count (SLH-DSA weight) must dominate whatever the executor
+// charges for the algorithm it discovers at run time.
+static_assert(VALIDATION_WEIGHT_PER_SLHDSA_SIGOP >= VALIDATION_WEIGHT_PER_MLDSA_SIGOP, "CSFS static count must be the maximum");
+
+// N-1 (a): with the annex rejected, the counter and the executor read the leaf from
+// the same witness position; an appended annex can no longer zero the count.
+BOOST_AUTO_TEST_CASE(p2mr_witness_sigops_unaffected_by_annex)
+{
+    const std::vector<unsigned char> pk(MLDSA44_PUBKEY_SIZE, 0x11);
+    const std::vector<unsigned char> fragment = BuildP2MRScript(PQAlgorithm::ML_DSA_44, pk);
+    const std::vector<unsigned char> annex{ANNEX_TAG, 0xAA, 0xBB};
+    std::vector<unsigned char> big_annex(3 * MAX_P2MR_ELEMENT_SIZE, 0x00);
+    big_annex.front() = ANNEX_TAG;
+
+    for (size_t k = 1; k <= 4; ++k) {
+        const std::vector<unsigned char> leaf = RepeatLeaf(fragment, k);
+        const size_t expected = k * VALIDATION_WEIGHT_PER_MLDSA_SIGOP;
+        BOOST_CHECK_EQUAL(CountP2MRLeafSigOps(leaf, /*n_inputs=*/1), expected);
+        // Pre-fix this returned 0: the counter scanned the control block.
+        BOOST_CHECK_EQUAL(CountP2MRLeafSigOps(leaf, /*n_inputs=*/1, &annex), expected);
+        BOOST_CHECK_EQUAL(CountP2MRLeafSigOps(leaf, /*n_inputs=*/1, &big_annex), expected);
+    }
+
+    // Two-element witness: the trailing element is the control block even if it
+    // starts with 0x50, exactly as in VerifyWitnessProgram.
+    {
+        const std::vector<unsigned char> leaf = RepeatLeaf(fragment, 2);
+        const CScript script_pub_key = BuildP2MROutput(ComputeP2MRMerkleRoot({ComputeP2MRLeafHash(P2MR_LEAF_VERSION, leaf)}));
+        CScriptWitness witness;
+        witness.stack = {leaf, {ANNEX_TAG}};
+        BOOST_CHECK_EQUAL(CountWitnessSigOps(CScript{}, script_pub_key, &witness, SIGOP_COUNT_FLAGS), static_cast<size_t>(2 * VALIDATION_WEIGHT_PER_MLDSA_SIGOP));
+    }
+}
+
+// N-1 (a): OP_CHECKSIGFROMSTACK is counted at the SLH-DSA weight whatever pubkey
+// the leaf carries, since the executor picks the algorithm from the pubkey size at
+// run time and the static scan must never under-count.
+BOOST_AUTO_TEST_CASE(p2mr_witness_sigops_count_csfs_at_slhdsa_weight)
+{
+    const std::vector<unsigned char> ml_pk(MLDSA44_PUBKEY_SIZE, 0x21);
+    const std::vector<unsigned char> slh_pk(SLHDSA128S_PUBKEY_SIZE, 0x22);
+    const std::vector<unsigned char> ml_csfs = BuildP2MRCSFSScript(PQAlgorithm::ML_DSA_44, ml_pk);
+    const std::vector<unsigned char> slh_csfs = BuildP2MRCSFSScript(PQAlgorithm::SLH_DSA_128S, slh_pk);
+    const std::vector<unsigned char> annex{ANNEX_TAG, 0x01};
+
+    for (size_t k = 1; k <= 3; ++k) {
+        const size_t expected = k * VALIDATION_WEIGHT_PER_SLHDSA_SIGOP;
+        // Pre-fix CSFS was absent from the counter's switch and counted 0.
+        BOOST_CHECK_EQUAL(CountP2MRLeafSigOps(RepeatLeaf(ml_csfs, k), /*n_inputs=*/2), expected);
+        BOOST_CHECK_EQUAL(CountP2MRLeafSigOps(RepeatLeaf(slh_csfs, k), /*n_inputs=*/2), expected);
+        BOOST_CHECK_EQUAL(CountP2MRLeafSigOps(RepeatLeaf(ml_csfs, k), /*n_inputs=*/2, &annex), expected);
+    }
+
+    // The bare opcode (pubkey supplied from the witness) is counted the same way.
+    const std::vector<unsigned char> bare{static_cast<unsigned char>(OP_CHECKSIGFROMSTACK)};
+    BOOST_CHECK_EQUAL(CountP2MRLeafSigOps(bare, /*n_inputs=*/3), static_cast<size_t>(VALIDATION_WEIGHT_PER_SLHDSA_SIGOP));
+}
+
+// N-1 (a): every PQ-verifying opcode the executor charges is charged by the counter.
+// The reserved Falcon slots are OP_SUCCESSx in P2MR (they verify nothing) and count 0.
+BOOST_AUTO_TEST_CASE(p2mr_witness_sigops_cover_every_pq_opcode)
+{
+    const std::vector<unsigned char> ml_pk(MLDSA44_PUBKEY_SIZE, 0x31);
+    const std::vector<unsigned char> slh_pk(SLHDSA128S_PUBKEY_SIZE, 0x32);
+
+    CScript leaf;
+    leaf << ml_pk << OP_CHECKSIG_MLDSA
+         << slh_pk << OP_CHECKSIG_SLHDSA
+         << ml_pk << OP_CHECKSIGADD_MLDSA
+         << slh_pk << OP_CHECKSIGADD_SLHDSA
+         << ml_pk << OP_CHECKSIGFROMSTACK
+         << OP_CHECKSIG_FALCON << OP_CHECKSIGADD_FALCON << OP_CHECKSIGFROMSTACK_FALCON;
+    const std::vector<unsigned char> leaf_bytes(leaf.begin(), leaf.end());
+
+    const size_t expected = VALIDATION_WEIGHT_PER_MLDSA_SIGOP +
+                            VALIDATION_WEIGHT_PER_SLHDSA_SIGOP +
+                            VALIDATION_WEIGHT_PER_MLDSA_MULTISIG_SIGOP +
+                            VALIDATION_WEIGHT_PER_SLHDSA_MULTISIG_SIGOP +
+                            VALIDATION_WEIGHT_PER_SLHDSA_SIGOP; // CSFS at the conservative weight
+    BOOST_CHECK_EQUAL(CountP2MRLeafSigOps(leaf_bytes, /*n_inputs=*/1), expected);
+}
+
+// N-1 (c): OP_CHECKSIGFROMSTACK verifies through checker.VerifyPQSignature with the
+// CSFS-tagged hash of the message, the algorithm derived from the pubkey size and
+// the FIPS-205 mode flag, so a caching checker can key its cache on all of them.
+BOOST_AUTO_TEST_CASE(csfs_routes_verification_through_checker_verifypqsignature)
+{
+    CPQKey key;
+    key.MakeNewKey(PQAlgorithm::ML_DSA_44);
+    BOOST_REQUIRE(key.IsValid());
+    const std::vector<unsigned char> msg{0x5A, 0x5B, 0x5C};
+    std::vector<unsigned char> sig = CreateCSFSSignature(key, msg);
+    sig[0] ^= 0x01; // corrupted: only a checker that says "true" can make this pass
+    const std::vector<unsigned char> script_bytes = BuildP2MRCSFSScript(PQAlgorithm::ML_DSA_44, key.GetPubKey());
+    const CScript script(script_bytes.begin(), script_bytes.end());
+    const std::vector<unsigned char> pubkey = key.GetPubKey(); // one temporary: begin()/end() of two temporaries is UB
+
+    for (const bool fips205 : {false, true}) {
+        const unsigned int flags = fips205 ? SCRIPT_VERIFY_SLHDSA_FIPS205 : SCRIPT_VERIFY_NONE;
+
+        std::vector<std::vector<unsigned char>> stack{sig, msg};
+        ScriptExecutionData execdata;
+        execdata.m_validation_weight_left_init = true;
+        execdata.m_validation_weight_left = 10 * VALIDATION_WEIGHT_PER_MLDSA_SIGOP;
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        const RecordingPQVerifyChecker checker{/*result=*/true};
+
+        BOOST_REQUIRE(EvalP2MRScript(stack, script, flags, checker, execdata, err));
+        BOOST_CHECK_EQUAL(stack.size(), 1U);
+        BOOST_CHECK(stack.back() == std::vector<unsigned char>({1}));
+        BOOST_CHECK_EQUAL(checker.calls, 1U);
+        BOOST_CHECK(checker.last_sig == sig);
+        BOOST_CHECK(checker.last_pubkey == pubkey);
+        BOOST_REQUIRE(checker.last_algo.has_value());
+        BOOST_CHECK(*checker.last_algo == PQAlgorithm::ML_DSA_44);
+        BOOST_REQUIRE(checker.last_hash.has_value());
+        BOOST_CHECK(*checker.last_hash == ComputeCSFSHash(msg));
+        BOOST_CHECK_EQUAL(checker.last_fips205, fips205);
+        // The weight is still charged on this path.
+        BOOST_CHECK_EQUAL(execdata.m_validation_weight_left, 9 * VALIDATION_WEIGHT_PER_MLDSA_SIGOP);
+    }
+
+    // And a checker that says "false" yields a false result (no NULLFAIL here).
+    {
+        std::vector<std::vector<unsigned char>> stack{sig, msg};
+        ScriptExecutionData execdata;
+        execdata.m_validation_weight_left_init = true;
+        execdata.m_validation_weight_left = 10 * VALIDATION_WEIGHT_PER_MLDSA_SIGOP;
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        const RecordingPQVerifyChecker checker{/*result=*/false};
+        BOOST_REQUIRE(EvalP2MRScript(stack, script, SCRIPT_VERIFY_NONE, checker, execdata, err));
+        BOOST_CHECK_EQUAL(stack.size(), 1U);
+        BOOST_CHECK(stack.back().empty());
+        BOOST_CHECK_EQUAL(checker.calls, 1U);
+    }
+}
+
+// N-1 (c): a full P2MR CSFS spend verified with CachingTransactionSignatureChecker
+// populates the salted signature cache under the CSFS hash / algorithm / mode key.
+BOOST_AUTO_TEST_CASE(csfs_verification_is_covered_by_signature_cache)
+{
+    CPQKey oracle;
+    oracle.MakeNewKey(PQAlgorithm::ML_DSA_44);
+    BOOST_REQUIRE(oracle.IsValid());
+    const std::vector<unsigned char> pubkey = oracle.GetPubKey(); // one temporary: begin()/end() of two temporaries is UB
+    const std::vector<unsigned char> msg{0x71, 0x72, 0x73, 0x74};
+    const std::vector<unsigned char> sig = CreateCSFSSignature(oracle, msg);
+    const uint256 csfs_hash = ComputeCSFSHash(msg);
+
+    const std::vector<unsigned char> leaf_script = BuildP2MRCSFSScript(PQAlgorithm::ML_DSA_44, pubkey);
+    const uint256 leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION, leaf_script);
+    P2MRSpendContext ctx{BuildP2MROutput(ComputeP2MRMerkleRoot({leaf_hash}))};
+
+    CScriptWitness witness;
+    witness.stack = {sig, msg, leaf_script, {P2MR_LEAF_VERSION}};
+    ctx.tx_spend.vin.at(0).scriptWitness = witness;
+    const CTransaction tx{ctx.tx_spend};
+
+    SignatureCache cache{1 << 20};
+    uint256 entry;
+    cache.ComputeEntryPQ(entry, csfs_hash, sig, pubkey, PQAlgorithm::ML_DSA_44, /*slhdsa_fips205=*/false);
+    BOOST_CHECK(!cache.Get(entry, /*erase=*/false));
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifyScript(
+        tx.vin.at(0).scriptSig,
+        ctx.tx_credit.vout.at(0).scriptPubKey,
+        &tx.vin.at(0).scriptWitness,
+        P2MR_SCRIPT_FLAGS,
+        CachingTransactionSignatureChecker(&tx, /*nIn=*/0, ctx.tx_credit.vout.at(0).nValue, /*storeIn=*/true, cache, ctx.txdata),
+        &err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+
+    // The CSFS verification result is now cached under its own key ...
+    BOOST_CHECK(cache.Get(entry, /*erase=*/false));
+    // ... and not under the FIPS-205 variant of the same tuple.
+    uint256 fips_entry;
+    cache.ComputeEntryPQ(fips_entry, csfs_hash, sig, pubkey, PQAlgorithm::ML_DSA_44, /*slhdsa_fips205=*/true);
+    BOOST_CHECK(!cache.Get(fips_entry, /*erase=*/false));
+}
+
+// M-8 (test 3): the per-input validation budget arithmetic reflects the 1000-unit
+// SLH-DSA weight on a real spend. With one 7,856-byte witness signature re-verified
+// k times, the budget is ~7,909 + 36k while the cost is 1000k, so k = 8 fits and
+// k = 9 does not; under the pre-M-8 weight of 500, k = 9 would have been accepted.
+BOOST_AUTO_TEST_CASE(p2mr_slhdsa_spend_budget_reflects_raised_weight)
+{
+    CPQKey key;
+    key.MakeNewKey(PQAlgorithm::SLH_DSA_128S);
+    BOOST_REQUIRE(key.IsValid());
+
+    // Find the boundary from sizes alone (no signing needed: SLH-DSA signatures
+    // have a fixed size), then sign only the two boundary leaves.
+    const std::vector<unsigned char> dummy_sig(SLHDSA128S_SIGNATURE_SIZE, 0x00);
+    auto budget_for = [&](size_t k) {
+        CScriptWitness w;
+        w.stack = {dummy_sig, BuildRepeatedSLHDSAChecksigLeaf(key.GetPubKey(), k), {P2MR_LEAF_VERSION}};
+        return P2MRInputBudget(w);
+    };
+    size_t k_pass{0};
+    for (size_t k = 1; k <= 32; ++k) {
+        if (static_cast<int64_t>(k) * VALIDATION_WEIGHT_PER_SLHDSA_SIGOP <= budget_for(k)) k_pass = k;
+    }
+    BOOST_REQUIRE_GE(k_pass, 1U);
+    const size_t k_fail = k_pass + 1;
+    BOOST_REQUIRE_GT(static_cast<int64_t>(k_fail) * VALIDATION_WEIGHT_PER_SLHDSA_SIGOP, budget_for(k_fail));
+    BOOST_CHECK_EQUAL(k_pass, 8U);
+    // Documenting the M-8 change: at the old weight (500) the failing leaf fit.
+    BOOST_CHECK_LE(static_cast<int64_t>(k_fail) * 500, budget_for(k_fail));
+
+    for (const size_t k : {k_pass, k_fail}) {
+        const std::vector<unsigned char> leaf = BuildRepeatedSLHDSAChecksigLeaf(key.GetPubKey(), k);
+        const uint256 leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION, leaf);
+        P2MRSpendContext ctx{BuildP2MROutput(ComputeP2MRMerkleRoot({leaf_hash}))};
+        const auto sighash = ComputeP2MRSighash(ctx, leaf);
+        BOOST_REQUIRE(sighash.has_value());
+        std::vector<unsigned char> sig;
+        BOOST_REQUIRE(key.Sign(*sighash, sig));
+        BOOST_REQUIRE_EQUAL(sig.size(), SLHDSA128S_SIGNATURE_SIZE);
+
+        CScriptWitness witness;
+        witness.stack = {sig, leaf, {P2MR_LEAF_VERSION}};
+        BOOST_CHECK_EQUAL(P2MRInputBudget(witness), budget_for(k));
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        const bool ok = VerifyP2MRSpend(ctx, witness, err);
+        if (k == k_pass) {
+            BOOST_CHECK_MESSAGE(ok, "k=" << k << " should fit the budget");
+            BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+        } else {
+            BOOST_CHECK_MESSAGE(!ok, "k=" << k << " should exhaust the budget");
+            BOOST_CHECK_EQUAL(err, SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT);
+        }
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

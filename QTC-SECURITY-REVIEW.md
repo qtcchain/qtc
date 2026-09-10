@@ -272,8 +272,10 @@ Fixed in the working tree (commit pending the full-suite result), no consensus c
 | P-4..P-8 | budget keys by NodeId / IPv6 /64; service bit soft; cmpctblock fetch via BlockRequested; no outbound disconnect on unconnecting headers; guard limitation documented | `denialofservice_tests` |
 | N-10 / W-2..W-5 / M-9 / M-10 / B-12 / QTC-07 | auto-update off unless explicit, hash always required, dev-origin refused on mainnet, downgrade marker; installer key removed, ML-DSA required, git_commit mandatory; verify tooling no longer trusts upstream hosts/keys; secrets off argv; prebuilt binary removed; CI runs upstream functional suites | `autoupdate_tests` |
 
-Deferred to the consensus fork (modelled in iCloud `QTC/software/QTC_Consensus_Fix_Model_2026-09-10`): N-1, M-8, N-5,
-S-1/S-2/C-3/C-4 gate, C-2 default, H1/H2/H3.
+Consensus fork applied 2026-09-10 (QTC-LAUNCH-SAFETY.md §12): N-1, M-8, N-5, the S-1/S-2/C-3/C-4 gate, C-2 default, and
+the genesis regeneration. Still open: H2 (powLimit after the GPU measurement), H1 at launch (regenerate again), H3 via
+minimum chain work and a checkpoint post-launch, M-11 (stubbed template readiness guard), porting the upstream functional
+suites (M-9).
 
 ## What was NOT covered
 No fuzzing, no functional-test runs, no dynamic analysis; no review of the miner/pool/stratum tooling outside this tree;

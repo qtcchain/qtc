@@ -134,6 +134,7 @@ add_executable(test_qtc
   lattice_poly_tests.cpp
   lattice_polyvec_tests.cpp
   note_encryption_tests.cpp
+  shielded_gate_tests.cpp
   shielded_merkle_serialization_tests.cpp
   shielded_merkle_tests.cpp
   shielded_transaction_tests.cpp

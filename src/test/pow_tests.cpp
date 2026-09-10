@@ -991,9 +991,12 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_matmul_activation)
     BOOST_CHECK_EQUAL(consensus.nShieldedSpendPathRecoveryActivationHeight, 0);
     BOOST_CHECK_EQUAL(consensus.nShieldedC002ActivationHeight, 0);
     BOOST_CHECK_EQUAL(consensus.nShieldedSunsetHeight, 0); // QTC D9: pool sunset from genesis
-    BOOST_CHECK_EQUAL(consensus.nShieldedRecoveryExitActivationHeight, 0);
     BOOST_CHECK(consensus.IsShieldedSunsetActive(0));
-    BOOST_CHECK(consensus.IsShieldedRecoveryExitActive(0));
+    // Security-review fork: the pool can never hold value on mainnet, so the whole shielded
+    // surface is disabled and the recovery exit never activates (S-1/S-2/C-3/C-4).
+    BOOST_CHECK(consensus.fShieldedPoolDisabled);
+    BOOST_CHECK_EQUAL(consensus.nShieldedRecoveryExitActivationHeight, std::numeric_limits<int32_t>::max());
+    BOOST_CHECK(!consensus.IsShieldedRecoveryExitActive(0));
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_genesis_reduced_data_compliant)
@@ -1057,7 +1060,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_option_b_asert_anchored_at_genesis)
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_genesis_header_fields_frozen)
 {
     const auto params = CreateChainParams(*m_node.args, ChainType::MAIN);
-    assert_qtc_genesis_header_fields(*params, 1773878400U, 0U, "1e013333", 1U); // nBits == compact(powLimit)
+    assert_qtc_genesis_header_fields(*params, 1789063200U, 0U, "1e013333", 1U); // nBits == compact(powLimit)
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_genesis_hashes_frozen)
@@ -1065,7 +1068,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_genesis_hashes_frozen)
     const auto params = CreateChainParams(*m_node.args, ChainType::MAIN);
     assert_qtc_genesis_hashes(
         *params,
-        "c53432768f1d1898dfa336fde028b527fef96a44319ee3f8b6c483aa1b8af8e3",
+        "44c4f064d67cca8053e7dfe74f8935b146ce913f81bf87ec7ba65db69f1504d4",
         "68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23");
 }
 
@@ -1128,7 +1131,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_REGTEST_genesis_reduced_data_compliant)
 BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_genesis_header_fields_frozen)
 {
     const auto params = CreateChainParams(*m_node.args, ChainType::TESTNET);
-    assert_qtc_genesis_header_fields(*params, 1773878400U, 0U, "20027525", 238U);
+    assert_qtc_genesis_header_fields(*params, 1789063200U, 0U, "20027525", 238U);
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_genesis_hashes_frozen)
@@ -1136,7 +1139,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_genesis_hashes_frozen)
     const auto params = CreateChainParams(*m_node.args, ChainType::TESTNET);
     assert_qtc_genesis_hashes(
         *params,
-        "ac4518b8cdd24b4f82789b1136d6735ebd5d2d260d40b61abd49ee11f54140e2",
+        "2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb",
         "68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23");
 }
 
@@ -1145,7 +1148,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_TESTNET4_genesis_hashes_frozen)
     const auto params = CreateChainParams(*m_node.args, ChainType::TESTNET4);
     assert_qtc_genesis_hashes(
         *params,
-        "ac4518b8cdd24b4f82789b1136d6735ebd5d2d260d40b61abd49ee11f54140e2",
+        "2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb",
         "68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23");
 }
 
@@ -2308,7 +2311,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_hardening_anchor_consistency)
     BOOST_CHECK_EQUAL(it_0->second.GetHex(), consensus.hashGenesisBlock.GetHex());
     BOOST_CHECK_EQUAL(
         it_0->second.GetHex(),
-        "c53432768f1d1898dfa336fde028b527fef96a44319ee3f8b6c483aa1b8af8e3");
+        "44c4f064d67cca8053e7dfe74f8935b146ce913f81bf87ec7ba65db69f1504d4");
 
     BOOST_CHECK(params->GetAvailableSnapshotHeights().empty());
     BOOST_CHECK(!params->AssumeutxoForHeight(55000).has_value());

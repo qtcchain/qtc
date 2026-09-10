@@ -119,6 +119,8 @@ std::string ScriptErrorString(const ScriptError serror)
             return "Invalid P2MR control block size";
         case SCRIPT_ERR_P2MR_WRONG_LEAF_VERSION:
             return "Invalid P2MR leaf version";
+        case SCRIPT_ERR_P2MR_ANNEX_UNSUPPORTED:
+            return "P2MR annex is not supported";
         case SCRIPT_ERR_PQ_PUBKEY_SIZE:
             return "Invalid post-quantum public key size";
         case SCRIPT_ERR_PQ_MULTISIG_THRESHOLD:

@@ -486,11 +486,21 @@ std::atomic<int64_t> g_reorg_protection_last_deferred_unix{0};
     return false;
 }
 
-[[nodiscard]] bool RejectShieldedHeightGateViolation(const CTransaction& tx,
-                                                     const Consensus::Params& consensus,
-                                                     int32_t validation_height,
-                                                     std::string& reject_reason)
+} // namespace
+
+bool RejectShieldedHeightGateViolation(const CTransaction& tx,
+                                       const Consensus::Params& consensus,
+                                       int32_t validation_height,
+                                       std::string& reject_reason)
 {
+    // QTC security review S-1/S-2/C-3/C-4: on a chain whose shielded pool is disabled EVERY bundle is
+    // rejected before any value-balance parsing, witness/proof parsing, ML-DSA ownership or membership
+    // work, on every chainstate and in every path (mempool, ConnectBlock, state rebuilds, audits).
+    // This must remain the first statement of the gate.
+    if (consensus.fShieldedPoolDisabled && tx.HasShieldedBundle()) {
+        reject_reason = "bad-shielded-disabled";
+        return false;
+    }
     if (!RejectShieldedSunsetViolation(tx, consensus, validation_height, reject_reason)) {
         return false;
     }
@@ -502,6 +512,19 @@ std::atomic<int64_t> g_reorg_protection_last_deferred_unix{0};
     }
     return true;
 }
+
+bool IsShieldedTxPolicyStandard(const CTransaction& tx, const Consensus::Params& consensus, std::string& reason)
+{
+    // QTC security review S-2: IsStandardTx() only sees kernel::MemPoolOptions, so the chain-dependent
+    // shielded standardness rule lives here and is applied by MemPoolAccept::PreChecks right after it.
+    if (consensus.fShieldedPoolDisabled && tx.HasShieldedBundle()) {
+        reason = "shielded-disabled";
+        return false;
+    }
+    return true;
+}
+
+namespace {
 
 [[nodiscard]] bool RejectPostForkTransparentFundingV2SendContext(const CTransaction& tx,
                                                                  const CCoinsViewCache& view,
@@ -1941,6 +1964,7 @@ static void RefreshShieldedValidationSnapshots(
     for (const auto& tx_ref : block.vtx) {
         const CTransaction& tx = *tx_ref;
         if (!tx.HasShieldedBundle()) continue;
+        if (consensus.fShieldedPoolDisabled) return std::string{"bad-shielded-disabled"};
         const CShieldedBundle& bundle = tx.GetShieldedBundle();
         if (!NeedsShieldedProofCheck(bundle, consensus, height)) continue;
 
@@ -2937,6 +2961,19 @@ bool BuildShieldedProofAuditArchive(const Chainstate& chainstate,
         for (const auto& txref : block.vtx) {
             if (!txref->HasShieldedBundle()) continue;
 
+            // Height gate (incl. the disabled-pool rule) runs before any proof work.
+            std::string height_gate_reject;
+            if (!RejectShieldedHeightGateViolation(*txref,
+                                                   chainstate.m_chainman.GetConsensus(),
+                                                   pindex->nHeight,
+                                                   height_gate_reject)) {
+                error = strprintf("shielded height-gate audit failed txid=%s height=%d reject=%s",
+                                  txref->GetHash().ToString(),
+                                  pindex->nHeight,
+                                  height_gate_reject);
+                return false;
+            }
+
             const CShieldedBundle& bundle = txref->GetShieldedBundle();
             shielded::audit::ProofAuditEntry entry;
             entry.block_hash = pindex->GetBlockHash();
@@ -2968,17 +3005,6 @@ bool BuildShieldedProofAuditArchive(const Chainstate& chainstate,
             archive.verified_count += 1;
             archive.entries.push_back(std::move(entry));
 
-            std::string height_gate_reject;
-            if (!RejectShieldedHeightGateViolation(*txref,
-                                                   chainstate.m_chainman.GetConsensus(),
-                                                   pindex->nHeight,
-                                                   height_gate_reject)) {
-                error = strprintf("shielded height-gate audit failed txid=%s height=%d reject=%s",
-                                  txref->GetHash().ToString(),
-                                  pindex->nHeight,
-                                  height_gate_reject);
-                return false;
-            }
             if (!ApplyShieldedStateEffects(bundle,
                                            use_nonced_bridge_tag,
                                            pindex->GetBlockHash(),
@@ -4129,6 +4155,13 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         return false; // state filled in by CheckTransaction
     }
 
+    // QTC security review S-1/S-2: on a chain whose shielded pool is disabled, reject a bundle here --
+    // before standardness weighing, shielded state initialisation, nullifier/anchor conflict lookups and
+    // proof work. The full height gate below repeats this check; this is the earliest point.
+    if (tx.HasShieldedBundle() && m_active_chainstate.m_chainman.GetConsensus().fShieldedPoolDisabled) {
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-shielded-disabled");
+    }
+
     // Coinbase is only valid in a block, not as a loose transaction
     if (tx.IsCoinBase())
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "coinbase");
@@ -4140,6 +4173,11 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // Rather not work on nonstandard transactions (unless -testnet/-regtest)
     std::string reason;
     if (m_pool.m_opts.require_standard && !IsStandardTx(tx, m_pool.m_opts, reason, ignore_rejects)) {
+        return state.Invalid(TxValidationResult::TX_NOT_STANDARD, reason);
+    }
+    // Chain-dependent shielded standardness (IsStandardTx only sees policy options).
+    if (m_pool.m_opts.require_standard &&
+        !IsShieldedTxPolicyStandard(tx, m_active_chainstate.m_chainman.GetConsensus(), reason)) {
         return state.Invalid(TxValidationResult::TX_NOT_STANDARD, reason);
     }
 
@@ -7018,8 +7056,14 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
     CBlockUndo blockundo;
 
+    const bool block_has_shielded_bundle{BlockHasShieldedBundle(block)};
+    // QTC security review S-1/C-4: a disabled pool rejects the block on EVERY chainstate (not only the
+    // active one) before shielded state is initialised or the tree is snapshotted.
+    if (block_has_shielded_bundle && params.GetConsensus().fShieldedPoolDisabled) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-shielded-disabled");
+    }
     const bool enforce_shielded_consensus{
-        apply_shielded_state && this == &m_chainman.ActiveChainstate() && BlockHasShieldedBundle(block)};
+        apply_shielded_state && this == &m_chainman.ActiveChainstate() && block_has_shielded_bundle};
     if (enforce_shielded_consensus) {
         if (!m_chainman.EnsureShieldedStateInitialized()) {
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "shielded-state-init-failed");
@@ -9736,6 +9780,17 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-signet-blksig", "signet block signature validation failure");
     }
 
+    // QTC security review N-5: the legacy MatMul v2 payload vectors (matrix_a_data / matrix_b_data) are
+    // covered by neither the header, the merkle root nor matmul_digest, so a relaying peer can append up
+    // to ~24 MB of junk to an honest block at zero PoW cost. Chains with deterministic seeds never need
+    // them: reject as MUTATED (the header stays valid, exactly like witness malleation) before any
+    // merkle or transaction work, so the block is neither stored nor relayed.
+    if (consensusParams.fMatMulRejectLegacyPayloadVectors && HasMatMulV2Payload(block)) {
+        return state.Invalid(BlockValidationResult::BLOCK_MUTATED, "bad-matmul-legacy-payload",
+                             strprintf("%s : legacy matmul payload vectors present (a=%u b=%u words)", __func__,
+                                       block.matrix_a_data.size(), block.matrix_b_data.size()));
+    }
+
     if (consensusParams.fMatMulPOW) {
         const bool has_v2_payload = HasMatMulV2Payload(block);
         if (has_v2_payload && !IsMatMulV2PayloadSizeValid(block, consensusParams)) {
@@ -9786,6 +9841,13 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
             assert(tx_state.GetResult() == TxValidationResult::TX_CONSENSUS);
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, tx_state.GetRejectReason(),
                                  strprintf("Transaction check failed (tx hash %s) %s", tx->GetHash().ToString(), tx_state.GetDebugMessage()));
+        }
+        // QTC security review S-1/C-4: shielded bundles are txid- (hence merkle-) committed, so this is a
+        // context-free consensus rejection that runs before the block is stored, relayed or connected on
+        // any chainstate.
+        if (consensusParams.fShieldedPoolDisabled && tx->HasShieldedBundle()) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-shielded-disabled",
+                                 strprintf("Transaction %s carries a shielded bundle on a chain whose shielded pool is disabled", tx->GetHash().ToString()));
         }
         if (consensusParams.fReducedDataLimits &&
             !CheckReducedDataOutputLimits(*tx, state, consensusParams)) {

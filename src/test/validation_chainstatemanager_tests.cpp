@@ -4028,7 +4028,8 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_args, BasicTestingSetup)
     BOOST_CHECK_EQUAL(default_profile.warn_depth, 3U);
     BOOST_CHECK_EQUAL(default_profile.park_depth, kernel::REORG_PROTECTION_DEPTH_DISABLED);
     BOOST_CHECK_EQUAL(default_profile.finality_depth, 72U);
-    BOOST_CHECK_EQUAL(default_profile.hysteresis_depth, 0U);
+    // Security-review fork C-2: one-block races follow most-work; the work margin applies to depth >= 2.
+    BOOST_CHECK_EQUAL(default_profile.hysteresis_depth, 1U);
     BOOST_CHECK_EQUAL(default_profile.hysteresis_work_margin, 2U);
 
     const auto standard_opts = get_valid_opts({"-reorgprotectionprofile=standard"});
@@ -4075,7 +4076,7 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_args, BasicTestingSetup)
     BOOST_CHECK_EQUAL(emergency_profile.warn_depth, 3U);
     BOOST_CHECK_EQUAL(emergency_profile.park_depth, kernel::REORG_PROTECTION_DEPTH_DISABLED);
     BOOST_CHECK_EQUAL(emergency_profile.finality_depth, 72U);
-    BOOST_CHECK_EQUAL(emergency_profile.hysteresis_depth, 0U);
+    BOOST_CHECK_EQUAL(emergency_profile.hysteresis_depth, 1U); // security-review fork C-2
     BOOST_CHECK_EQUAL(emergency_profile.hysteresis_work_margin, 2U);
 
     BOOST_CHECK(get_valid_opts({"-reorgprotectionprofile=archive", "-parkdeepreorg=1"}).deep_reorg_action == kernel::DeepReorgAction::PARK);

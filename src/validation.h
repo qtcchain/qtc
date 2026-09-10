@@ -364,6 +364,18 @@ static const std::string rejectmsg_zero_mempool_entry_seq = "zero mempool entry 
 MempoolAcceptResult AcceptToMemoryPool(Chainstate& active_chainstate, const CTransactionRef& tx,
                                        int64_t accept_time, const ignore_rejects_type& ignore_rejects, bool test_accept) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+/** QTC shielded height gate (disabled pool, sunset, pool-credit disable, zero-output exit). Consensus,
+ *  chainstate-independent. Returns false and sets reject_reason on violation; the first rule is
+ *  "bad-shielded-disabled" whenever consensus.fShieldedPoolDisabled and the tx carries a bundle. */
+[[nodiscard]] bool RejectShieldedHeightGateViolation(const CTransaction& tx,
+                                                     const Consensus::Params& consensus,
+                                                     int32_t validation_height,
+                                                     std::string& reject_reason);
+/** Policy: a transaction carrying a shielded bundle is non-standard ("shielded-disabled") on a chain whose
+ *  shielded pool is disabled. Applied by mempool acceptance right after IsStandardTx(). */
+[[nodiscard]] bool IsShieldedTxPolicyStandard(const CTransaction& tx,
+                                              const Consensus::Params& consensus,
+                                              std::string& reason);
 [[nodiscard]] bool HasInvalidShieldedAnchors(const CTransaction& tx,
                                              const ChainstateManager& chainman) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 [[nodiscard]] bool HasInvalidShieldedRecoveryExitMempoolState(const CTransaction& tx,

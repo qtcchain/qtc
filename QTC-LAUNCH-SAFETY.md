@@ -385,8 +385,8 @@ Halving table (block, year, coins/block): 0 → 50; 210,000 → 25 (y4); 420,000
   `stall_sim.py` gained `--spacing/--tau`.
 
 **Genesis regenerated** (the coinbase value is the subsidy, nBits = compact(powLimit)):
-- main    `c53432768f1d1898dfa336fde028b527fef96a44319ee3f8b6c483aa1b8af8e3` (bits `1e013333`)
-- test/testnet4/signet `ac4518b8cdd24b4f82789b1136d6735ebd5d2d260d40b61abd49ee11f54140e2`
+- main    `44c4f064d67cca8053e7dfe74f8935b146ce913f81bf87ec7ba65db69f1504d4` (bits `1e013333`)
+- test/testnet4/signet `2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb`
 - regtest `25d0b1c272072b56bb0e79aea8566b16378648775e7a517d9d022720f6a1fca6`
 - shieldedv2dev `309ae3de50712d4520cec19066979473a70de4a4b73d89b3327a07c845336e1f`
 - merkle `68668615…` (shared coinbase)
@@ -433,3 +433,22 @@ one-hash-per-element oracle (540 k SHA-256 per nonce) dominated GPU attempts —
 **Open.** GPU digest kernels (Metal, CUDA) are gated to the CPU path until ported and parity-tested on hardware; the
 in-kernel "factored compression" path is the H4 shortcut and must be deleted in the port. Spec: iCloud
 `QTC/software/QTC_O5_Implementation_2026-09-09.md`. The upstream chain remains on v3 and is exposed to H4.
+
+## 12. Security-review consensus fork applied (2026-09-10)
+
+Applied together, from genesis, with a genesis regeneration (see `QTC-SECURITY-REVIEW.md` and the model in iCloud
+`QTC/software/QTC_Consensus_Fix_Model_2026-09-10`):
+
+| Item | Change |
+|---|---|
+| N-1 | `WitnessSigOps` mirrors the executor's annex handling and counts every PQ-verifying opcode; `OP_CHECKSIGFROMSTACK` counted at the SLH-DSA weight and verified through the caching checker; P2MR annex rejected at consensus (`SCRIPT_ERR_P2MR_ANNEX_UNSUPPORTED`) |
+| M-8 | `VALIDATION_WEIGHT_PER_SLHDSA_SIGOP` 500 → 1,000 (multisig 5,000 unchanged: the per-input budget cannot afford more) |
+| N-5 | `fMatMulRejectLegacyPayloadVectors` (main/test/testnet4/signet): blocks with `matrix_a_data`/`matrix_b_data` are `BLOCK_MUTATED bad-matmul-legacy-payload`; sender punished; vectors stripped before storage |
+| Shielded gate | `fShieldedPoolDisabled` (mainnet): first check on every consensus path, non-standard, recovery exit `INT32_MAX` |
+| C-2 | default reorg profile `hysteresis_depth` 0 → 1 (fork-choice policy, same release) |
+| Genesis | `nTime 1789063200` (2026-09-10 18:00 UTC) on main/test/testnet4/signet: main `44c4f064…1504d4`, test/testnet4/signet `2532b498…7870cb`; regtest and shieldedv2dev unchanged; merkle unchanged |
+
+**Still placeholders:** `powLimit` (H2, needs the GPU throughput measurement after the kernel port) and the genesis
+timestamp itself, which must be regenerated within hours of the real launch (H1) — the procedure is
+`genesis_regen_hooks.py` → build → boot each chain → `genesis_bake4.py` (scratch scripts, copied to iCloud
+`QTC/software`). H3 is handled after launch by `nMinimumChainWork` and a checkpoint in the first point release.

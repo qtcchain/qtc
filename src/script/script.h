@@ -65,20 +65,40 @@ static constexpr int64_t VALIDATION_WEIGHT_OFFSET{50};
 
 // Validation weight cost per passing ML-DSA-44 signature check in P2MR.
 // Set to match Tapscript's VALIDATION_WEIGHT_PER_SIGOP_PASSED (50).
-// ML-DSA-44 verification is ~10x slower than Schnorr, but the block sigops
-// budget (480k) already caps worst-case verification time to ~20% of the
-// 90-second block interval. A lower weight avoids penalizing PQ transactions
-// in virtual-size (via bytes_per_sigop) and the per-tx sigops policy limit.
+// Measured verify cost (QTC-SECURITY-REVIEW M-8): ~48 us on Apple M5 with the
+// in-tree library, a few hundred us on the x86 reference build. The block
+// sigops budget (MAX_BLOCK_SIGOPS_COST = 480k) therefore bounds a block to
+// 9,600 ML-DSA-44 verifications, i.e. well under one second single-threaded on
+// any supported validator against the 600-second block interval. A lower
+// weight avoids penalizing PQ transactions in virtual-size (via
+// bytes_per_sigop) and the per-tx sigops policy limit.
+//
+// These weights are charged twice: statically by WitnessSigOps against the
+// block sigops budget, and at execution time against the per-input validation
+// budget (serialized witness size + VALIDATION_WEIGHT_OFFSET). A per-signature
+// weight must therefore stay below the budget one signature contributes
+// (signature size + compactsize prefix), or the opcode becomes unspendable.
 static constexpr int64_t VALIDATION_WEIGHT_PER_MLDSA_SIGOP{50};
 
 // Validation weight cost per passing SLH-DSA-128s signature check in P2MR.
-// SLH-DSA is ~50x slower than Schnorr, so 10x the Tapscript weight.
-static constexpr int64_t VALIDATION_WEIGHT_PER_SLHDSA_SIGOP{500};
+// Raised from 500 to 1000 (QTC-SECURITY-REVIEW M-8). SLH-DSA-128s verify is
+// ~147 us on Apple M5 but 1-3 ms on the x86 reference build; the weight targets
+// the slowest supported validator. 480k / 1000 = 480 verifications per block,
+// at most ~1.5 s single-threaded per 600-second block on the reference build.
+// OP_CHECKSIGFROMSTACK is statically counted at this weight regardless of the
+// algorithm (see WitnessSigOps), since its algorithm is only known at run time.
+static constexpr int64_t VALIDATION_WEIGHT_PER_SLHDSA_SIGOP{1000};
 
 // Validation weight cost per passing ML-DSA-44 OP_CHECKSIGADD check in P2MR.
 static constexpr int64_t VALIDATION_WEIGHT_PER_MLDSA_MULTISIG_SIGOP{500};
 
 // Validation weight cost per passing SLH-DSA-128s OP_CHECKSIGADD check in P2MR.
+// Deliberately NOT scaled 10x alongside the M-8 single-sig change: an SLH-DSA
+// signature contributes only 7,859 (7,856 + 3) to the per-input validation
+// budget, so any per-signature weight above that makes every SLH-DSA
+// OP_CHECKSIGADD spend fail SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT. 5000 keeps
+// the multisig premium (5x the single-sig weight) while remaining spendable;
+// pq_consensus_tests pins this invariant.
 static constexpr int64_t VALIDATION_WEIGHT_PER_SLHDSA_MULTISIG_SIGOP{5000};
 
 // Standard policy limit for number of PQ pubkeys in a single P2MR multisig leaf.

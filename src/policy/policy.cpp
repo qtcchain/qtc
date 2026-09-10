@@ -883,7 +883,8 @@ bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs,
         if (is_p2mr) {
             Span<const std::vector<unsigned char>> stack{tx.vin[i].scriptWitness.stack};
             if (stack.size() >= 3 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
-                // Annexes are consensus-valid but nonstandard for P2MR until semantics are defined.
+                // Annexes are rejected by P2MR consensus (SCRIPT_ERR_P2MR_ANNEX_UNSUPPORTED,
+                // QTC-SECURITY-REVIEW N-1); reject here first with a specific reason.
                 MaybeReject("p2mr-annex");
                 SpanPopBack(stack);
             }

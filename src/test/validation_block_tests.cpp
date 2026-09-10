@@ -8,6 +8,7 @@
 #include <consensus/merkle.h>
 #include <consensus/validation.h>
 #include <hash.h>
+#include <net_processing.h>
 #include <node/blockstorage.h>
 #include <node/miner.h>
 #include <pow.h>
@@ -446,5 +447,102 @@ BOOST_AUTO_TEST_CASE(random_tiebreak_equal_work)
 
     // Restore default (off) so we do not leak state into other test cases.
     SetRandomTiebreak(/*enabled=*/false);
+}
+// QTC security review N-5: the legacy MatMul v2 payload vectors (matrix_a_data /
+// matrix_b_data) are covered by neither the header, the merkle root nor
+// matmul_digest. On chains that set fMatMulRejectLegacyPayloadVectors a block
+// carrying them is BLOCK_MUTATED (the header stays valid, exactly like witness
+// malleation); regtest keeps them accepted for the legacy payload tests.
+BOOST_AUTO_TEST_CASE(matmul_legacy_payload_vectors_rejected_when_flagged)
+{
+    bool ignored;
+    BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), true, true, &ignored));
+    const auto good = GoodBlock(Params().GenesisBlock().GetHash());
+    BOOST_REQUIRE(!HasMatMulV2Payload(*good));
+
+    const Consensus::Params& lenient{Params().GetConsensus()};
+    BOOST_REQUIRE(!lenient.fMatMulRejectLegacyPayloadVectors); // regtest keeps legacy payloads
+    Consensus::Params strict{lenient};
+    strict.fMatMulRejectLegacyPayloadVectors = true;
+
+    CBlock with_vectors{*good};
+    with_vectors.matrix_a_data.assign(16, 1u);
+    with_vectors.matrix_b_data.assign(16, 2u);
+    BOOST_REQUIRE(HasMatMulV2Payload(with_vectors));
+    // The vectors are not header-committed: the hash is unchanged.
+    BOOST_CHECK_EQUAL(with_vectors.GetHash(), good->GetHash());
+
+    {
+        BlockValidationState state;
+        BOOST_CHECK(!CheckBlock(with_vectors, state, strict, /*fCheckPOW=*/true, /*fCheckMerkleRoot=*/true));
+        BOOST_CHECK(state.GetResult() == BlockValidationResult::BLOCK_MUTATED);
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-matmul-legacy-payload");
+        BOOST_CHECK(!with_vectors.fChecked);
+    }
+    {
+        // Only one of the two vectors is enough to trigger the rule.
+        CBlock a_only{*good};
+        a_only.matrix_a_data.assign(4, 3u);
+        BlockValidationState state;
+        BOOST_CHECK(!CheckBlock(a_only, state, strict, /*fCheckPOW=*/true, /*fCheckMerkleRoot=*/true));
+        BOOST_CHECK(state.GetResult() == BlockValidationResult::BLOCK_MUTATED);
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-matmul-legacy-payload");
+    }
+    {
+        // Regtest behaviour (flag false): the same block still passes.
+        CBlock lenient_copy{with_vectors};
+        BlockValidationState state;
+        BOOST_CHECK_MESSAGE(CheckBlock(lenient_copy, state, lenient, /*fCheckPOW=*/true, /*fCheckMerkleRoot=*/true), state.ToString());
+    }
+    {
+        // The identical block without the vectors passes under the strict rule.
+        CBlock stripped{*good};
+        BlockValidationState state;
+        BOOST_CHECK_MESSAGE(CheckBlock(stripped, state, strict, /*fCheckPOW=*/true, /*fCheckMerkleRoot=*/true), state.ToString());
+    }
+}
+
+// The sender of a block with appended legacy vectors is culpable (the header is
+// fine, the payload is not), so the rejection is routed to the MatMul Phase-2
+// punishment ladder like the other payload mutations.
+BOOST_AUTO_TEST_CASE(matmul_legacy_payload_is_phase2_failure)
+{
+    BlockValidationState legacy_payload;
+    legacy_payload.Invalid(BlockValidationResult::BLOCK_MUTATED, "bad-matmul-legacy-payload",
+                           "legacy matmul payload vectors present");
+    BOOST_CHECK(IsMatMulPhase2Failure(legacy_payload));
+
+    // A consensus-level rejection with the same reason string must not be misclassified.
+    BlockValidationState wrong_result;
+    wrong_result.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-matmul-legacy-payload", "");
+    BOOST_CHECK(!IsMatMulPhase2Failure(wrong_result));
+}
+
+// Defence in depth: on a chain with fMatMulRejectLegacyPayloadVectors (mainnet)
+// BlockManager::WriteBlock never persists the vectors, and the block hash is
+// unchanged by stripping them.
+BOOST_FIXTURE_TEST_CASE(matmul_legacy_payload_vectors_stripped_on_write, TestingSetup)
+{
+    auto& blockman{Assert(m_node.chainman)->m_blockman};
+    BOOST_REQUIRE(m_node.chainman->GetConsensus().fMatMulRejectLegacyPayloadVectors);
+
+    const CBlock& genesis{Params().GenesisBlock()};
+    CBlock with_vectors{genesis};
+    with_vectors.matrix_a_data.assign(8, 7u);
+    with_vectors.matrix_b_data.assign(8, 9u);
+    BOOST_REQUIRE(HasMatMulV2Payload(with_vectors));
+    BOOST_CHECK_EQUAL(with_vectors.GetHash(), genesis.GetHash());
+
+    const FlatFilePos pos{blockman.WriteBlock(with_vectors, 0)};
+    BOOST_REQUIRE(!pos.IsNull());
+
+    CBlock read_back;
+    BOOST_REQUIRE(blockman.ReadBlock(read_back, pos, genesis.GetHash()));
+    BOOST_CHECK(!HasMatMulV2Payload(read_back));
+    BOOST_CHECK(read_back.matrix_a_data.empty());
+    BOOST_CHECK(read_back.matrix_b_data.empty());
+    BOOST_CHECK_EQUAL(read_back.GetHash(), genesis.GetHash());
+    BOOST_CHECK_EQUAL(read_back.vtx.size(), genesis.vtx.size());
+    BOOST_CHECK(read_back.matrix_c_data == genesis.matrix_c_data);
 }
 BOOST_AUTO_TEST_SUITE_END()
