@@ -19,7 +19,13 @@
 namespace matmul::transcript {
 
 inline constexpr std::string_view COMPRESS_TAG{"matmul-compress-v1"};
-inline constexpr std::string_view PRODUCT_DIGEST_TAG{"matmul-product-digest-v3"};
+/** Product-committed digest v4 (QTC O5): every b×b tile of C' is hashed in full
+ *  (SHA-256 over b² LE32 elements, row-major), the tile hashes are hashed in
+ *  row-major tile order into a root, and the digest is
+ *  SHA256d(tag || sigma || root || dim_le32 || b_le32). The v3 linear
+ *  compression was removable from the mining loop (H4): a miner could evaluate
+ *  the compressed words in O(n³/b) without forming C'. */
+inline constexpr std::string_view PRODUCT_DIGEST_TAG{"matmul-product-digest-v4"};
 
 std::vector<field::Element> DeriveCompressionVector(const uint256& sigma, uint32_t b);
 field::Element CompressBlock(const Matrix& block_bb, const std::vector<field::Element>& v);
@@ -54,15 +60,27 @@ uint256 ReplayCanonicalHashWithReusableCleanProducts(
     uint32_t b,
     const uint256& sigma);
 
-/** Compute the post-61000 digest from the sigma-bound compressed final block
- *  image of C'. Validators can rebuild the compressed image from the carried
- *  C' payload in O(n^2) and then use Freivalds to confirm A'B' == C'. */
+/** Legacy transcript-scheme helper (pre product-digest heights on regtest only). */
 uint256 HashMatrixWords(Span<const field::Element> words);
 uint256 FinalizeTranscriptDigestFromWords(Span<const field::Element> words);
-uint256 FinalizeProductCommittedDigestFromHash(const uint256& c_prime_hash,
+
+/** v4 product-committed digest primitives. */
+uint256 HashProductTile(const ConstMatrixView& tile);
+uint256 HashProductTile(Span<const field::Element> tile_row_major);
+std::vector<uint256> ComputeProductTileHashes(const Matrix& C_prime, uint32_t b);
+std::vector<uint256> ComputeProductTileHashesFromWords(Span<const field::Element> c_prime_words, uint32_t dim, uint32_t b);
+uint256 HashProductTileHashes(Span<const uint256> tile_hashes);
+uint256 FinalizeProductCommittedDigestFromHash(const uint256& tile_hash_root,
                                                const uint256& sigma,
                                                uint32_t dim,
                                                uint32_t b);
+uint256 ComputeProductCommittedDigestFromTileHashes(Span<const uint256> tile_hashes,
+                                                    const uint256& sigma,
+                                                    uint32_t dim,
+                                                    uint32_t b);
+/** c_prime_words: the full C' (dim×dim elements, row-major). Validators rebuild
+ *  the tile hashes from the carried C' payload in O(n²) and then use Freivalds
+ *  to confirm A'B' == C'. */
 uint256 ComputeProductCommittedDigestFromWords(Span<const field::Element> c_prime_words,
                                                const uint256& sigma,
                                                uint32_t dim,

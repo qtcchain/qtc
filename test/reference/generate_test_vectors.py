@@ -8,7 +8,8 @@ as structured JSON.
 
 Algorithms implemented:
   - reduce64: double Mersenne fold for M31
-  - from_oracle(seed, index): SHA-256 PRF with rejection sampling
+  - from_oracle(seed, index): SHA-256 PRF, 8 lanes per hash (oracle v2), rejection sampling per lane
+  - product_committed_digest_v4: full-tile SHA-256 commitment to C' (QTC O5)
   - FromSeed(seed, n): row-major matrix generation
   - dot(a, b, length): per-step reduction inner product
   - Noise seed derivation: SHA-256(tag || sigma) for 4 domain tags
@@ -18,6 +19,7 @@ Algorithms implemented:
 
 import hashlib
 import json
+import os
 import struct
 import sys
 
@@ -140,39 +142,37 @@ def hex_to_bytes(h):
 # from_oracle and FromSeed
 # ---------------------------------------------------------------------------
 
+def oracle_block_hash(seed_bytes, block, retry):
+    """SHA-256(seed || LE32(block) [|| LE32(retry) if retry > 0])."""
+    preimage = seed_bytes + le32_bytes(block)
+    if retry > 0:
+        preimage = preimage + le32_bytes(retry)
+    return sha256(preimage)
+
+
 def from_oracle(seed_bytes, index):
     """
-    from_oracle(seed, index) -> Element in [0, M31).
+    Oracle v2 (QTC O5): from_oracle(seed, index) -> Element in [0, M31).
 
-    Per spec section 7.4.1:
-      retry = 0:  preimage = seed || LE32(index)           (36 bytes)
-      retry > 0:  preimage = seed || LE32(index) || LE32(retry) (40 bytes)
-
+      block = index >> 3, lane = index & 7
+      retry = 0:  preimage = seed || LE32(block)              (36 bytes)
+      retry > 0:  preimage = seed || LE32(block) || LE32(retry) (40 bytes)
       h = SHA-256(preimage)
-      raw = h[0] | (h[1] << 8) | (h[2] << 16) | (h[3] << 24)   (LE uint32)
+      raw = LE32(h[4*lane : 4*lane+4])
       candidate = raw & 0x7FFFFFFF
-      if candidate < M31: return candidate
-      else: retry += 1
+      if candidate < M31: return candidate  else: retry += 1 (same lane)
+
+    Index 0 is identical to the v1 oracle (block 0, lane 0).
     """
     assert len(seed_bytes) == 32, f"seed must be 32 bytes, got {len(seed_bytes)}"
-
+    block = index >> 3
+    lane = index & 7
     for retry in range(256):
-        preimage = seed_bytes + le32_bytes(index)
-        if retry > 0:
-            preimage = preimage + le32_bytes(retry)
-
-        h = sha256(preimage)
-
-        # Extract bytes 0-3 as little-endian uint32
-        raw = h[0] | (h[1] << 8) | (h[2] << 16) | (h[3] << 24)
-
-        # Mask to 31 bits
+        h = oracle_block_hash(seed_bytes, block, retry)
+        raw = le32_from_bytes(h[4 * lane:4 * lane + 4])
         candidate = raw & 0x7FFFFFFF
-
-        # Rejection sampling: reject candidate == M31
         if candidate < M31:
             return candidate
-
     raise RuntimeError("from_oracle: 256 consecutive rejections")
 
 
@@ -358,6 +358,38 @@ def compress_block(block_flat, v):
 
 
 # ---------------------------------------------------------------------------
+# Product-committed digest v4 (QTC O5): full-tile hashing, no linear compression
+# ---------------------------------------------------------------------------
+PRODUCT_DIGEST_TAG_V4 = b'matmul-product-digest-v4'
+
+
+def product_tile_hashes(C_prime, b):
+    """SHA-256 over each b x b tile of C' (row-major LE32 elements), row-major tile order."""
+    n = len(C_prime)
+    assert n % b == 0
+    N = n // b
+    hashes = []
+    for i in range(N):
+        for j in range(N):
+            data = bytearray()
+            for row in range(b):
+                for col in range(b):
+                    data += le32_bytes(C_prime[i * b + row][j * b + col])
+            hashes.append(sha256(bytes(data)))
+    return hashes
+
+
+def product_committed_digest_v4(C_prime, b, sigma_bytes):
+    """SHA256d(tag_v4 || sigma || SHA256(tile_hashes...) || LE32(n) || LE32(b))."""
+    n = len(C_prime)
+    root = sha256(b''.join(product_tile_hashes(C_prime, b)))
+    # The C++ finalizer writes sigma.begin(), i.e. uint256 internal (little-endian)
+    # byte order, which is the reverse of the canonical bytes used everywhere else.
+    outer = PRODUCT_DIGEST_TAG_V4 + sigma_bytes[::-1] + root + le32_bytes(n) + le32_bytes(b)
+    return sha256d(outer)
+
+
+# ---------------------------------------------------------------------------
 # Canonical MatMul with streaming transcript hash
 # ---------------------------------------------------------------------------
 
@@ -469,27 +501,24 @@ def verify_pinned_vectors():
           1432335981)
 
     # --- TV2: from_oracle(seed=0x00..00, index=1) ---
+    # Oracle v2: index 1 = lane 1 of block 0 = bytes 4..7 of the TV1 hash
+    # 6db65fd5 9fd356f6 ... -> LE32(9f d3 56 f6) = 0xf656d39f, masked 0x7656d39f
     check("TV2 from_oracle(zero_seed, 1)",
           from_oracle(zero_seed, 1),
-          1134348657)
-
-    # Verify TV2 SHA-256
-    preimage_tv2 = zero_seed + le32_bytes(1)
-    h_tv2 = sha256(preimage_tv2)
-    check("TV2 SHA-256 hash",
-          bytes_to_hex(h_tv2),
-          "71c99cc3bc21757feed5b712744ebb0f770d5c41d99189f9457495747bf11050")
+          1985401759)
+    check("TV2 lane 1 of TV1 hash",
+          le32_from_bytes(h_tv1[4:8]) & 0x7FFFFFFF,
+          1985401759)
 
     # --- TV3: from_oracle(seed=0x00..00, index=7) ---
+    # Oracle v2: index 7 = lane 7 of block 0 = bytes 28..31 of the TV1 hash
+    # ... fc3c8a0e -> LE32 = 0x0e8a3cfc
     check("TV3 from_oracle(zero_seed, 7)",
           from_oracle(zero_seed, 7),
-          2147021205)
-
-    preimage_tv3 = zero_seed + le32_bytes(7)
-    h_tv3 = sha256(preimage_tv3)
-    check("TV3 SHA-256 hash",
-          bytes_to_hex(h_tv3),
-          "95f1f8ffe5b54fd46e622b34b93464acfc25fd54cabd50a3f0143479e4253b42")
+          243940604)
+    check("TV3 lane 7 of TV1 hash",
+          le32_from_bytes(h_tv1[28:32]) & 0x7FFFFFFF,
+          243940604)
 
     # --- TV4: from_oracle(seed=SHA-256("test_seed"), index=42) ---
     test_seed = sha256(b"test_seed")
@@ -497,15 +526,18 @@ def verify_pinned_vectors():
           bytes_to_hex(test_seed),
           "4504d44d861b69197db1d95e473442346c4f2bc1f5869996bdccd63cfbdbd150")
 
+    # Oracle v2: index 42 = block 5, lane 2
     check("TV4 from_oracle(test_seed, 42)",
           from_oracle(test_seed, 42),
-          1287506798)
-
-    preimage_tv4 = test_seed + le32_bytes(42)
+          1637792496)
+    preimage_tv4 = test_seed + le32_bytes(5)
     h_tv4 = sha256(preimage_tv4)
-    check("TV4 SHA-256 hash",
+    check("TV4 SHA-256 hash (block 5)",
           bytes_to_hex(h_tv4),
-          "6ecbbdccdae17aaac5acb50d7b23107f7ffa1017b2b7e6684369370372e3c5f9")
+          "86a2fa5c1b0394abf0ba9e614997e7420582b3fa32d4d3d53c4373d54726a7e5")
+    check("TV4 lane 2 of block-5 hash",
+          le32_from_bytes(h_tv4[8:12]) & 0x7FFFFFFF,
+          1637792496)
 
     # --- TV5: Retry mechanism preimage format ---
     # retry=0 is same as TV1
@@ -534,13 +566,13 @@ def verify_pinned_vectors():
     # --- TV6: FromSeed(seed=0x00..00, n=2) ---
     mat = from_seed(zero_seed, 2)
     check("TV6 matrix[0][0]", mat[0][0], 1432335981)
-    check("TV6 matrix[0][1]", mat[0][1], 1134348657)
-    check("TV6 matrix[1][0]", mat[1][0], 428617384)
-    check("TV6 matrix[1][1]", mat[1][1], 258375063)
+    check("TV6 matrix[0][1]", mat[0][1], 1985401759)
+    check("TV6 matrix[1][0]", mat[1][0], 1463849330)
+    check("TV6 matrix[1][1]", mat[1][1], 1808620315)
 
     # Also verify from_oracle(zero_seed, 2) and from_oracle(zero_seed, 3) directly
-    check("TV6 from_oracle(zero_seed, 2)", from_oracle(zero_seed, 2), 428617384)
-    check("TV6 from_oracle(zero_seed, 3)", from_oracle(zero_seed, 3), 258375063)
+    check("TV6 from_oracle(zero_seed, 2)", from_oracle(zero_seed, 2), 1463849330)
+    check("TV6 from_oracle(zero_seed, 3)", from_oracle(zero_seed, 3), 1808620315)
 
     # --- Noise derivation pinned vectors (section 8.2.2) ---
     sigma_zero = b'\x00' * 32
@@ -569,23 +601,23 @@ def verify_pinned_vectors():
     noise = generate_noise(sigma_zero, 4, 2)
 
     check("Noise EL[0][0]", noise['EL'][0][0], 1931902215)
-    check("Noise EL[0][1]", noise['EL'][0][1], 129748845)
-    check("Noise EL[1][0]", noise['EL'][1][0], 505403935)
-    check("Noise EL[1][1]", noise['EL'][1][1], 538008036)
-    check("Noise EL[2][0]", noise['EL'][2][0], 1006343602)
-    check("Noise EL[2][1]", noise['EL'][2][1], 1697202758)
-    check("Noise EL[3][0]", noise['EL'][3][0], 2128262120)
-    check("Noise EL[3][1]", noise['EL'][3][1], 942473671)
+    check("Noise EL[0][1]", noise['EL'][0][1], 1595657157)
+    check("Noise EL[1][0]", noise['EL'][1][0], 196402182)
+    check("Noise EL[1][1]", noise['EL'][1][1], 2100142100)
+    check("Noise EL[2][0]", noise['EL'][2][0], 545335226)
+    check("Noise EL[2][1]", noise['EL'][2][1], 850560975)
+    check("Noise EL[3][0]", noise['EL'][3][0], 1393477226)
+    check("Noise EL[3][1]", noise['EL'][3][1], 445857985)
 
     # E_R pinned elements
     check("Noise ER[0][0]", noise['ER'][0][0], 962405871)
-    check("Noise ER[0][1]", noise['ER'][0][1], 1142251768)
-    check("Noise ER[0][2]", noise['ER'][0][2], 505582893)
-    check("Noise ER[0][3]", noise['ER'][0][3], 443901062)
-    check("Noise ER[1][0]", noise['ER'][1][0], 858057583)
-    check("Noise ER[1][1]", noise['ER'][1][1], 2082571321)
-    check("Noise ER[1][2]", noise['ER'][1][2], 70698889)
-    check("Noise ER[1][3]", noise['ER'][1][3], 1087797252)
+    check("Noise ER[0][1]", noise['ER'][0][1], 1446915036)
+    check("Noise ER[0][2]", noise['ER'][0][2], 488189162)
+    check("Noise ER[0][3]", noise['ER'][0][3], 647563697)
+    check("Noise ER[1][0]", noise['ER'][1][0], 1646275947)
+    check("Noise ER[1][1]", noise['ER'][1][1], 1520400424)
+    check("Noise ER[1][2]", noise['ER'][1][2], 1495996857)
+    check("Noise ER[1][3]", noise['ER'][1][3], 530077483)
 
     # Domain separation: first element of each factor differs
     check("Noise FL[0][0]", from_oracle(noise['tag_FL'], 0), 1766706109)
@@ -756,6 +788,23 @@ def generate_additional_vectors():
         "num_intermediates": (8 // 4) ** 3,
     }
 
+    tile_hashes = product_tile_hashes(C_prime, 4)
+    vectors["product_digest_v4_n8_b4"] = {
+        "seed_a_hex": bytes_to_hex(seed_a),
+        "seed_b_hex": bytes_to_hex(seed_b),
+        "sigma_hex": bytes_to_hex(sigma_test),
+        "n": 8,
+        "b": 4,
+        "tag": PRODUCT_DIGEST_TAG_V4.decode(),
+        "tile_hashes_hex": [bytes_to_hex(h) for h in tile_hashes],
+        "root_hex": bytes_to_hex(sha256(b''.join(tile_hashes))),
+        "digest_hex": bytes_to_hex(product_committed_digest_v4(C_prime, 4, sigma_test)),
+        # Display-order (reversed) forms, usable directly as C++ uint256{"..."} literals.
+        "root_uint256": bytes_to_hex(sha256(b''.join(tile_hashes))[::-1]),
+        "tile0_uint256": bytes_to_hex(tile_hashes[0][::-1]),
+        "digest_uint256": bytes_to_hex(product_committed_digest_v4(C_prime, 4, sigma_test)[::-1]),
+    }
+
     # ---------------------------------------------------------------
     # 6. reduce64 edge cases
     # ---------------------------------------------------------------
@@ -801,20 +850,23 @@ def generate_additional_vectors():
     vectors["pinned_tv2"] = {
         "seed_hex": bytes_to_hex(zero_seed),
         "index": 1,
-        "sha256_hex": "71c99cc3bc21757feed5b712744ebb0f770d5c41d99189f9457495747bf11050",
-        "result": 1134348657,
+        "note": "oracle v2: block 0 lane 1 of SHA-256(seed || LE32(0))",
+        "sha256_hex": bytes_to_hex(oracle_block_hash(zero_seed, 0, 0)),
+        "result": from_oracle(zero_seed, 1),
     }
     vectors["pinned_tv3"] = {
         "seed_hex": bytes_to_hex(zero_seed),
         "index": 7,
-        "sha256_hex": "95f1f8ffe5b54fd46e622b34b93464acfc25fd54cabd50a3f0143479e4253b42",
-        "result": 2147021205,
+        "note": "oracle v2: block 0 lane 7",
+        "sha256_hex": bytes_to_hex(oracle_block_hash(zero_seed, 0, 0)),
+        "result": from_oracle(zero_seed, 7),
     }
     vectors["pinned_tv4"] = {
         "seed_hex": bytes_to_hex(test_seed),
         "index": 42,
-        "sha256_hex": "6ecbbdccdae17aaac5acb50d7b23107f7ffa1017b2b7e6684369370372e3c5f9",
-        "result": 1287506798,
+        "note": "oracle v2: block 5 lane 2 of SHA-256(seed || LE32(5))",
+        "sha256_hex": bytes_to_hex(oracle_block_hash(test_seed, 5, 0)),
+        "result": from_oracle(test_seed, 42),
     }
     vectors["pinned_tv5_retry"] = {
         "seed_hex": bytes_to_hex(zero_seed),
@@ -829,10 +881,7 @@ def generate_additional_vectors():
     vectors["pinned_tv6_from_seed_2x2"] = {
         "seed_hex": bytes_to_hex(zero_seed),
         "n": 2,
-        "matrix": [
-            [1432335981, 1134348657],
-            [428617384, 258375063],
-        ],
+        "matrix": from_seed(zero_seed, 2),  # oracle v2: lanes 0..3 of block 0
     }
 
     # Noise pinned vectors
@@ -847,21 +896,13 @@ def generate_additional_vectors():
         "sigma_hex": bytes_to_hex(sigma_zero),
         "n": 4,
         "r": 2,
-        "matrix": [
-            [1931902215, 129748845],
-            [505403935, 538008036],
-            [1006343602, 1697202758],
-            [2128262120, 942473671],
-        ],
+        "matrix": generate_noise(sigma_zero, 4, 2)['EL'],  # oracle v2
     }
     vectors["pinned_noise_ER_n4_r2"] = {
         "sigma_hex": bytes_to_hex(sigma_zero),
         "n": 4,
         "r": 2,
-        "matrix": [
-            [962405871, 1142251768, 505582893, 443901062],
-            [858057583, 2082571321, 70698889, 1087797252],
-        ],
+        "matrix": generate_noise(sigma_zero, 4, 2)['ER'],  # oracle v2
     }
     vectors["pinned_noise_domain_separation"] = {
         "sigma_hex": bytes_to_hex(sigma_zero),
@@ -905,7 +946,7 @@ def main():
     vectors = generate_additional_vectors()
 
     # Step 3: Write JSON
-    output_path = "/home/user/qtc-node/test/reference/test_vectors.json"
+    output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_vectors.json")
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(vectors, f, indent=2)
     print(f"Test vectors written to: {output_path}")

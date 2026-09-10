@@ -3860,63 +3860,10 @@ BOOST_AUTO_TEST_CASE(matmul_solve_crosses_60999_to_61000_with_product_digest_con
     BOOST_CHECK(CheckMatMulProofOfWork_ProductCommitted(solved_block, consensus, 61'000));
 }
 
-BOOST_AUTO_TEST_CASE(live_mainnet_61000_block_matches_fixed_contract_and_breaks_legacy_contract)
-{
-    // QTC live-chain vector (block 61,000). QTC D8 activates the product digest at
-    // genesis, so restore QTC's 61,000 schedule on a copy to keep the vector valid.
-    auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
-    consensus.nMatMulProductDigestHeight = 61'000;
-    consensus.nMatMulFreivaldsBindingHeight = 61'000;
-    BOOST_REQUIRE(consensus.IsMatMulProductDigestActive(61'000));
-    BOOST_REQUIRE(!consensus.IsMatMulProductDigestActive(60'999));
-
-    CBlockHeader block_61000{};
-    block_61000.nVersion = 0x20000000;
-    block_61000.hashPrevBlock =
-        uint256{"045e9181fbbeba9b422ae70e0ab5834f466e286ae5b16edc61f3b13916490c70"};
-    block_61000.hashMerkleRoot =
-        uint256{"b14a337a0cfe98c9e620f2b6c29a41ac6a77bf95cbcc7b9f76a5529e1e367193"};
-    block_61000.nTime = 1'775'242'281U;
-    block_61000.nBits = 0x1e15d55eU;
-    block_61000.nNonce64 = 83'649'524U;
-    block_61000.nNonce = static_cast<uint32_t>(block_61000.nNonce64);
-    block_61000.matmul_digest =
-        uint256{"0000044434522189ef972f86660aa24400c878991effce289d8ff5a882da8241"};
-    block_61000.matmul_dim = 512;
-    block_61000.seed_a =
-        uint256{"3346a31f91a59d6d51a829a0e4a316b45ee015f173a08b7c5a8c526cf1bb9366"};
-    block_61000.seed_b =
-        uint256{"61bab8f7324903584feea3c6641aa46f83616728d6e9adbe80b0047df90b303a"};
-
-    const arith_uint256 target = DecodeTarget(block_61000.nBits);
-    BOOST_CHECK(UintToArith256(block_61000.matmul_digest) <= target);
-
-    const auto A = matmul::SharedFromSeed(block_61000.seed_a, block_61000.matmul_dim);
-    const auto B = matmul::SharedFromSeed(block_61000.seed_b, block_61000.matmul_dim);
-    const uint256 sigma = matmul::DeriveSigma(block_61000);
-    const auto noise = matmul::noise::Generate(sigma, block_61000.matmul_dim, consensus.nMatMulNoiseRank);
-    const auto A_prime = *A + (noise.E_L * noise.E_R);
-    const auto B_prime = *B + (noise.F_L * noise.F_R);
-
-    const uint256 mined_digest = matmul::transcript::ComputeProductCommittedDigestFromPerturbed(
-        A_prime,
-        B_prime,
-        consensus.nMatMulTranscriptBlockSize,
-        sigma);
-    BOOST_CHECK_EQUAL(mined_digest, block_61000.matmul_digest);
-
-    const auto canonical = matmul::transcript::CanonicalMatMul(
-        A_prime,
-        B_prime,
-        consensus.nMatMulTranscriptBlockSize,
-        sigma);
-    const uint256 validator_digest = matmul::transcript::ComputeProductCommittedDigest(
-        canonical.C_prime,
-        consensus.nMatMulTranscriptBlockSize,
-        sigma);
-    BOOST_CHECK_EQUAL(validator_digest, block_61000.matmul_digest);
-    BOOST_CHECK(UintToArith256(canonical.transcript_hash) > target);
-}
+// NOTE (QTC O5): the upstream live-chain vector for block 61,000 (v3 product digest with
+// linear tile compression and the one-lane oracle) was removed here. QTC activates the
+// v4 full-tile digest and oracle v2 from genesis, so that block cannot validate on QTC
+// by design; its digest is covered by the v4 known-answer tests in matmul_transcript_tests.
 
 BOOST_AUTO_TEST_CASE(matmul_digest_compare_probe_ignores_matching_digests)
 {

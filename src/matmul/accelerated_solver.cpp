@@ -51,6 +51,27 @@ uint256 ComputeDigestCpuFromPrepared(const Matrix& A,
     return result.transcript_hash;
 }
 
+// QTC O5: the v4 product-committed digest hashes every C' tile in full. The
+// Metal and CUDA digest kernels still implement the v3 linear compression (and
+// the v1 one-lane oracle), so until they are ported and parity-tested on
+// hardware, digest requests are served by the CPU reference path. This covers
+// TRANSCRIPT-scheme requests too (pre-activation regtest heights only), because
+// the GPU oracle kernels predate oracle v2.
+constexpr bool kGpuDigestKernelsPortedToV4 = false;
+constexpr const char* kGpuDigestV4GateReason = "gpu_digest_kernels_not_ported_to_oracle_v2_product_digest_v4";
+std::atomic_bool g_logged_v4_gpu_gate{false};
+
+bool GpuDigestPathAvailable(backend::Kind backend_kind)
+{
+    if (backend_kind == backend::Kind::CPU) return true;
+    if (kGpuDigestKernelsPortedToV4) return true;
+    if (!g_logged_v4_gpu_gate.exchange(true)) {
+        LogPrintf("MATMUL: %s digest kernels not yet ported to oracle v2 / product digest v4; using CPU path\n",
+                  backend::ToString(backend_kind));
+    }
+    return false;
+}
+
 qtc::metal::MatMulDigestMode ToMetalDigestMode(DigestScheme digest_scheme)
 {
     return digest_scheme == DigestScheme::PRODUCT_COMMITTED
@@ -1632,6 +1653,37 @@ DigestResult ComputeMatMulDigestPrepared(const CBlockHeader& block,
     result.backend = preferred_backend;
     g_digest_requests.fetch_add(1, std::memory_order_relaxed);
 
+    if (preferred_backend != backend::Kind::CPU && !GpuDigestPathAvailable(preferred_backend)) {
+        // Report exactly like an unavailable-backend fallback so callers, stats and
+        // tests observe a clean CPU fallback with a reason.
+        const std::string reason = kGpuDigestV4GateReason;
+        std::string prefix;
+        if (preferred_backend == backend::Kind::CUDA) {
+            g_requested_cuda.fetch_add(1, std::memory_order_relaxed);
+            LogBackendFallbackOnce(g_logged_cuda_fallback, "CUDA", reason);
+            RecordCudaFallback(reason);
+            prefix = "cuda_backend_fallback_to_cpu:";
+        } else if (preferred_backend == backend::Kind::METAL) {
+            g_requested_metal.fetch_add(1, std::memory_order_relaxed);
+            LogBackendFallbackOnce(g_logged_metal_fallback, "METAL", reason);
+            RecordMetalFallback(reason);
+            prefix = "metal_backend_fallback_to_cpu:";
+        } else {
+            g_requested_unknown.fetch_add(1, std::memory_order_relaxed);
+            prefix = "backend_fallback_to_cpu:";
+        }
+        result.digest = ComputeDigestCpuFromPreparedInputs(
+            A,
+            B,
+            prepared,
+            transcript_block_size,
+            digest_scheme);
+        result.backend = backend::Kind::CPU;
+        result.accelerated = false;
+        result.ok = true;
+        result.error = prefix + reason;
+        return result;
+    }
     if (preferred_backend == backend::Kind::CPU) {
         g_requested_cpu.fetch_add(1, std::memory_order_relaxed);
         result.digest = ComputeDigestCpuFromPreparedInputs(
@@ -1974,6 +2026,7 @@ DigestBatchSubmission SubmitMatMulDigestPreparedBatchForMining(const std::vector
     state->digest_scheme = digest_scheme;
     state->prepared_batch = &prepared_batch;
     state->preferred_backend = preferred_backend;
+    const bool gpu_digest_available = GpuDigestPathAvailable(preferred_backend);
 
     if (blocks.empty()) {
         submission.submitted = true;
@@ -1989,6 +2042,24 @@ DigestBatchSubmission SubmitMatMulDigestPreparedBatchForMining(const std::vector
             item.ok = false;
             item.error = "prepared_batch_size_mismatch";
         }
+        submission.submitted = true;
+        submission.opaque = state;
+        return submission;
+    }
+
+    if (preferred_backend == backend::Kind::CUDA && !gpu_digest_available) {
+        g_digest_requests.fetch_add(blocks.size(), std::memory_order_relaxed);
+        g_requested_cuda.fetch_add(blocks.size(), std::memory_order_relaxed);
+        state->immediate_results = ComputeCudaDigestBatchFallbackResults(
+            blocks,
+            A,
+            B,
+            transcript_block_size,
+            prepared_batch,
+            digest_scheme,
+            kGpuDigestV4GateReason,
+            "cuda_batch_backend_fallback_to_cpu:");
+        submission.backend = backend::Kind::CPU;
         submission.submitted = true;
         submission.opaque = state;
         return submission;
@@ -2055,7 +2126,8 @@ DigestBatchSubmission SubmitMatMulDigestPreparedBatchForMining(const std::vector
         return submission;
     }
 
-    if (preferred_backend != backend::Kind::METAL) {
+    if (preferred_backend != backend::Kind::METAL || !gpu_digest_available) {
+        // Metal requests fall through ComputeMatMulDigestPrepared, which reports the v4 gate as a clean fallback.
         state->immediate_results.reserve(blocks.size());
         for (size_t i = 0; i < blocks.size(); ++i) {
             state->immediate_results.push_back(ComputeMatMulDigestPrepared(
@@ -2485,6 +2557,25 @@ std::vector<DigestResult> ComputeMatMulDigestPreparedVariableBaseBatchForMining(
         return results;
     }
 
+    if (preferred_backend != backend::Kind::CPU && !GpuDigestPathAvailable(preferred_backend)) {
+        g_digest_requests.fetch_add(blocks.size(), std::memory_order_relaxed);
+        if (preferred_backend == backend::Kind::CUDA) {
+            g_requested_cuda.fetch_add(blocks.size(), std::memory_order_relaxed);
+        } else if (preferred_backend == backend::Kind::METAL) {
+            g_requested_metal.fetch_add(blocks.size(), std::memory_order_relaxed);
+        }
+        return ComputeVariableBaseDigestBatchFallbackResults(
+            blocks,
+            transcript_block_size,
+            noise_rank,
+            prepared_batch,
+            digest_scheme,
+            preferred_backend,
+            kGpuDigestV4GateReason,
+            preferred_backend == backend::Kind::METAL
+                ? "metal_variable_base_batch_backend_fallback_to_cpu:"
+                : "cuda_variable_base_batch_backend_fallback_to_cpu:");
+    }
     if (preferred_backend == backend::Kind::CUDA) {
         g_digest_requests.fetch_add(blocks.size(), std::memory_order_relaxed);
         g_requested_cuda.fetch_add(blocks.size(), std::memory_order_relaxed);

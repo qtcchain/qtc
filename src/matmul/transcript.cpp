@@ -438,7 +438,7 @@ uint256 FinalizeProductCommittedDigestFromHash(const uint256& c_prime_hash,
         throw std::runtime_error("product-committed digest requires dim divisible by b");
     }
 
-    // Outer hash: SHA256d(tag || sigma || H(compressed_final_blocks(C')) || dim_le32 || b_le32)
+    // Outer hash: SHA256d(tag_v4 || sigma || root(tile hashes of C') || dim_le32 || b_le32)
     CSHA256 outer;
     outer.Write(reinterpret_cast<const unsigned char*>(PRODUCT_DIGEST_TAG.data()),
                 PRODUCT_DIGEST_TAG.size());
@@ -466,46 +466,133 @@ uint256 FinalizeProductCommittedDigestFromHash(const uint256& c_prime_hash,
     return result;
 }
 
+namespace {
+
+void WriteTileElement(CSHA256& hasher, field::Element value)
+{
+    unsigned char buf[4];
+    WriteLE32(buf, value);
+    hasher.Write(buf, sizeof(buf));
+}
+
+void RequireTileGeometry(uint32_t dim, uint32_t b)
+{
+    if (dim == 0 || b == 0) {
+        throw std::runtime_error("product-committed digest requires non-zero dimensions");
+    }
+    if ((dim % b) != 0) {
+        throw std::runtime_error("product-committed digest requires dim divisible by b");
+    }
+}
+
+} // namespace
+
+uint256 HashProductTile(const ConstMatrixView& tile)
+{
+    CSHA256 hasher;
+    for (uint32_t row = 0; row < tile.rows(); ++row) {
+        for (uint32_t col = 0; col < tile.cols(); ++col) {
+            WriteTileElement(hasher, tile.at(row, col));
+        }
+    }
+    uint256 out;
+    hasher.Finalize(out.begin());
+    return out;
+}
+
+uint256 HashProductTile(Span<const field::Element> tile_row_major)
+{
+    CSHA256 hasher;
+    for (const field::Element value : tile_row_major) {
+        WriteTileElement(hasher, value);
+    }
+    uint256 out;
+    hasher.Finalize(out.begin());
+    return out;
+}
+
+std::vector<uint256> ComputeProductTileHashes(const Matrix& C_prime, uint32_t b)
+{
+    if (C_prime.rows() != C_prime.cols()) {
+        throw std::runtime_error("product-committed digest requires square C'");
+    }
+    RequireTileGeometry(C_prime.rows(), b);
+    const uint32_t blocks_per_axis = C_prime.rows() / b;
+    std::vector<uint256> tile_hashes;
+    tile_hashes.reserve(static_cast<size_t>(blocks_per_axis) * blocks_per_axis);
+    for (uint32_t i = 0; i < blocks_per_axis; ++i) {
+        for (uint32_t j = 0; j < blocks_per_axis; ++j) {
+            tile_hashes.push_back(HashProductTile(C_prime.block_view(i, j, b)));
+        }
+    }
+    return tile_hashes;
+}
+
+std::vector<uint256> ComputeProductTileHashesFromWords(Span<const field::Element> c_prime_words, uint32_t dim, uint32_t b)
+{
+    RequireTileGeometry(dim, b);
+    if (c_prime_words.size() != static_cast<size_t>(dim) * dim) {
+        throw std::runtime_error("product-committed digest word span size mismatch");
+    }
+    const uint32_t blocks_per_axis = dim / b;
+    std::vector<uint256> tile_hashes;
+    tile_hashes.reserve(static_cast<size_t>(blocks_per_axis) * blocks_per_axis);
+    for (uint32_t i = 0; i < blocks_per_axis; ++i) {
+        for (uint32_t j = 0; j < blocks_per_axis; ++j) {
+            CSHA256 hasher;
+            for (uint32_t row = 0; row < b; ++row) {
+                const size_t base = (static_cast<size_t>(i) * b + row) * dim + static_cast<size_t>(j) * b;
+                for (uint32_t col = 0; col < b; ++col) {
+                    WriteTileElement(hasher, c_prime_words[base + col]);
+                }
+            }
+            uint256 out;
+            hasher.Finalize(out.begin());
+            tile_hashes.push_back(out);
+        }
+    }
+    return tile_hashes;
+}
+
+uint256 HashProductTileHashes(Span<const uint256> tile_hashes)
+{
+    CSHA256 hasher;
+    for (const uint256& tile_hash : tile_hashes) {
+        hasher.Write(tile_hash.begin(), 32);
+    }
+    uint256 out;
+    hasher.Finalize(out.begin());
+    return out;
+}
+
+uint256 ComputeProductCommittedDigestFromTileHashes(Span<const uint256> tile_hashes,
+                                                    const uint256& sigma,
+                                                    uint32_t dim,
+                                                    uint32_t b)
+{
+    RequireTileGeometry(dim, b);
+    const size_t blocks_per_axis = dim / b;
+    if (tile_hashes.size() != blocks_per_axis * blocks_per_axis) {
+        throw std::runtime_error("product-committed digest tile hash count mismatch");
+    }
+    return FinalizeProductCommittedDigestFromHash(HashProductTileHashes(tile_hashes), sigma, dim, b);
+}
+
 uint256 ComputeProductCommittedDigestFromWords(Span<const field::Element> c_prime_words,
                                                const uint256& sigma,
                                                uint32_t dim,
                                                uint32_t b)
 {
-    if (dim == 0 || b == 0 || (dim % b) != 0) {
-        throw std::runtime_error("product-committed digest word span requires valid dimensions");
-    }
-    const uint32_t blocks_per_axis = dim / b;
-    const size_t expected_words = static_cast<size_t>(blocks_per_axis) * blocks_per_axis;
-    if (c_prime_words.size() != expected_words) {
-        throw std::runtime_error("product-committed digest word span size mismatch");
-    }
-    return FinalizeProductCommittedDigestFromHash(HashMatrixWords(c_prime_words), sigma, dim, b);
+    const auto tile_hashes = ComputeProductTileHashesFromWords(c_prime_words, dim, b);
+    return ComputeProductCommittedDigestFromTileHashes(
+        Span<const uint256>{tile_hashes.data(), tile_hashes.size()}, sigma, dim, b);
 }
 
 uint256 ComputeProductCommittedDigest(const Matrix& C_prime, uint32_t b, const uint256& sigma)
 {
-    if (C_prime.rows() != C_prime.cols()) {
-        throw std::runtime_error("product-committed digest requires square C'");
-    }
-    if (b == 0 || (C_prime.rows() % b) != 0) {
-        throw std::runtime_error("product-committed digest requires valid transcript block size");
-    }
-
-    const uint32_t blocks_per_axis = C_prime.rows() / b;
-    const auto compress_vec = DeriveCompressionVector(sigma, b);
-    std::vector<field::Element> compressed_blocks;
-    compressed_blocks.reserve(static_cast<size_t>(blocks_per_axis) * blocks_per_axis);
-    for (uint32_t i = 0; i < blocks_per_axis; ++i) {
-        for (uint32_t j = 0; j < blocks_per_axis; ++j) {
-            compressed_blocks.push_back(CompressBlock(C_prime.block_view(i, j, b), compress_vec));
-        }
-    }
-
-    return ComputeProductCommittedDigestFromWords(
-        Span<const field::Element>{compressed_blocks.data(), compressed_blocks.size()},
-        sigma,
-        C_prime.rows(),
-        b);
+    const auto tile_hashes = ComputeProductTileHashes(C_prime, b);
+    return ComputeProductCommittedDigestFromTileHashes(
+        Span<const uint256>{tile_hashes.data(), tile_hashes.size()}, sigma, C_prime.rows(), b);
 }
 
 uint256 ComputeProductCommittedDigestFromPerturbed(const Matrix& A_prime,
@@ -516,32 +603,11 @@ uint256 ComputeProductCommittedDigestFromPerturbed(const Matrix& A_prime,
     if (A_prime.rows() != A_prime.cols() || B_prime.rows() != B_prime.cols() || A_prime.rows() != B_prime.rows()) {
         throw std::runtime_error("product-committed digest requires square matrices of equal size");
     }
-    if (b == 0 || (A_prime.rows() % b) != 0) {
-        throw std::runtime_error("product-committed digest requires valid transcript block size");
-    }
-
-    const uint32_t n = A_prime.rows();
-    const uint32_t blocks_per_axis = n / b;
-    const auto compress_vec = DeriveCompressionVector(sigma, b);
-    std::vector<field::Element> compressed_blocks;
-    compressed_blocks.reserve(static_cast<size_t>(blocks_per_axis) * blocks_per_axis);
-
-    for (uint32_t i = 0; i < blocks_per_axis; ++i) {
-        for (uint32_t j = 0; j < blocks_per_axis; ++j) {
-            field::Element compressed_acc = 0;
-            for (uint32_t ell = 0; ell < blocks_per_axis; ++ell) {
-                const Matrix product = A_prime.block(i, ell, b) * B_prime.block(ell, j, b);
-                compressed_acc = field::add(compressed_acc, CompressBlock(product, compress_vec));
-            }
-            compressed_blocks.push_back(compressed_acc);
-        }
-    }
-
-    return ComputeProductCommittedDigestFromWords(
-        Span<const field::Element>{compressed_blocks.data(), compressed_blocks.size()},
-        sigma,
-        n,
-        b);
+    RequireTileGeometry(A_prime.rows(), b);
+    // v4 needs every element of C': there is no per-tile shortcut. Form the
+    // full product with the fastest available (consensus-checked) kernel.
+    const Matrix C_prime = A_prime * B_prime;
+    return ComputeProductCommittedDigest(C_prime, b, sigma);
 }
 
 } // namespace matmul::transcript

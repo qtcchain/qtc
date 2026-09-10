@@ -1846,6 +1846,31 @@ TEST: from_seed_cross_platform_consistency
 
 ---
 
+
+### 7.4.A Oracle v2 (QTC O5, from genesis) — supersedes 7.4 for QTC
+
+One SHA-256 call now yields eight field elements instead of one:
+
+```
+from_oracle(seed, index):
+    block = index >> 3
+    lane  = index & 7
+    for retry in 0..255:
+        preimage = seed_canonical(32) || LE32(block)            # 36 bytes, retry == 0
+                 = seed_canonical(32) || LE32(block) || LE32(retry)   # 40 bytes, retry > 0
+        h = SHA-256(preimage)
+        candidate = LE32(h[4*lane .. 4*lane+3]) & 0x7FFFFFFF
+        if candidate < M31: return candidate
+    return LE32(SHA-256(seed_canonical || LE32(block) || "oracle-fallback")[4*lane..]) mod M31
+```
+
+Index 0 is unchanged from v1 (TV1 still holds). TV2–TV4 and the noise/from_seed
+vectors are regenerated in `test/reference/test_vectors.json`. Rationale: the v1
+oracle cost 524,288 SHA-256 calls per nonce at n = 512 (33 MiB of hash input) and
+dominated GPU attempts (~72 % of an attempt on an A6000-class card), which made
+the proof of work SHA-256-bound rather than matmul-bound. v2 reduces it to
+65,536 calls; the verifier's FromSeed cost drops from ~60 ms to ~7.5 ms per block.
+
 ## 8. MatMul PoW Core Algorithm
 
 ### 8.1 Matrix Type
@@ -2285,6 +2310,37 @@ target specific compressed outputs. The σ-dependence prevents this.
 string `"matmul-compress-v1"`, the LE32 encoding of compressed elements,
 and the SHA-256d finalization are all consensus-critical. Any implementation
 must produce byte-identical compressed streams and digest for the same inputs.
+
+
+#### 8.3.A Product-committed digest v4 (QTC O5, from genesis) — supersedes the compression in 8.3.1–8.3.6
+
+**Finding H4 (2026-09-09).** The v3 product digest committed to one linear
+functional per b×b tile of C' with a single σ-derived vector v. Because
+Σ_{k,l} v[k,l]·C'[ib+k, jb+l] = Σ_l Σ_m U_i[l,m]·B'[m, jb+l] with U_i = vᵀ·A'_rows(i),
+all (n/b)² compressed words could be computed in O(n³/b + n²·b) without forming
+C' — 10.7× less matmul arithmetic at n = 512, b = 16 (verified numerically). The
+analyses in 8.3.2 and 8.3.5 covered forgery of the compression, not its cost.
+
+**v4 definition.** No compression. Every tile is hashed in full:
+
+```
+tile_hash(i, j) = SHA-256( LE32(C'[ib+k, jb+l]) for k in 0..b-1, l in 0..b-1 )   # row-major, b² × 4 bytes
+root            = SHA-256( tile_hash(0,0) || tile_hash(0,1) || … || tile_hash(N-1,N-1) )   # row-major tile order
+digest          = SHA-256d( "matmul-product-digest-v4" || sigma_internal(32) || root || LE32(n) || LE32(b) )
+```
+
+`sigma_internal` is the uint256 internal (little-endian) byte order, as written by
+`FinalizeProductCommittedDigestFromHash` (unchanged from v3). The digest therefore
+depends on every element of C'; a miner must form the full product for every nonce.
+Cost at n = 512, b = 16: 1,024 tiles × 1 KiB = 17,408 SHA-256 compressions + 512 for the
+root, ≈ 2 ms on one CPU core (0.6 % of an attempt) and ≈ 2 % of a GPU attempt.
+Validators hash the carried C' payload (1 MiB) and run Freivalds exactly as before.
+
+**Status.** CPU reference, mining and validation paths implement v4. The Metal and
+CUDA digest kernels still implement v3 and oracle v1; `accelerated_solver.cpp`
+routes every digest request to the CPU path (`kGpuDigestKernelsPortedToV4 = false`)
+until the kernels are ported and parity-tested on hardware. Port spec:
+`QTC/software/QTC_O5_Implementation_2026-09-09.md` (iCloud).
 
 #### 8.3.6 Economic Security Note: Compression Collision Probability
 

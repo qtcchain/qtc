@@ -44,10 +44,11 @@ Matrix FromSeedRect(const uint256& seed, uint32_t rows, uint32_t cols)
     Matrix out(rows, cols);
     const auto profile = ProbeNoiseGenerationProfile(rows, cols);
     const auto fill_rows = [&](uint32_t row_begin, uint32_t row_end) {
-        for (uint32_t row = row_begin; row < row_end; ++row) {
-            for (uint32_t col = 0; col < cols; ++col) {
-                out.at(row, col) = field::from_oracle(seed, row * cols + col);
-            }
+        if (row_end > row_begin) {
+            field::fill_from_oracle(seed,
+                                    row_begin * cols,
+                                    (row_end - row_begin) * cols,
+                                    out.data() + static_cast<size_t>(row_begin) * cols);
         }
     };
 

@@ -492,11 +492,7 @@ Matrix FromSeed(const uint256& seed, uint32_t n)
 {
     assert(static_cast<uint64_t>(n) * n <= std::numeric_limits<uint32_t>::max());
     Matrix out(n, n);
-    for (uint32_t row = 0; row < n; ++row) {
-        for (uint32_t col = 0; col < n; ++col) {
-            out.at(row, col) = field::from_oracle(seed, row * n + col);
-        }
-    }
+    field::fill_from_oracle(seed, 0, n * n, out.data());
     return out;
 }
 

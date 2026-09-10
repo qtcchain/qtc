@@ -412,3 +412,24 @@ is why the bound was scaled; with τ/4 the 600 s chain recovers the way the 90 s
 chain did in §7. Absolute-ASERT surplus behaviour is unchanged: a stall of S
 seconds from D seconds of deficit costs ≈ (S − D)/600 floor-difficulty blocks
 (here 864 vs 785 with the drift bound smoothing the entry).
+
+## 11. O5 applied — oracle v2 and product digest v4 (2026-09-09)
+
+**Why.** Security review H4 (`QTC-SECURITY-REVIEW.md`): the v3 digest hashed one inner product per C' tile with a
+single σ-derived vector. Re-associating Σ v·(A'B')_tile lets a miner compute all tile words in O(n³/b + n²b) without
+forming C'. Measured on this M5: honest attempt 332 ms, shortcut 87 ms (3.8×); GPU estimate ~1.35× only because the
+one-hash-per-element oracle (540 k SHA-256 per nonce) dominated GPU attempts — itself a design defect.
+
+**What changed (consensus, from genesis, all networks).**
+| | before | after |
+|---|---|---|
+| Oracle | 1 element per SHA-256 (seed‖LE32(index)) | 8 lanes per SHA-256 (seed‖LE32(index>>3)), lane = index&7 |
+| Product digest | SHA256d(tag_v3‖σ‖SHA256d(compressed words)‖n‖b) | SHA256d(tag_v4‖σ‖SHA256(tile hashes)‖n‖b), tile hash = SHA-256 of the full 1 KiB tile |
+| Attempt cost, n=512 (M5, 1 thread) | 332 ms honest / 87 ms shortcut | ≈ 279 ms, no shortcut |
+| Verifier FromSeed per block | 60 ms | 7.5 ms |
+
+**Not changed.** Genesis (no MatMul fields), header layout, C' payload, Freivalds, ASERT, powLimit (still placeholder).
+
+**Open.** GPU digest kernels (Metal, CUDA) are gated to the CPU path until ported and parity-tested on hardware; the
+in-kernel "factored compression" path is the H4 shortcut and must be deleted in the port. Spec: iCloud
+`QTC/software/QTC_O5_Implementation_2026-09-09.md`. The upstream chain remains on v3 and is exposed to H4.

@@ -1192,6 +1192,7 @@ BOOST_AUTO_TEST_CASE(cuda_regtest_shape_product_digest_matches_cpu_or_cleanly_fa
     }
 }
 
+// QTC O5: expected value re-pinned to the oracle-v2 / product-digest-v4 CPU output for the same inputs.
 BOOST_AUTO_TEST_CASE(strict_regtest_warning_repro_cpu_digest_matches_logged_vector)
 {
     constexpr uint32_t kTranscriptBlockSize = 8;
@@ -1211,7 +1212,7 @@ BOOST_AUTO_TEST_CASE(strict_regtest_warning_repro_cpu_digest_matches_logged_vect
 
     BOOST_CHECK_EQUAL(
         cpu_digest,
-        ParseUint256("c4b56f5152aeff98c2ee8a1c3f22edf9ad9cead370a24042c3281597b0e44251"));
+        ParseUint256("36a23eb97086ecdb7ca1405647c5362820ef7bdb5d6ae3974548aef67a54a1b6"));
 }
 
 BOOST_AUTO_TEST_CASE(cuda_strict_regtest_warning_repro_direct_and_batch_match_cpu_or_cleanly_falls_back)

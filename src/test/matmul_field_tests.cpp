@@ -352,19 +352,54 @@ BOOST_AUTO_TEST_CASE(from_oracle_pinned_tv1)
 BOOST_AUTO_TEST_CASE(from_oracle_pinned_tv2)
 {
     const uint256 seed = ParseUint256("0000000000000000000000000000000000000000000000000000000000000000");
-    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 1), 1134348657U);
+    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 1), 1985401759U);
 }
 
 BOOST_AUTO_TEST_CASE(from_oracle_pinned_tv3)
 {
     const uint256 seed = ParseUint256("0000000000000000000000000000000000000000000000000000000000000000");
-    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 7), 2147021205U);
+    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 7), 243940604U);
 }
 
 BOOST_AUTO_TEST_CASE(from_oracle_pinned_tv4)
 {
     const uint256 seed = ParseUint256("4504d44d861b69197db1d95e473442346c4f2bc1f5869996bdccd63cfbdbd150");
-    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 42), 1287506798U);
+    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 42), 1637792496U);
+}
+
+
+// Oracle v2 (QTC O5): eight lanes per SHA-256. Lane k of block 0 must equal the
+// v1-style value read from bytes 4k..4k+3 of SHA-256(seed || LE32(0)).
+BOOST_AUTO_TEST_CASE(from_oracle_v2_lanes_are_hash_words)
+{
+    const uint256 seed = ParseUint256("0000000000000000000000000000000000000000000000000000000000000000");
+    std::vector<uint8_t> preimage(seed.begin(), seed.end());
+    uint8_t zero[4];
+    WriteLE32(zero, 0);
+    preimage.insert(preimage.end(), zero, zero + 4);
+    const auto hash0 = Sha256(preimage);
+    for (uint32_t lane = 0; lane < 8; ++lane) {
+        BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, lane), ReadLE32(hash0.data() + 4 * lane) & matmul::field::MODULUS);
+    }
+    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 1), 1985401759U);
+    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 7), 243940604U);
+}
+
+BOOST_AUTO_TEST_CASE(from_oracle_block_and_fill_match_from_oracle)
+{
+    FastRandomContext rng{true};
+    const uint256 seed = rng.rand256();
+    matmul::field::Element lanes[8];
+    matmul::field::from_oracle_block(seed, 3, lanes);
+    for (uint32_t lane = 0; lane < 8; ++lane) {
+        BOOST_CHECK_EQUAL(lanes[lane], matmul::field::from_oracle(seed, 24 + lane));
+    }
+    // Unaligned start and length exercise the partial-block paths.
+    std::vector<matmul::field::Element> out(37);
+    matmul::field::fill_from_oracle(seed, 5, static_cast<uint32_t>(out.size()), out.data());
+    for (uint32_t k = 0; k < out.size(); ++k) {
+        BOOST_CHECK_EQUAL(out[k], matmul::field::from_oracle(seed, 5 + k));
+    }
 }
 
 // TEST: from_oracle_rejection_boundary
@@ -406,9 +441,9 @@ BOOST_AUTO_TEST_CASE(from_seed_pinned_2x2)
     const std::vector<Element> m = FromSeedFlat(seed, 2);
     BOOST_REQUIRE_EQUAL(m.size(), 4U);
     BOOST_CHECK_EQUAL(m[0], 1432335981U);
-    BOOST_CHECK_EQUAL(m[1], 1134348657U);
-    BOOST_CHECK_EQUAL(m[2], 428617384U);
-    BOOST_CHECK_EQUAL(m[3], 258375063U);
+    BOOST_CHECK_EQUAL(m[1], 1985401759U);
+    BOOST_CHECK_EQUAL(m[2], 1463849330U);
+    BOOST_CHECK_EQUAL(m[3], 1808620315U);
 }
 
 BOOST_AUTO_TEST_CASE(from_seed_row_major_indexing)
@@ -436,19 +471,19 @@ BOOST_AUTO_TEST_CASE(from_seed_cross_platform_consistency)
     const std::vector<Element> m = FromSeedFlat(seed, 4);
     BOOST_REQUIRE_EQUAL(m.size(), 16U);
     BOOST_CHECK_EQUAL(m[0], 1432335981U);
-    BOOST_CHECK_EQUAL(m[1], 1134348657U);
-    BOOST_CHECK_EQUAL(m[2], 428617384U);
-    BOOST_CHECK_EQUAL(m[3], 258375063U);
+    BOOST_CHECK_EQUAL(m[1], 1985401759U);
+    BOOST_CHECK_EQUAL(m[2], 1463849330U);
+    BOOST_CHECK_EQUAL(m[3], 1808620315U);
 }
 
 BOOST_AUTO_TEST_CASE(from_oracle_extra_vectors_zero_seed)
 {
     const uint256 seed = ParseUint256("0000000000000000000000000000000000000000000000000000000000000000");
-    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 100), 1689924282U);
-    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 255), 140522425U);
-    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 1000), 370943536U);
-    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 65535), 484788800U);
-    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, std::numeric_limits<uint32_t>::max()), 752357001U);
+    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 100), 2060225844U);
+    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 255), 126251429U);
+    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 1000), 655637585U);
+    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 65535), 178895147U);
+    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, std::numeric_limits<uint32_t>::max()), 202950684U);
 }
 
 BOOST_AUTO_TEST_CASE(from_oracle_extra_vectors_nonzero_seed)
@@ -456,10 +491,10 @@ BOOST_AUTO_TEST_CASE(from_oracle_extra_vectors_nonzero_seed)
     const uint256 seed = ParseUint256("4504d44d861b69197db1d95e473442346c4f2bc1f5869996bdccd63cfbdbd150");
     const uint256 other_seed = ParseUint256("c6a811f7f75fe4e64be106a50351aed9c04403a74bfe7b4bbe59f7311722b735");
     BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 0), 360032607U);
-    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 1), 154360646U);
-    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 100), 124997740U);
-    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 999), 1912486207U);
-    BOOST_CHECK_EQUAL(matmul::field::from_oracle(other_seed, 12345), 732050367U);
+    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 1), 369286479U);
+    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 100), 1349016275U);
+    BOOST_CHECK_EQUAL(matmul::field::from_oracle(seed, 999), 1873833507U);
+    BOOST_CHECK_EQUAL(matmul::field::from_oracle(other_seed, 12345), 995759357U);
 }
 
 BOOST_AUTO_TEST_CASE(dot_all_max_len4_vector)

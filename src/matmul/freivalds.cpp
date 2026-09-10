@@ -61,9 +61,7 @@ std::vector<field::Element> DeriveRandomVector(const uint256& sigma, uint32_t ro
     const uint256 round_seed{seed_hasher.GetSHA256()};
 
     std::vector<field::Element> random_vector(n);
-    for (uint32_t i = 0; i < n; ++i) {
-        random_vector[i] = field::from_oracle(round_seed, i);
-    }
+    field::fill_from_oracle(round_seed, 0, n, random_vector.data());
     return random_vector;
 }
 

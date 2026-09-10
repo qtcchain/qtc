@@ -350,3 +350,18 @@ exposed that a 3,600 s MTP-relative drift bound pins the chain clock to exactly
 fixed by scaling the bound to τ/4 = 43,200 s (D4 is spacing-dependent); rerun PASS
 (floor +78 blocks, 785 floor blocks, model error 2e-4). New regtest knob
 `-regtestmatmulmaxfuturemtpdrift`, simulator `--drift`.
+
+### Stage: O5 — oracle v2 + product digest v4 (2026-09-09)
+Security-review finding H4: the v3 product digest committed to a *linear* compression of each C' tile with one shared
+σ-vector, so the digest could be computed in O(n³/b) without forming C' (10.7× less matmul arithmetic; 3.8× wall-clock
+on an M5 CPU because the one-lane oracle was not skippable). Fix chosen after modelling (`QTC_H4_Fix_Options_Model`):
+* **Product digest v4** — every 16×16 tile of C' hashed in full with SHA-256, root over the tile hashes, tag
+  `matmul-product-digest-v4`; active from genesis on every network (`src/matmul/transcript.*`).
+* **Oracle v2** — one SHA-256 yields eight 31-bit lanes (`from_oracle`, `from_oracle_block`, `fill_from_oracle`);
+  index 0 unchanged, all other pinned vectors regenerated (`test/reference/generate_test_vectors.py`, 127 self-checks).
+* Metal/CUDA digest kernels NOT ported (no toolchain on this host): `accelerated_solver.cpp` gates every digest request
+  to the CPU reference path (`kGpuDigestKernelsPortedToV4 = false`) and reports it as a clean backend fallback. Port
+  spec in iCloud `QTC/software/QTC_O5_Implementation_2026-09-09.md`. Required before the fleet measurement (D3/H2).
+* Genesis blocks unchanged (no MatMul fields); regtest assumeutxo @110 unchanged (regtest mining skips MatMul).
+* Verified: matmul_*/pow/validation/pq_genesis suites green; Python-vs-C++ v4 known answer agrees; 5 regtest blocks
+  mined and accepted under `-test=matmulstrict`. Full suite: see commit message.

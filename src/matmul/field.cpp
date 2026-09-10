@@ -137,51 +137,103 @@ Element inv(Element a)
     return result;
 }
 
-Element from_oracle(const uint256& seed, uint32_t index)
+namespace {
+
+void CanonicalSeedBytes(const uint256& seed, uint8_t out[32])
 {
-    uint8_t seed_bytes[32];
-    for (size_t i = 0; i < sizeof(seed_bytes); ++i) {
-        seed_bytes[i] = seed.data()[sizeof(seed_bytes) - 1 - i];
+    for (size_t i = 0; i < 32; ++i) {
+        out[i] = seed.data()[31 - i];
     }
+}
 
-    for (uint32_t retry = 0; retry < 256; ++retry) {
-        CSHA256 hasher;
-        hasher.Write(seed_bytes, sizeof(seed_bytes));
+// SHA-256(seed || LE32(block) [|| LE32(retry)]) -> 32 bytes = eight LE32 lanes.
+void OracleBlockHash(const uint8_t seed_bytes[32], uint32_t block, uint32_t retry, uint8_t hash[CSHA256::OUTPUT_SIZE])
+{
+    CSHA256 hasher;
+    hasher.Write(seed_bytes, 32);
+    uint8_t block_le[4];
+    WriteLE32(block_le, block);
+    hasher.Write(block_le, sizeof(block_le));
+    if (retry > 0) {
+        uint8_t retry_le[4];
+        WriteLE32(retry_le, retry);
+        hasher.Write(retry_le, sizeof(retry_le));
+    }
+    hasher.Finalize(hash);
+}
 
-        uint8_t index_le[4];
-        WriteLE32(index_le, index);
-        hasher.Write(index_le, sizeof(index_le));
+Element OracleFallbackLane(const uint8_t seed_bytes[32], uint32_t block, uint32_t lane)
+{
+    // Effectively unreachable (~2^-7936 per lane), but consensus requires a
+    // deterministic value across all implementations if it is ever hit.
+    CSHA256 fallback_hasher;
+    fallback_hasher.Write(seed_bytes, 32);
+    uint8_t block_le[4];
+    WriteLE32(block_le, block);
+    fallback_hasher.Write(block_le, sizeof(block_le));
+    static constexpr uint8_t fallback_tag[] = "oracle-fallback";
+    fallback_hasher.Write(fallback_tag, sizeof(fallback_tag) - 1);
+    uint8_t fallback_hash[CSHA256::OUTPUT_SIZE];
+    fallback_hasher.Finalize(fallback_hash);
+    LogPrintf("MATMUL WARNING: from_oracle exhausted retries at block=%u lane=%u; using deterministic fallback\n", block, lane);
+    return ReadLE32(fallback_hash + 4 * lane) % MODULUS;
+}
 
-        if (retry > 0) {
-            uint8_t retry_le[4];
-            WriteLE32(retry_le, retry);
-            hasher.Write(retry_le, sizeof(retry_le));
-        }
-
+Element OracleLaneWithRetries(const uint8_t seed_bytes[32], uint32_t block, uint32_t lane, uint32_t first_retry)
+{
+    for (uint32_t retry = first_retry; retry < 256; ++retry) {
         uint8_t hash[CSHA256::OUTPUT_SIZE];
-        hasher.Finalize(hash);
-
-        const uint32_t candidate = ReadLE32(hash) & MODULUS;
+        OracleBlockHash(seed_bytes, block, retry, hash);
+        const uint32_t candidate = ReadLE32(hash + 4 * lane) & MODULUS;
         if (candidate < MODULUS) {
             return candidate;
         }
     }
+    return OracleFallbackLane(seed_bytes, block, lane);
+}
 
-    // This path is effectively unreachable in practice (~2^-7936), but
-    // consensus requires deterministic behavior across all implementations if
-    // it is ever hit.
-    CSHA256 fallback_hasher;
-    fallback_hasher.Write(seed_bytes, sizeof(seed_bytes));
-    uint8_t index_le[4];
-    WriteLE32(index_le, index);
-    fallback_hasher.Write(index_le, sizeof(index_le));
-    static constexpr uint8_t fallback_tag[] = "oracle-fallback";
-    fallback_hasher.Write(fallback_tag, sizeof(fallback_tag) - 1);
+} // namespace
 
-    uint8_t fallback_hash[CSHA256::OUTPUT_SIZE];
-    fallback_hasher.Finalize(fallback_hash);
-    LogPrintf("MATMUL WARNING: from_oracle exhausted retries at index=%u; using deterministic fallback\n", index);
-    return ReadLE32(fallback_hash) % MODULUS;
+void from_oracle_block(const uint256& seed, uint32_t block, Element out[8])
+{
+    uint8_t seed_bytes[32];
+    CanonicalSeedBytes(seed, seed_bytes);
+    uint8_t hash[CSHA256::OUTPUT_SIZE];
+    OracleBlockHash(seed_bytes, block, /*retry=*/0, hash);
+    for (uint32_t lane = 0; lane < 8; ++lane) {
+        const uint32_t candidate = ReadLE32(hash + 4 * lane) & MODULUS;
+        out[lane] = candidate < MODULUS ? candidate : OracleLaneWithRetries(seed_bytes, block, lane, /*first_retry=*/1);
+    }
+}
+
+Element from_oracle(const uint256& seed, uint32_t index)
+{
+    uint8_t seed_bytes[32];
+    CanonicalSeedBytes(seed, seed_bytes);
+    return OracleLaneWithRetries(seed_bytes, index >> 3, index & 7U, /*first_retry=*/0);
+}
+
+void fill_from_oracle(const uint256& seed, uint32_t start_index, uint32_t count, Element* out)
+{
+    if (count == 0) return;
+    assert(static_cast<uint64_t>(start_index) + count <= (static_cast<uint64_t>(1) << 32));
+    uint32_t index = start_index;
+    uint32_t written = 0;
+    // Leading partial block.
+    while (written < count && (index & 7U) != 0) {
+        out[written++] = from_oracle(seed, index++);
+    }
+    Element lanes[8];
+    while (count - written >= 8) {
+        from_oracle_block(seed, index >> 3, lanes);
+        for (uint32_t lane = 0; lane < 8; ++lane) out[written + lane] = lanes[lane];
+        written += 8;
+        index += 8;
+    }
+    if (written < count) {
+        from_oracle_block(seed, index >> 3, lanes);
+        for (uint32_t lane = 0; written < count; ++lane) out[written++] = lanes[lane];
+    }
 }
 
 #if defined(__ARM_NEON)

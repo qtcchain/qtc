@@ -275,7 +275,7 @@ BOOST_AUTO_TEST_CASE(transcript_streaming_matches_batch)
     BOOST_CHECK_EQUAL(canonical.transcript_hash, manual.second);
 }
 
-BOOST_AUTO_TEST_CASE(product_digest_matches_hash_of_final_ell_transcript_slice)
+BOOST_AUTO_TEST_CASE(product_digest_v4_matches_tile_hash_construction)
 {
     FastRandomContext rng{true};
     const matmul::Matrix a = RandomMatrix(rng, 8);
@@ -285,31 +285,61 @@ BOOST_AUTO_TEST_CASE(product_digest_matches_hash_of_final_ell_transcript_slice)
     constexpr uint32_t kNBlocks = 2;
 
     const auto canonical = matmul::transcript::CanonicalMatMul(a, b, kBlockSize, sigma);
-    const auto compressed_words = ManualCompressedTranscriptWords(a, b, kBlockSize, sigma);
-    BOOST_REQUIRE_EQUAL(compressed_words.size(), static_cast<size_t>(kNBlocks) * kNBlocks * kNBlocks);
+    const matmul::Matrix& c = canonical.C_prime;
 
-    std::vector<matmul::field::Element> final_ell_words;
-    final_ell_words.reserve(static_cast<size_t>(kNBlocks) * kNBlocks);
+    // Manual construction: SHA-256 over each b×b tile (row-major LE32), root over the tile hashes.
+    std::vector<uint256> tile_hashes;
     for (uint32_t i = 0; i < kNBlocks; ++i) {
         for (uint32_t j = 0; j < kNBlocks; ++j) {
-            const size_t offset = (static_cast<size_t>(i) * kNBlocks + j) * kNBlocks + (kNBlocks - 1);
-            final_ell_words.push_back(compressed_words[offset]);
+            CSHA256 hasher;
+            for (uint32_t row = 0; row < kBlockSize; ++row) {
+                for (uint32_t col = 0; col < kBlockSize; ++col) {
+                    unsigned char buf[4];
+                    WriteLE32(buf, c.at(i * kBlockSize + row, j * kBlockSize + col));
+                    hasher.Write(buf, 4);
+                }
+            }
+            uint256 tile_hash;
+            hasher.Finalize(tile_hash.begin());
+            tile_hashes.push_back(tile_hash);
         }
     }
+    CSHA256 root_hasher;
+    for (const auto& h : tile_hashes) root_hasher.Write(h.begin(), 32);
+    uint256 root;
+    root_hasher.Finalize(root.begin());
 
-    const uint256 final_ell_hash = matmul::transcript::HashMatrixWords(final_ell_words);
-    const uint256 final_ell_digest = matmul::transcript::FinalizeProductCommittedDigestFromHash(
-        final_ell_hash,
-        sigma,
-        a.rows(),
-        kBlockSize);
+    const uint256 expected = matmul::transcript::FinalizeProductCommittedDigestFromHash(root, sigma, a.rows(), kBlockSize);
+    BOOST_CHECK_EQUAL(expected, matmul::transcript::ComputeProductCommittedDigest(c, kBlockSize, sigma));
+    BOOST_CHECK_EQUAL(expected, matmul::transcript::ComputeProductCommittedDigestFromPerturbed(a, b, kBlockSize, sigma));
+    BOOST_CHECK_EQUAL(expected, matmul::transcript::ComputeProductCommittedDigestFromWords(
+        Span<const matmul::field::Element>{c.data(), static_cast<size_t>(c.rows()) * c.cols()}, sigma, c.rows(), kBlockSize));
+    const auto computed_tiles = matmul::transcript::ComputeProductTileHashes(c, kBlockSize);
+    BOOST_REQUIRE_EQUAL(computed_tiles.size(), tile_hashes.size());
+    for (size_t k = 0; k < tile_hashes.size(); ++k) BOOST_CHECK_EQUAL(computed_tiles[k], tile_hashes[k]);
 
-    BOOST_CHECK_EQUAL(
-        final_ell_digest,
-        matmul::transcript::ComputeProductCommittedDigest(
-            canonical.C_prime,
-            kBlockSize,
-            sigma));
+    // Every element of C' is committed: a single-element change alters the digest.
+    matmul::Matrix c_mod = c;
+    c_mod.at(7, 7) = matmul::field::add(c_mod.at(7, 7), 1);
+    BOOST_CHECK_NE(expected, matmul::transcript::ComputeProductCommittedDigest(c_mod, kBlockSize, sigma));
+}
+
+// Known answer from test/reference/generate_test_vectors.py (product_digest_v4_n8_b4):
+// A' = FromSeed(seed_a, 8), B' = FromSeed(seed_b, 8), C' = A'·B', b = 4.
+BOOST_AUTO_TEST_CASE(product_digest_v4_pinned_n8_b4)
+{
+    const uint256 seed_a{"376d8f3e225ed14f5614a884f822920360a7b021684bd74600aa5f88dbd32a27"};
+    const uint256 seed_b{"3609c5eaeae940efb3035712cd65b09f0330d77fdf852128a89069b3ac02f586"};
+    const uint256 sigma{"ffc381ccd5e78ab52348ec8ba82f51d5feb0e857d7969ab0df9a5891c68cdf15"};
+    const matmul::Matrix a = matmul::FromSeed(seed_a, 8);
+    const matmul::Matrix b = matmul::FromSeed(seed_b, 8);
+    const matmul::Matrix c = a * b;
+    const auto tiles = matmul::transcript::ComputeProductTileHashes(c, 4);
+    BOOST_REQUIRE_EQUAL(tiles.size(), 4U);
+    BOOST_CHECK_EQUAL(tiles[0], uint256{"01534b7e0e052d95679d68da70fb777f14166229f98eae1c0f0e8bc4b3bc4224"});
+    BOOST_CHECK_EQUAL(matmul::transcript::HashProductTileHashes(tiles), uint256{"ebf116b5ba88fff54f6fff2f042f34a59575f444d5d6071ccaa018caf5176830"});
+    BOOST_CHECK_EQUAL(matmul::transcript::ComputeProductCommittedDigest(c, 4, sigma),
+                      uint256{"0bd68fd1c252d7bfabec102e7cfe7adab5755ad0034459b072df1daea8707759"});
 }
 
 BOOST_AUTO_TEST_CASE(replay_from_clean_block_products_matches_canonical_hash)
@@ -493,14 +523,14 @@ BOOST_AUTO_TEST_CASE(compression_vector_b8_pinned)
     const auto vec = matmul::transcript::DeriveCompressionVector(sigma, 8);
 
     const std::vector<uint32_t> expected{
-        854323467U, 1922810799U, 138893669U, 774245080U, 1910322065U, 479659975U, 1001665414U, 846347437U,
-        1594558452U, 1190555733U, 1946094175U, 949130026U, 1989820537U, 1338239980U, 112664120U, 495418066U,
-        763100808U, 963296335U, 2104825498U, 911035817U, 840832198U, 1648834108U, 249535501U, 987286922U,
-        1284151614U, 1283357078U, 2095142933U, 1026823933U, 277904251U, 448493396U, 683839780U, 146995467U,
-        1820928528U, 1115770288U, 926380059U, 1478244584U, 235132119U, 415929716U, 1528251740U, 441728812U,
-        717970846U, 1597403828U, 852380403U, 1541164172U, 1576656695U, 2088271682U, 1066081759U, 1868395032U,
-        1496940987U, 878288754U, 366484956U, 1828311227U, 588781468U, 931740877U, 1126598725U, 1663853027U,
-        797953804U, 984550866U, 1476302989U, 1991155073U, 707298527U, 1170652932U, 414389278U, 869587357U,
+        854323467U, 93970670U, 1622192336U, 946673523U, 550173025U, 102188850U, 605994788U, 2094605813U,
+        1922810799U, 402117796U, 1893669665U, 1585336762U, 19603294U, 1483654026U, 1793006933U, 667515165U,
+        138893669U, 1688833283U, 525520578U, 505321981U, 547009448U, 468201701U, 1616427335U, 512541449U,
+        774245080U, 1910090041U, 1366987153U, 2131726147U, 1893447767U, 363437984U, 804552173U, 354810647U,
+        1910322065U, 596231767U, 1094209687U, 2136431261U, 1823245600U, 1245090425U, 1219674302U, 1698286284U,
+        479659975U, 17366915U, 1901637939U, 467896388U, 2143977916U, 1396422926U, 161415286U, 1881021761U,
+        1001665414U, 1166671707U, 19598978U, 1429580997U, 1089874781U, 1320521654U, 1050759605U, 824719103U,
+        846347437U, 206821886U, 1386777854U, 1555624198U, 1892259907U, 878055653U, 1542406696U, 252462912U,
     };
 
     BOOST_CHECK_EQUAL(vec.size(), expected.size());
@@ -531,7 +561,7 @@ BOOST_AUTO_TEST_CASE(canonical_matmul_n8_b4_pinned_digest)
     const matmul::Matrix b = matmul::FromSeed(seed_b, 8);
 
     const auto result = matmul::transcript::CanonicalMatMul(a, b, 4, sigma);
-    BOOST_CHECK_EQUAL(result.transcript_hash, ParseUint256Raw("b134b59bfdd28f3bf566e35a4d44b0af8e9530dce8047125a59d308ed22c17b8"));
+    BOOST_CHECK_EQUAL(result.transcript_hash, ParseUint256Raw("24daac348b560e763d07f6421bc3ad1c59f75d5f7eb2329df61d81cd5a28bb3e"));
 }
 
 BOOST_AUTO_TEST_CASE(canonical_matmul_n8_b4_pinned_product)
@@ -546,14 +576,14 @@ BOOST_AUTO_TEST_CASE(canonical_matmul_n8_b4_pinned_product)
     const auto result = matmul::transcript::CanonicalMatMul(a, b, 4, sigma);
 
     const std::vector<std::vector<uint32_t>> expected_rows{
-        {131245387U, 996985597U, 1415691111U, 75647953U, 1453769508U, 226370569U, 1602132038U, 1924870967U},
-        {1994294548U, 464104048U, 179583508U, 1527279991U, 1126483094U, 36768432U, 2013561722U, 1312578439U},
-        {1436220467U, 466816144U, 126453702U, 753329165U, 471499874U, 1418934695U, 1761650946U, 1573241549U},
-        {645246462U, 175153553U, 361276609U, 966664511U, 1705575876U, 1016078365U, 605091080U, 797357023U},
-        {1699709533U, 616249584U, 837573788U, 722153758U, 528778884U, 538341887U, 960803804U, 432492092U},
-        {1221896789U, 1497511969U, 1409959869U, 2018077429U, 1838839539U, 842677057U, 1591736450U, 1282074994U},
-        {1199405744U, 1776639913U, 43247130U, 1950021239U, 161220525U, 936954211U, 92632281U, 1714468946U},
-        {1349493752U, 1294873866U, 580920316U, 1375526319U, 301361523U, 290972387U, 1491529954U, 626629023U},
+        {1432442312U, 608050635U, 287662935U, 84438345U, 198107531U, 736063368U, 946137375U, 1654079043U},
+        {68661792U, 1036955028U, 695739083U, 1455803335U, 54115564U, 1928064227U, 717075796U, 2067944156U},
+        {219977974U, 604545880U, 2083750038U, 1992370063U, 2035020009U, 1268155074U, 600728755U, 1714758590U},
+        {284455938U, 1552763805U, 551827765U, 408579968U, 1769771903U, 1764313334U, 902515694U, 544255871U},
+        {1476102821U, 1430879526U, 1152511302U, 1705186941U, 863049128U, 540912741U, 234470509U, 2059112565U},
+        {374336660U, 1624281963U, 1672054102U, 2090287161U, 367955151U, 1775754472U, 987091669U, 1762215887U},
+        {138690713U, 1932978492U, 1843264253U, 1905269605U, 986710366U, 171340944U, 187308095U, 1956914969U},
+        {1554780505U, 1894629306U, 915796821U, 1395159837U, 2026772936U, 1860774379U, 1697258497U, 1195049964U},
     };
 
     BOOST_CHECK(result.C_prime == MatrixFromRows(expected_rows));
