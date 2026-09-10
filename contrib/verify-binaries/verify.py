@@ -2,20 +2,22 @@
 # Copyright (c) 2020-2021 The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Script for verifying Bitcoin Core release binaries.
+"""Script for verifying QTC release binaries.
 
 This script attempts to download the sum file SHA256SUMS and corresponding
-signature file SHA256SUMS.asc from bitcoincore.org and bitcoin.org and
-compares them.
+signature file SHA256SUMS.asc from every configured QTC release host (see
+HOSTS below) and compares them. QTC has not published signed release binaries
+yet, so HOSTS is intentionally empty and the `pub` command fails closed with
+"no QTC release hosts configured yet" until a release host exists.
 
 The sum-signature file is signed by a number of builder keys. This script
 ensures that there is a minimum threshold of signatures from pubkeys that
 we trust. This trust is articulated on the basis of configuration options
 here, but by default is based upon local GPG trust settings.
 
-The builder keys are available in the guix.sigs repo:
-
-    https://github.com/bitcoin-core/guix.sigs/tree/main/builder-keys
+The builder keys will be published in the QTC attestation (guix.sigs-style)
+repository once QTC release signing is established; no such repository exists
+yet.
 
 If a minimum good, trusted signature threshold is met on the sum file, we then
 download the files specified in SHA256SUMS, and check if the hashes of these
@@ -45,10 +47,11 @@ import enum
 from hashlib import sha256
 from pathlib import PurePath, Path
 
-# The primary host; this will fail if we can't retrieve files from here.
-HOST1 = "https://bitcoincore.org"
-HOST2 = "https://bitcoin.org"
-VERSIONPREFIX = "bitcoin-core-"
+# QTC release hosts, primary first. Intentionally EMPTY: QTC has no signed release
+# distribution yet, so there is nothing to download or verify. Populate once a release
+# host (and its attestation repository) exists; until then `pub` fails closed.
+HOSTS: list[str] = []
+VERSIONPREFIX = "qtc-"
 SUMS_FILENAME = 'SHA256SUMS'
 SIGNATUREFILENAME = f"{SUMS_FILENAME}.asc"
 
@@ -453,7 +456,12 @@ def verify_binary_hashes(hashes_to_verify: list[list[str]]) -> tuple[ReturnCode,
 
 
 def verify_published_handler(args: argparse.Namespace) -> ReturnCode:
-    WORKINGDIR = Path(tempfile.gettempdir()) / f"bitcoin_verify_binaries.{args.version}"
+    if not HOSTS:
+        log.error("no QTC release hosts configured yet (HOSTS is empty in verify.py); "
+                  "there are no published QTC release binaries to verify")
+        return ReturnCode.FILE_GET_FAILED
+
+    WORKINGDIR = Path(tempfile.gettempdir()) / f"qtc_verify_binaries.{args.version}"
 
     def cleanup():
         log.info("cleaning up files")
@@ -480,7 +488,7 @@ def verify_published_handler(args: argparse.Namespace) -> ReturnCode:
     os.makedirs(WORKINGDIR, exist_ok=True)
     os.chdir(WORKINGDIR)
 
-    hosts = [HOST1, HOST2]
+    hosts = list(HOSTS)
 
     got_sig_status = get_files_from_hosts_and_compare(
         hosts, remote_sigs_path, SIGNATUREFILENAME, args.require_all_hosts)
@@ -513,7 +521,7 @@ def verify_published_handler(args: argparse.Namespace) -> ReturnCode:
         log.error(f"No files matched the platform specified. Did you mean: {closest_match}")
         return ReturnCode.NO_BINARIES_MATCH
 
-    # remove binaries that are known not to be hosted by bitcoincore.org
+    # remove binaries that are known not to be hosted by the primary release host
     fragments_to_remove = ['-unsigned', '-debug', '-codesignatures']
     for fragment in fragments_to_remove:
         nobinaries = [i for i in hashes_to_verify if fragment in i[1]]
@@ -521,14 +529,14 @@ def verify_published_handler(args: argparse.Namespace) -> ReturnCode:
             remove_str = ', '.join(i[1] for i in nobinaries)
             log.info(
                 f"removing *{fragment} binaries ({remove_str}) from verification "
-                f"since {HOST1} does not host *{fragment} binaries")
+                f"since {hosts[0]} does not host *{fragment} binaries")
             hashes_to_verify = [i for i in hashes_to_verify if fragment not in i[1]]
 
     # download binaries
     for _, binary_filename in hashes_to_verify:
         log.info(f"downloading {binary_filename} to {WORKINGDIR}")
         success, output = download_with_wget(
-            HOST1 + remote_dir + binary_filename, binary_filename)
+            hosts[0] + remote_dir + binary_filename, binary_filename)
 
         if not success:
             log.error(
@@ -673,7 +681,7 @@ def main():
     pub_parser.set_defaults(func=verify_published_handler)
     pub_parser.add_argument(
         'version', type=str, help=(
-            f'version of the bitcoin release to download; of the format '
+            f'version of the QTC release to download; of the format '
             f'{VERSION_FORMAT}. Example: {VERSION_EXAMPLE}')
     )
     pub_parser.add_argument(
@@ -685,8 +693,8 @@ def main():
         '--require-all-hosts', action='store_true',
         default=bool_from_env('BINVERIFY_REQUIRE_ALL_HOSTS'),
         help=(
-            f'If set, require all hosts ({HOST1}, {HOST2}) to provide signatures. '
-            '(Sometimes bitcoin.org lags behind bitcoincore.org.)')
+            f'If set, require all configured hosts ({", ".join(HOSTS) or "none configured yet"}) '
+            'to provide signatures. (Mirrors may lag behind the primary host.)')
     )
 
     bin_parser = subparsers.add_parser("bin", help="Verify local binaries.")

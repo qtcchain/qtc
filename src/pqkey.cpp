@@ -117,10 +117,11 @@ void CPQKey::MakeNewKey(PQAlgorithm algo)
 {
     ClearKeyData();
 
+    // Key material must come from the strong RNG (as CKey::MakeNewKey does), not the fast RNG.
     std::array<unsigned char, 128> entropy{};
     for (size_t offset = 0; offset < entropy.size(); offset += 32) {
         const size_t chunk = std::min<size_t>(32, entropy.size() - offset);
-        GetRandBytes(Span<unsigned char>(entropy.data() + offset, chunk));
+        GetStrongRandBytes(Span<unsigned char>(entropy.data() + offset, chunk));
     }
 
     bitcoin_pqc_keypair_t keypair{};

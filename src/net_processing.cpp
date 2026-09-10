@@ -163,6 +163,12 @@ static_assert(INVENTORY_BROADCAST_MAX <= node::MAX_PEER_TX_ANNOUNCEMENTS, "INVEN
 static constexpr size_t MAX_TX_INVENTORY_TO_SEND = node::MAX_PEER_TX_ANNOUNCEMENTS;
 /** Retain reconnect-resistant MatMul verification budgets for this duration. */
 static constexpr auto MATMUL_ADDR_BUDGET_RETENTION{10min};
+/** MatMul verification budgets switch to the finite catch-up caps when our own
+ *  validated tip is older than this many target spacings, even if
+ *  IsInitialBlockDownload() is already false (a node rejoining after an outage
+ *  shorter than -maxtipage still has many blocks to verify). Only local chain
+ *  state is consulted; see PeerManagerImpl::MatMulBudgetCatchUp(). */
+static constexpr int MATMUL_BUDGET_CATCHUP_BLOCKS{16};
 /** Average delay between feefilter broadcasts in seconds. */
 static constexpr auto AVG_FEEFILTER_BROADCAST_INTERVAL{10min};
 /** Maximum feefilter broadcast delay after significant change. */
@@ -197,6 +203,60 @@ static std::chrono::milliseconds TargetSpacingForTip(const CBlockIndex* tip, con
 {
     const int32_t height = tip != nullptr ? tip->nHeight : 0;
     return EffectiveTargetSpacingForHeight(height, params);
+}
+
+MatMulBudgetKey MatMulBudgetKeyFor(const CNetAddr& addr, Network connected_through, NodeId node_id)
+{
+    MatMulBudgetKey key;
+    switch (connected_through) {
+    case NET_ONION:
+    case NET_I2P:
+    case NET_CJDNS: {
+        // Inbound onion peers all present the proxy/local address, and I2P/CJDNS
+        // identities are free to mint, so an address-keyed budget would be either
+        // shared by every such peer or unlimited. Key by connection instead.
+        key.push_back(0xff);
+        const uint64_t id = static_cast<uint64_t>(node_id);
+        for (int shift = 0; shift < 64; shift += 8) {
+            key.push_back(static_cast<unsigned char>(id >> shift));
+        }
+        return key;
+    }
+    case NET_IPV6: {
+        // Providers hand out whole /64s; bucket the prefix.
+        key.push_back(static_cast<unsigned char>(NET_IPV6));
+        const std::vector<unsigned char> bytes = addr.GetAddrBytes();
+        key.insert(key.end(), bytes.begin(), bytes.begin() + std::min<size_t>(bytes.size(), 8));
+        return key;
+    }
+    case NET_UNROUTABLE:
+    case NET_IPV4:
+    case NET_INTERNAL:
+    case NET_MAX:
+        break;
+    }
+    key.push_back(static_cast<unsigned char>(addr.GetNetwork()));
+    const std::vector<unsigned char> bytes = addr.GetAddrBytes();
+    key.insert(key.end(), bytes.begin(), bytes.end());
+    return key;
+}
+
+bool IsMatMulPhase2Failure(const BlockValidationState& state)
+{
+    // Expensive-stage failures: the Phase-1 header checks passed but the block-level
+    // MatMul verification did not. All of these are routed to the reconnect-resistant
+    // Phase-2 punishment ladder and address budgets rather than generic punishment.
+    //   - "high-hash"/"matmul phase2 proof of work failed": transcript / product mismatch.
+    //   - BLOCK_MUTATED "invalid-product-payload" / "missing-product-payload": the
+    //     header is fine but the SENDER substituted a garbage or absent Freivalds
+    //     payload (security audit N-3). The header must stay valid (an attacker
+    //     could otherwise invalidate honest blocks), but the sender is culpable.
+    const std::string& reason = state.GetRejectReason();
+    if (state.GetResult() == BlockValidationResult::BLOCK_MUTATED) {
+        return reason == "invalid-product-payload" || reason == "missing-product-payload";
+    }
+    return reason == "high-hash" &&
+        state.GetDebugMessage().find("matmul phase2 proof of work failed") != std::string::npos;
 }
 
 // Internal stuff
@@ -477,14 +537,17 @@ struct Peer {
     /** Time offset computed during the version handshake based on the
      * timestamp the peer sent in the version message. */
     std::atomic<std::chrono::seconds> m_time_offset{0s};
-    /** Remote network address used for reconnect-resistant MatMul budgeting. */
+    /** Remote network address (logging only; budgets are keyed by m_matmul_budget_key). */
     const CNetAddr m_addr;
+    /** Reconnect-resistant key for MatMul verification budgets, see MatMulBudgetKeyFor(). */
+    const MatMulBudgetKey m_matmul_budget_key;
 
-    explicit Peer(NodeId id, ServiceFlags our_services, bool is_inbound, const CNetAddr& addr)
+    explicit Peer(NodeId id, ServiceFlags our_services, bool is_inbound, const CNetAddr& addr, MatMulBudgetKey matmul_budget_key)
         : m_id{id}
         , m_our_services{our_services}
         , m_is_inbound{is_inbound}
         , m_addr{addr}
+        , m_matmul_budget_key{std::move(matmul_budget_key)}
     {}
 
 private:
@@ -649,13 +712,20 @@ private:
     void MaybeExpireMatMulAddrBudgets(std::chrono::steady_clock::time_point now)
         EXCLUSIVE_LOCKS_REQUIRED(m_matmul_addr_budget_mutex);
 
+    /** Whether MatMul verification budgets should use the finite catch-up caps:
+     *  IBD, or our own validated tip is stale (MATMUL_BUDGET_CATCHUP_BLOCKS).
+     *  Deliberately consults only local chain state: m_best_header and peers'
+     *  advertised heights are attacker-controlled (headers are cheap to forge
+     *  at floor difficulty) and must never widen the budget (audit N-2). */
+    bool MatMulBudgetCatchUp() const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
     /** Consume per-address MatMul verification budget for an incoming peer. */
     bool ConsumeMatMulVerificationBudgetForPeer(
         const Peer& peer,
         const Consensus::Params& params,
         uint32_t verification_count,
         std::chrono::steady_clock::time_point now,
-        bool is_ibd,
+        bool catch_up,
         int32_t reference_height);
 
     /** Register a MatMul phase2 failure against a reconnect-resistant address budget. */
@@ -949,7 +1019,7 @@ private:
         std::chrono::steady_clock::time_point last_update{};
     };
     mutable Mutex m_matmul_addr_budget_mutex;
-    std::map<CNetAddr, MatMulAddrBudgetState> m_matmul_addr_budgets GUARDED_BY(m_matmul_addr_budget_mutex);
+    std::map<MatMulBudgetKey, MatMulAddrBudgetState> m_matmul_addr_budgets GUARDED_BY(m_matmul_addr_budget_mutex);
 
     /** Number of outbound peers with m_chain_sync.m_protect. */
     int m_outbound_peers_with_protect_from_disconnect GUARDED_BY(cs_main) = 0;
@@ -1733,7 +1803,8 @@ void PeerManagerImpl::InitializeNode(const CNode& node, ServiceFlags our_service
         our_services = static_cast<ServiceFlags>(our_services | NODE_COMPACT_FILTERS);
     }
 
-    PeerRef peer = std::make_shared<Peer>(nodeid, our_services, node.IsInboundConn(), node.addr);
+    PeerRef peer = std::make_shared<Peer>(nodeid, our_services, node.IsInboundConn(), node.addr,
+                                          MatMulBudgetKeyFor(node.addr, node.ConnectedThroughNetwork(), nodeid));
     {
         LOCK(m_peer_mutex);
         m_peer_map.emplace_hint(m_peer_map.end(), nodeid, peer);
@@ -1857,18 +1928,18 @@ bool PeerManagerImpl::PeerAdvertisesMatMulConsensus(ServiceFlags services)
 
 ServiceFlags PeerManagerImpl::GetDesirableServiceFlags(ServiceFlags services) const
 {
-    const bool require_matmul_consensus = RequireMatMulConsensusPeersForSync();
-    const ServiceFlags matmul_desirable{require_matmul_consensus ? NODE_MATMUL_CONSENSUS : NODE_NONE};
-
+    // NODE_MATMUL_CONSENSUS is a soft preference for block download
+    // (fPreferredDownload), never a connection requirement: requiring it here
+    // disconnected every outbound peer without the bit at VERSION and left a
+    // consensus-mode node unable to sync from a network of non-advertising
+    // NODE_NETWORK peers (audit P-5).
     if (services & NODE_NETWORK_LIMITED) {
         // Limited peers are desirable when we are close to the tip.
         if (ApproximateBestBlockDepth() < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS) {
-            ServiceFlags desired{ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS)};
-            return ServiceFlags(desired | matmul_desirable);
+            return ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS);
         }
     }
-    ServiceFlags desired{ServiceFlags(NODE_NETWORK | NODE_WITNESS)};
-    return ServiceFlags(desired | matmul_desirable);
+    return ServiceFlags(NODE_NETWORK | NODE_WITNESS);
 }
 
 PeerRef PeerManagerImpl::GetPeerRef(NodeId id) const
@@ -2077,12 +2148,22 @@ void PeerManagerImpl::MaybeExpireMatMulAddrBudgets(std::chrono::steady_clock::ti
     }
 }
 
+bool PeerManagerImpl::MatMulBudgetCatchUp() const
+{
+    AssertLockHeld(cs_main);
+    if (m_chainman.IsInitialBlockDownload()) return true;
+    const CBlockIndex* tip = m_chainman.ActiveChain().Tip();
+    if (tip == nullptr) return true;
+    const auto stale_after = MATMUL_BUDGET_CATCHUP_BLOCKS * TargetSpacingForTip(tip, m_chainparams.GetConsensus());
+    return tip->Time() + stale_after < NodeClock::now();
+}
+
 bool PeerManagerImpl::ConsumeMatMulVerificationBudgetForPeer(
     const Peer& peer,
     const Consensus::Params& params,
     uint32_t verification_count,
     std::chrono::steady_clock::time_point now,
-    bool is_ibd,
+    bool catch_up,
     int32_t reference_height)
 {
     if (verification_count == 0) return true;
@@ -2093,7 +2174,7 @@ bool PeerManagerImpl::ConsumeMatMulVerificationBudgetForPeer(
     {
         UniqueLock lock(m_matmul_addr_budget_mutex, "m_matmul_addr_budget_mutex", __FILE__, __LINE__);
         MaybeExpireMatMulAddrBudgets(now);
-        auto& budget_state = m_matmul_addr_budgets[peer.m_addr];
+        auto& budget_state = m_matmul_addr_budgets[peer.m_matmul_budget_key];
         budget_state.last_update = now;
 
         // Snapshot full rate-limit state before consuming so we can roll
@@ -2104,7 +2185,7 @@ bool PeerManagerImpl::ConsumeMatMulVerificationBudgetForPeer(
         const auto saved_window_start = budget_state.budget.window_start;
         const uint32_t saved_count = budget_state.budget.expensive_verifications_this_minute;
         for (uint32_t i = 0; i < verification_count; ++i) {
-            if (!ConsumeMatMulPeerVerifyBudget(budget_state.budget, params, now, is_ibd, reference_height)) {
+            if (!ConsumeMatMulPeerVerifyBudget(budget_state.budget, params, now, catch_up, reference_height)) {
                 budget_state.budget.window_start = saved_window_start;
                 budget_state.budget.expensive_verifications_this_minute = saved_count;
                 return false;
@@ -2116,21 +2197,21 @@ bool PeerManagerImpl::ConsumeMatMulVerificationBudgetForPeer(
         // in. Still inside per-peer lock so we can roll back the full per-peer
         // rate-limit state if the global budget is exhausted.
         //
-        // During bootstrap fast phase, allow sustained verification throughput
-        // even if IBD heuristics latch false early (tip-time based). The
-        // per-peer budget remains in force and still protects the node.
+        // Never skipped: during catch-up and the bootstrap fast phase the cap is
+        // scaled (finite) rather than lifted, so a peer that manages to put us in
+        // catch-up mode still gets only a bounded amount of verification CPU
+        // (audit N-2).
         const bool in_fast_phase =
             params.fMatMulPOW &&
             reference_height >= 0 &&
             reference_height < params.nFastMineHeight;
-        if (!is_ibd && !in_fast_phase) {
-            if (!ConsumeGlobalMatMulPhase2Budget(params.nMatMulGlobalVerifyBudgetPerMin, verification_count, now)) {
-                budget_state.budget.window_start = saved_window_start;
-                budget_state.budget.expensive_verifications_this_minute = saved_count;
-                LogDebug(BCLog::NET, "Global Phase2 budget exhausted (%u/min), throttling peer %s\n",
-                         params.nMatMulGlobalVerifyBudgetPerMin, peer.m_addr.ToStringAddr());
-                return false;
-            }
+        const uint32_t global_budget = EffectiveMatMulGlobalVerifyBudgetPerMin(params, catch_up || in_fast_phase);
+        if (!ConsumeGlobalMatMulPhase2Budget(global_budget, verification_count, now)) {
+            budget_state.budget.window_start = saved_window_start;
+            budget_state.budget.expensive_verifications_this_minute = saved_count;
+            LogDebug(BCLog::NET, "Global Phase2 budget exhausted (%u/min), throttling peer %s\n",
+                     global_budget, peer.m_addr.ToStringAddr());
+            return false;
         }
     }
     return true;
@@ -2144,7 +2225,7 @@ MatMulPhase2Punishment PeerManagerImpl::RegisterMatMulPhase2FailureForPeer(
 {
     UniqueLock lock(m_matmul_addr_budget_mutex, "m_matmul_addr_budget_mutex", __FILE__, __LINE__);
     MaybeExpireMatMulAddrBudgets(now);
-    auto& budget_state = m_matmul_addr_budgets[peer.m_addr];
+    auto& budget_state = m_matmul_addr_budgets[peer.m_matmul_budget_key];
     budget_state.last_update = now;
     return RegisterMatMulPhase2Failure(budget_state.budget, params, now, failures_out);
 }
@@ -2179,12 +2260,6 @@ static bool IsMatMulPhase1Failure(const BlockValidationState& state)
     return reason == "high-hash" &&
         (msg.find("matmul phase1 proof of work failed") != std::string::npos ||
          msg.find("matmul pre-hash proof failed") != std::string::npos);
-}
-
-static bool IsMatMulPhase2Failure(const BlockValidationState& state)
-{
-    return state.GetRejectReason() == "high-hash" &&
-        state.GetDebugMessage().find("matmul phase2 proof of work failed") != std::string::npos;
 }
 
 static bool IsHighConfidenceInvalidShieldedBlock(const BlockValidationState& state)
@@ -2225,7 +2300,12 @@ void PeerManagerImpl::MaybePunishNodeForBlock(NodeId nodeid, const BlockValidati
         return;
     }
 
-    if (consensus_params.fMatMulPOW && IsMatMulPhase2Failure(state)) {
+    // A mutated (garbage/missing payload) block that we reconstructed from a compact
+    // block is not evidence against the announcing peer (BIP 152); only a peer that
+    // delivered the full block is culpable for its payload.
+    const bool mutated_via_compact_block =
+        via_compact_block && state.GetResult() == BlockValidationResult::BLOCK_MUTATED;
+    if (consensus_params.fMatMulPOW && IsMatMulPhase2Failure(state) && !mutated_via_compact_block) {
         PeerRef peer = GetPeerRef(nodeid);
         if (!peer) {
             HandleDoSPunishment(m_connman, nodeid, MATMUL_PHASE2_BAN_MISBEHAVIOR, "matmul block");
@@ -2247,7 +2327,14 @@ void PeerManagerImpl::MaybePunishNodeForBlock(NodeId nodeid, const BlockValidati
                   state.GetRejectReason(),
                   state.GetDebugMessage());
 
+        // DISCOURAGE and BAN both discourage the address through Misbehaving()
+        // (honoured by MaybeDiscourageAndDisconnect, which respects NoBan/manual/
+        // local exemptions like Core does for invalid blocks). HandleDoSPunishment
+        // alone never discourages and does not even disconnect inbound peers, so
+        // without this an inbound peer could keep feeding garbage payloads from
+        // the same address (audit N-3).
         if (punishment == MatMulPhase2Punishment::BAN) {
+            Misbehaving(*peer, "matmul phase2 failure threshold reached");
             HandleDoSPunishment(m_connman, nodeid, MATMUL_PHASE2_BAN_MISBEHAVIOR, "matmul block");
             DisconnectNodeNow(m_connman, nodeid);
             return;
@@ -2256,6 +2343,9 @@ void PeerManagerImpl::MaybePunishNodeForBlock(NodeId nodeid, const BlockValidati
         if (punishment == MatMulPhase2Punishment::DISCOURAGE) {
             Misbehaving(*peer, "matmul phase2 transcript mismatch");
         }
+        // Every rung disconnects the sender, so the block is never re-requested from
+        // the peer that just delivered a bad payload; the block index keeps no data
+        // for it and the normal download logic fetches it from another peer.
         m_connman.ForNode(nodeid, [](CNode* node) {
             node->fDisconnect = true;
             return true;
@@ -3228,11 +3318,10 @@ void PeerManagerImpl::HandleUnconnectingHeaders(CNode& pfrom, Peer& peer,
     // Set hashLastUnknownBlock for this peer, so that if we
     // eventually get the headers - even from a different peer -
     // we can use this peer to download.
+    // As in upstream Core, a single unconnecting headers message is not
+    // punished: it is usually a benign BIP 130 announcement whose parent we
+    // simply have not seen yet (audit P-7).
     WITH_LOCK(cs_main, UpdateBlockAvailability(pfrom.GetId(), headers.back().GetHash()));
-
-    if (pfrom.PunishInvalidBlocks()) {
-        pfrom.fDisconnect = true;
-    }
 }
 
 bool PeerManagerImpl::CheckHeadersAreContinuous(const std::vector<CBlockHeader>& headers) const
@@ -3664,34 +3753,20 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
     if (consensus_params.fMatMulPOW) {
         int32_t best_known_height{chain_start_header->nHeight};
         bool is_ibd{false};
+        bool budget_catch_up{false};
         bool phase2_enabled{false};
         {
             LOCK(cs_main);
             best_known_height = m_chainman.m_best_header != nullptr
                 ? m_chainman.m_best_header->nHeight
                 : chain_start_header->nHeight;
+            // is_ibd mirrors ContextualCheckBlock's Phase-2 gating (which heights
+            // will actually be verified). The budget mode is derived separately
+            // from local chain state only: neither m_best_header nor the peer's
+            // advertised starting height may widen the budget, since both are
+            // attacker-controlled (audit N-2).
             is_ibd = m_chainman.IsInitialBlockDownload();
-            const int32_t active_height = m_chainman.ActiveHeight();
-            // Treat catch-up phase (active tip far behind best header) as
-            // IBD-equivalent for verification budget purposes.  Without this,
-            // the budget drops to steady-state (32/min) the moment IBD exits
-            // even though hundreds of blocks still need Phase2 verification.
-            if (!is_ibd && active_height + 10 < best_known_height) {
-                is_ibd = true;
-            }
-            if (!is_ibd && peer.m_starting_height.load(std::memory_order_relaxed) >= 0) {
-                // A peer that advertises a tip more than one steady-state
-                // per-minute Phase2 budget window ahead of our active tip
-                // should be treated as catch-up to avoid disconnect loops on
-                // legitimate post-split rejoin traffic.
-                const int32_t peer_announced_height = peer.m_starting_height.load(std::memory_order_relaxed);
-                const int32_t ibd_equivalent_gap = std::max<int32_t>(
-                    32,
-                    static_cast<int32_t>(consensus_params.nMatMulPeerVerifyBudgetPerMin));
-                if (peer_announced_height > active_height + ibd_equivalent_gap) {
-                    is_ibd = true;
-                }
-            }
+            budget_catch_up = MatMulBudgetCatchUp();
             phase2_enabled = m_chainman.GetMatMulValidationMode() == kernel::MatMulValidationMode::CONSENSUS;
         }
 
@@ -3720,7 +3795,7 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
                     consensus_params,
                     phase2_checks,
                     std::chrono::steady_clock::now(),
-                    is_ibd,
+                    budget_catch_up,
                     budget_reference_height)) {
                 LogDebug(BCLog::NET, "Disconnecting peer=%d: MatMul per-peer verification budget exhausted\n", pfrom.GetId());
                 pfrom.fDisconnect = true;
@@ -4387,9 +4462,11 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             m_num_preferred_download_peers += state->fPreferredDownload;
 
             if (require_matmul_consensus && base_preferred && !state->fPreferredDownload) {
+                // Soft preference only: the peer stays connected and is still used
+                // for block download whenever no preferred peer is available.
                 LogPrintf("MATMUL WARNING: peer=%d lacks NODE_MATMUL_CONSENSUS service bit; deprioritizing for sync in consensus mode\n", pfrom.GetId());
                 if (m_num_preferred_download_peers == 0) {
-                    LogPrintf("MATMUL WARNING: no preferred NODE_MATMUL_CONSENSUS sync peers currently connected\n");
+                    LogPrintf("MATMUL WARNING: no preferred NODE_MATMUL_CONSENSUS sync peers currently connected; falling back to any block-serving peer\n");
                 }
             }
         }
@@ -5573,7 +5650,8 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         const auto blockhash = cmpctblock.header.GetHash();
         const Consensus::Params& consensus_params = m_chainparams.GetConsensus();
         bool requires_matmul_phase2{false};
-        bool is_ibd{false};
+        bool budget_catch_up{false};
+        bool payload_required_full_fetch{false};
         int32_t matmul_reference_height{0};
 
         {
@@ -5604,21 +5682,27 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         const int32_t best_known_height = m_chainman.m_best_header != nullptr
             ? m_chainman.m_best_header->nHeight
             : prev_block->nHeight;
-        is_ibd = m_chainman.IsInitialBlockDownload();
-        if (!is_ibd && m_chainman.ActiveHeight() + 10 < best_known_height) {
-            is_ibd = true;
-        }
-        requires_matmul_phase2 = CountMatMulExpensiveVerifyChecks(
+        // Budget mode from local chain state only (audit N-2), see MatMulBudgetCatchUp().
+        const bool is_ibd = m_chainman.IsInitialBlockDownload();
+        budget_catch_up = MatMulBudgetCatchUp();
+        matmul_reference_height =
+            prev_block->nHeight == std::numeric_limits<int>::max()
+                ? std::numeric_limits<int32_t>::max()
+                : prev_block->nHeight + 1;
+        // Compact blocks cannot carry the Freivalds product payload. Where consensus
+        // requires it, the full block is fetched below through the normal in-flight
+        // tracking and its Phase-2 unit is charged when that block arrives, so the
+        // compact block itself is not charged (audit P-6).
+        payload_required_full_fetch =
+            consensus_params.fMatMulPOW &&
+            consensus_params.IsMatMulProductPayloadRequired(matmul_reference_height);
+        requires_matmul_phase2 = !payload_required_full_fetch && CountMatMulExpensiveVerifyChecks(
             static_cast<int64_t>(prev_block->nHeight) + 1,
             /*header_count=*/1,
             best_known_height,
             consensus_params,
             m_chainman.GetMatMulValidationMode() == kernel::MatMulValidationMode::CONSENSUS,
             is_ibd) > 0;
-        matmul_reference_height =
-            prev_block->nHeight == std::numeric_limits<int>::max()
-                ? std::numeric_limits<int32_t>::max()
-                : prev_block->nHeight + 1;
 
         if (!m_chainman.m_blockman.LookupBlockIndex(blockhash)) {
             received_new_header = true;
@@ -5638,7 +5722,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                     consensus_params,
                     /*verification_count=*/1,
                     std::chrono::steady_clock::now(),
-                    is_ibd,
+                    budget_catch_up,
                     matmul_reference_height)) {
                 LogDebug(BCLog::NET, "Disconnecting peer=%d: MatMul per-peer verification budget exhausted (cmpctblock)\n", pfrom.GetId());
                 pfrom.fDisconnect = true;
@@ -5668,18 +5752,6 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         if (received_new_header) {
             LogInfo("Saw new cmpctblock header hash=%s peer=%d\n",
                 blockhash.ToString(), pfrom.GetId());
-        }
-
-        // Compact blocks do not carry MatMul Freivalds product payloads.
-        // If payloads are consensus-required for this header, fetch the full
-        // block immediately instead of attempting payload-less reconstruction.
-        if (consensus_params.fMatMulPOW &&
-            consensus_params.fMatMulFreivaldsEnabled &&
-            consensus_params.IsMatMulProductPayloadRequired(pindex->nHeight)) {
-            std::vector<CInv> vInv(1);
-            vInv[0] = CInv(MSG_BLOCK | GetFetchFlags(*peer), blockhash);
-            MakeAndPushMessage(pfrom, NetMsgType::GETDATA, vInv);
-            return;
         }
 
         bool fProcessBLOCKTXN = false;
@@ -5745,6 +5817,19 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         if (pindex->nHeight <= m_chainman.ActiveChain().Height() + 2) {
             if ((already_in_flight < MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK && nodestate->vBlocksInFlight.size() < MAX_BLOCKS_IN_TRANSIT_PER_PEER) ||
                  requested_block_from_this_peer) {
+                if (payload_required_full_fetch) {
+                    // Payload-less reconstruction cannot succeed at this height: request
+                    // the full block instead, registered in mapBlocksInFlight like any
+                    // other download so it is de-duplicated and timed out normally. If
+                    // it is already in flight from this peer, the full block is on its way.
+                    if (!requested_block_from_this_peer) {
+                        BlockRequested(pfrom.GetId(), *pindex);
+                        std::vector<CInv> vInv(1);
+                        vInv[0] = CInv(MSG_BLOCK | GetFetchFlags(*peer), blockhash);
+                        MakeAndPushMessage(pfrom, NetMsgType::GETDATA, vInv);
+                    }
+                    return;
+                }
                 std::list<QueuedBlock>::iterator* queuedBlockIt = nullptr;
                 if (!BlockRequested(pfrom.GetId(), *pindex, &queuedBlockIt)) {
                     if (!(*queuedBlockIt)->partialBlock)
@@ -5807,6 +5892,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                 // download from.
                 // Optimistically try to reconstruct anyway since we might be
                 // able to without any round trips.
+                if (payload_required_full_fetch) return; // reconstruction cannot supply the payload
                 PartiallyDownloadedBlock tempBlock(&m_mempool);
                 ReadStatus status = tempBlock.InitData(cmpctblock, vExtraTxnForCompact);
                 if (status != READ_STATUS_OK) {
@@ -5984,7 +6070,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         const uint256 hash(pblock->GetHash());
         bool min_pow_checked = false;
         bool requires_matmul_phase2{false};
-        bool is_ibd{false};
+        bool budget_catch_up{false};
         int32_t budget_reference_height{std::numeric_limits<int32_t>::max()};
         const Consensus::Params& consensus_params = m_chainparams.GetConsensus();
         std::optional<ScopedMatMulPendingVerification> pending_matmul_slot;
@@ -6013,10 +6099,9 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                 const int32_t best_known_height = m_chainman.m_best_header != nullptr
                     ? m_chainman.m_best_header->nHeight
                     : prev_block->nHeight;
-                is_ibd = m_chainman.IsInitialBlockDownload();
-                if (!is_ibd && m_chainman.ActiveHeight() + 10 < best_known_height) {
-                    is_ibd = true;
-                }
+                // Budget mode from local chain state only (audit N-2), see MatMulBudgetCatchUp().
+                const bool is_ibd = m_chainman.IsInitialBlockDownload();
+                budget_catch_up = MatMulBudgetCatchUp();
                 requires_matmul_phase2 = CountMatMulExpensiveVerifyChecks(
                     static_cast<int64_t>(prev_block->nHeight) + 1,
                     /*header_count=*/1,
@@ -6043,7 +6128,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                     consensus_params,
                     /*verification_count=*/1,
                     std::chrono::steady_clock::now(),
-                    is_ibd,
+                    budget_catch_up,
                     budget_reference_height)) {
                 LogDebug(BCLog::NET, "Disconnecting peer=%d: MatMul per-peer verification budget exhausted (block)\n", pfrom.GetId());
                 pfrom.fDisconnect = true;
@@ -6944,21 +7029,20 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         // block download from this peer -- this mostly affects behavior while
         // in IBD (once out of IBD, we sync from all peers).
         bool sync_blocks_and_headers_from_peer = false;
-        const bool require_matmul_consensus = RequireMatMulConsensusPeersForSync();
         if (state.fPreferredDownload) {
             sync_blocks_and_headers_from_peer = true;
         } else if (CanServeBlocks(*peer) && !pto->IsAddrFetchConn()) {
-            // Typically this is an inbound peer. If we don't have any outbound
-            // peers, or if we aren't downloading any blocks from such peers,
-            // then allow block downloads from this peer, too.
+            // Typically this is an inbound peer, or (in MatMul consensus mode) a
+            // peer without the NODE_MATMUL_CONSENSUS preference bit. If we don't
+            // have any preferred peers, or if we aren't downloading any blocks
+            // from such peers, then allow block downloads from this peer, too.
             // We prefer downloading blocks from outbound peers to avoid
             // putting undue load on (say) some home user who is just making
             // outbound connections to the network, but if our only source of
             // the latest blocks is from an inbound peer, we have to be sure to
             // eventually download it (and not just wait indefinitely for an
             // outbound peer to have it).
-            if (!require_matmul_consensus &&
-                (m_num_preferred_download_peers == 0 || mapBlocksInFlight.empty())) {
+            if (m_num_preferred_download_peers == 0 || mapBlocksInFlight.empty()) {
                 sync_blocks_and_headers_from_peer = true;
             }
         }

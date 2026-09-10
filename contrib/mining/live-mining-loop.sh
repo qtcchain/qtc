@@ -78,7 +78,7 @@ Options:
   --rpcconnect=HOST         RPC host override
   --rpcport=PORT            RPC port override
   --rpcuser=USER            RPC username override
-  --rpcpassword=PASS        RPC password override
+  --rpcpassword=PASS        RPC password override (prefer QTC_MINING_RPCPASSWORD or --rpccookiefile; argv is visible to other users)
   --rpccookiefile=PATH      RPC cookie file override
   --wallet=NAME             Wallet used for mining RPCs (default: miner)
   --address=ADDR            Explicit payout address
@@ -367,12 +367,13 @@ rpc_cli() {
     cmd+=("-rpcuser=${RPC_USER}")
   fi
   if [[ -n "${RPC_PASSWORD}" ]]; then
-    cmd+=("-rpcpassword=${RPC_PASSWORD}")
+    # Password goes over stdin, never onto the qtc-cli command line (visible in ps/procfs).
+    cmd+=("-stdinrpcpass")
   fi
   if [[ -n "${RPC_COOKIEFILE}" ]]; then
     cmd+=("-rpccookiefile=${RPC_COOKIEFILE}")
   fi
-  "${cmd[@]}" "$@"
+  printf '%s\n' "${RPC_PASSWORD}" | "${cmd[@]}" "$@"
 }
 
 rpc_wallet_cli() {
@@ -396,13 +397,14 @@ rpc_wallet_cli() {
     cmd+=("-rpcuser=${RPC_USER}")
   fi
   if [[ -n "${RPC_PASSWORD}" ]]; then
-    cmd+=("-rpcpassword=${RPC_PASSWORD}")
+    # Password goes over stdin, never onto the qtc-cli command line (visible in ps/procfs).
+    cmd+=("-stdinrpcpass")
   fi
   if [[ -n "${RPC_COOKIEFILE}" ]]; then
     cmd+=("-rpccookiefile=${RPC_COOKIEFILE}")
   fi
   cmd+=("-rpcwallet=${WALLET}")
-  "${cmd[@]}" "$@"
+  printf '%s\n' "${RPC_PASSWORD}" | "${cmd[@]}" "$@"
 }
 
 rpc_error_is_warmup_file() {
@@ -461,6 +463,20 @@ wait_for_rpc_ready() {
   return 1
 }
 
+# Build a -rpcauth=<user>:<salt>$<hmac-sha256> value (the format produced by
+# share/rpcauth/rpcauth.py) with the password fed over stdin, so the secret itself never appears on
+# the daemon's command line. qtc-cli keeps authenticating with the plain user/password pair.
+rpcauth_from_password() {
+  local user="$1" password="$2"
+  require_command python3
+  printf '%s' "${password}" | RPCAUTH_USER="${user}" python3 -c '
+import hmac, os, secrets, sys
+salt = secrets.token_hex(16)
+digest = hmac.new(salt.encode(), sys.stdin.read().encode(), "sha256").hexdigest()
+print(os.environ["RPCAUTH_USER"] + ":" + salt + "$" + digest)
+'
+}
+
 start_node() {
   rm -f "${NODE_PIDFILE}"
   if [[ -n "${START_CMD}" ]]; then
@@ -489,7 +505,7 @@ start_node() {
     cmd+=("-rpcuser=${RPC_USER}")
   fi
   if [[ -n "${RPC_PASSWORD}" ]]; then
-    cmd+=("-rpcpassword=${RPC_PASSWORD}")
+    cmd+=("-rpcauth=$(rpcauth_from_password "${RPC_USER}" "${RPC_PASSWORD}")")
   fi
   if [[ -n "${RPC_COOKIEFILE}" ]]; then
     cmd+=("-rpccookiefile=${RPC_COOKIEFILE}")

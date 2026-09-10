@@ -7,10 +7,13 @@
 #include <logging.h>
 #include <node/types.h>
 #include <outputtype.h>
+#include <random.h>
 #include <script/descriptor.h>
 #include <script/script.h>
 #include <script/sign.h>
 #include <script/solver.h>
+#include <streams.h>
+#include <support/cleanse.h>
 #include <util/bip32.h>
 #include <util/check.h>
 #include <util/strencodings.h>
@@ -2322,6 +2325,28 @@ isminetype DescriptorScriptPubKeyMan::IsMine(const CScript& script) const
     return ISMINE_NO;
 }
 
+//! Domain tags for the authenticated encryption of per-descriptor PQ seed records. Binding the
+//! descriptor id prevents an encrypted seed record from being transplanted between descriptors.
+static std::string PQDescriptorSeedPurpose(const uint256& desc_id)
+{
+    return "walletdescriptorpqseed:" + desc_id.ToString();
+}
+
+static std::string PQDescriptorSeedMapPurpose(const uint256& desc_id)
+{
+    return "walletdescriptorpqseedmap:" + desc_id.ToString();
+}
+
+static void CleansePQSeedBytes(std::vector<unsigned char>& bytes)
+{
+    if (!bytes.empty()) memory_cleanse(bytes.data(), bytes.size());
+}
+
+static void CleansePQSeedMap(PQDescriptorSeedMap& seed_map)
+{
+    for (auto& entry : seed_map) CleansePQSeedBytes(entry.second);
+}
+
 bool DescriptorScriptPubKeyMan::CheckDecryptionKey(const CKeyingMaterial& master_key)
 {
     LOCK(cs_desc_man);
@@ -2350,8 +2375,202 @@ bool DescriptorScriptPubKeyMan::CheckDecryptionKey(const CKeyingMaterial& master
     if (keyFail || !keyPass) {
         return false;
     }
+    // PQ-native descriptors keep their secret material in an encrypted seed record rather than in
+    // m_map_crypted_keys, so the master key must also authenticate against that record (otherwise a
+    // PQ-only wallet would accept any passphrase). This also injects the seed for derivation/signing.
+    if (!UnlockPQSeeds(master_key)) {
+        return false;
+    }
     m_decryption_thoroughly_checked = true;
     return true;
+}
+
+bool DescriptorScriptPubKeyMan::UnlockPQSeeds(const CKeyingMaterial& master_key)
+{
+    AssertLockHeld(cs_desc_man);
+    if (!m_crypted_pq_seed && !m_crypted_pq_seed_map) {
+        return true;
+    }
+
+    const uint256 desc_id = GetID();
+    const bool had_seed = m_wallet_descriptor.descriptor->ExtractPQSeed().has_value();
+    bool injected{false};
+
+    // Mirror the load-time precedence: use the multi-seed map when it has entries,
+    // otherwise fall back to the single-seed record. Both records must authenticate.
+    if (m_crypted_pq_seed_map) {
+        std::vector<unsigned char> plaintext;
+        PQDescriptorSeedMap seed_map;
+        bool authenticated{false};
+        bool ok = DecryptAuthenticatedSecret(master_key, m_crypted_pq_seed_map->second, m_crypted_pq_seed_map->first,
+                                             plaintext, PQDescriptorSeedMapPurpose(desc_id), &authenticated) &&
+                  authenticated;
+        if (ok) {
+            try {
+                DataStream ss{plaintext};
+                ss >> seed_map;
+            } catch (const std::ios_base::failure&) {
+                ok = false;
+            }
+        }
+        if (ok) {
+            for (const auto& [fingerprint, seed] : seed_map) {
+                if (seed.size() == 32) {
+                    m_wallet_descriptor.descriptor->InjectPQSeedByFingerprint(fingerprint, seed);
+                    injected = true;
+                }
+            }
+        }
+        CleansePQSeedMap(seed_map);
+        CleansePQSeedBytes(plaintext);
+        if (!ok) return false;
+    }
+    if (m_crypted_pq_seed) {
+        std::vector<unsigned char> seed;
+        bool authenticated{false};
+        const bool ok = DecryptAuthenticatedSecret(master_key, m_crypted_pq_seed->second, m_crypted_pq_seed->first,
+                                                   seed, PQDescriptorSeedPurpose(desc_id), &authenticated) &&
+                        authenticated && seed.size() == 32;
+        if (ok && !injected) {
+            m_wallet_descriptor.descriptor->InjectPQSeed(seed);
+            injected = true;
+        }
+        CleansePQSeedBytes(seed);
+        if (!ok) return false;
+    }
+    if (injected && !had_seed) {
+        // Signing providers cached while the seed was unavailable carry no PQ private keys.
+        m_map_signing_providers_private.clear();
+    }
+    return true;
+}
+
+bool DescriptorScriptPubKeyMan::WriteCryptedPQSeedWithDB(WalletBatch& batch, const CKeyingMaterial& master_key, const std::vector<unsigned char>& seed)
+{
+    LOCK(cs_desc_man);
+    const uint256 desc_id = GetID();
+    const uint256 iv = GetRandHash();
+    std::vector<unsigned char> ciphertext;
+    if (!EncryptAuthenticatedSecret(master_key, seed, iv, ciphertext, PQDescriptorSeedPurpose(desc_id))) {
+        return false;
+    }
+    if (!batch.WriteCryptedPQDescriptorSeed(desc_id, iv, ciphertext)) {
+        return false;
+    }
+    m_crypted_pq_seed = std::make_pair(iv, std::move(ciphertext));
+    return true;
+}
+
+bool DescriptorScriptPubKeyMan::WriteCryptedPQSeedMapWithDB(WalletBatch& batch, const CKeyingMaterial& master_key, const PQDescriptorSeedMap& seed_map)
+{
+    LOCK(cs_desc_man);
+    const uint256 desc_id = GetID();
+    DataStream ss{};
+    ss << seed_map;
+    std::vector<unsigned char> plaintext(UCharCast(ss.data()), UCharCast(ss.data()) + ss.size());
+    memory_cleanse(ss.data(), ss.size());
+
+    const uint256 iv = GetRandHash();
+    std::vector<unsigned char> ciphertext;
+    const bool encrypted = EncryptAuthenticatedSecret(master_key, plaintext, iv, ciphertext, PQDescriptorSeedMapPurpose(desc_id));
+    CleansePQSeedBytes(plaintext);
+    if (!encrypted) {
+        return false;
+    }
+    if (!batch.WriteCryptedPQDescriptorSeedMap(desc_id, iv, ciphertext)) {
+        return false;
+    }
+    m_crypted_pq_seed_map = std::make_pair(iv, std::move(ciphertext));
+    return true;
+}
+
+bool DescriptorScriptPubKeyMan::EncryptPQSeedsWithDB(WalletBatch& batch, const CKeyingMaterial& master_key)
+{
+    LOCK(cs_desc_man);
+    const uint256 desc_id = GetID();
+    bool ok{true};
+
+    std::vector<unsigned char> seed;
+    if (batch.ReadPQDescriptorSeed(desc_id, seed)) {
+        ok = WriteCryptedPQSeedWithDB(batch, master_key, seed) && batch.ErasePQDescriptorSeed(desc_id);
+    }
+    CleansePQSeedBytes(seed);
+    if (!ok) return false;
+
+    PQDescriptorSeedMap seed_map;
+    if (batch.ReadPQDescriptorSeedMap(desc_id, seed_map)) {
+        ok = WriteCryptedPQSeedMapWithDB(batch, master_key, seed_map) && batch.ErasePQDescriptorSeedMap(desc_id);
+    }
+    CleansePQSeedMap(seed_map);
+    return ok;
+}
+
+bool DescriptorScriptPubKeyMan::WritePQSeedsWithDB(WalletBatch& batch, const std::vector<unsigned char>& seed, const PQDescriptorSeedMap& seed_map)
+{
+    LOCK(cs_desc_man);
+    if (m_storage.HasEncryptionKeys()) {
+        // Encrypted wallets never persist PQ seed material in plaintext.
+        if (m_storage.IsLocked()) {
+            return false;
+        }
+        return m_storage.WithEncryptionKey([&](const CKeyingMaterial& encryption_key) {
+            if (!WriteCryptedPQSeedWithDB(batch, encryption_key, seed)) return false;
+            return seed_map.empty() || WriteCryptedPQSeedMapWithDB(batch, encryption_key, seed_map);
+        });
+    }
+    if (!batch.WritePQDescriptorSeed(GetID(), seed)) return false;
+    return seed_map.empty() || batch.WritePQDescriptorSeedMap(GetID(), seed_map);
+}
+
+void DescriptorScriptPubKeyMan::UpgradePQSeedEncryption()
+{
+    LOCK(cs_desc_man);
+    if (!m_storage.HasEncryptionKeys() || m_storage.IsLocked()) {
+        return;
+    }
+    WalletBatch batch(m_storage.GetDatabase());
+    const uint256 desc_id = GetID();
+
+    std::vector<unsigned char> seed;
+    PQDescriptorSeedMap seed_map;
+    const bool has_plaintext = batch.ReadPQDescriptorSeed(desc_id, seed) || batch.ReadPQDescriptorSeedMap(desc_id, seed_map);
+    CleansePQSeedBytes(seed);
+    CleansePQSeedMap(seed_map);
+    if (!has_plaintext) {
+        return;
+    }
+
+    if (!batch.TxnBegin()) {
+        WalletLogPrintf("%s: cannot begin db transaction to encrypt PQ descriptor seed records\n", __func__);
+        return;
+    }
+    const bool encrypted = m_storage.WithEncryptionKey([&](const CKeyingMaterial& encryption_key) {
+        return EncryptPQSeedsWithDB(batch, encryption_key);
+    });
+    if (!encrypted || !batch.TxnCommit()) {
+        batch.TxnAbort();
+        WalletLogPrintf("%s: failed to migrate plaintext PQ descriptor seed records to encrypted storage\n", __func__);
+        return;
+    }
+    WalletLogPrintf("Migrated plaintext PQ descriptor seed records to encrypted storage for descriptor %s\n", desc_id.ToString());
+}
+
+void DescriptorScriptPubKeyMan::AddCryptedPQSeed(const uint256& iv, const std::vector<unsigned char>& ciphertext)
+{
+    LOCK(cs_desc_man);
+    m_crypted_pq_seed = std::make_pair(iv, ciphertext);
+}
+
+void DescriptorScriptPubKeyMan::AddCryptedPQSeedMap(const uint256& iv, const std::vector<unsigned char>& ciphertext)
+{
+    LOCK(cs_desc_man);
+    m_crypted_pq_seed_map = std::make_pair(iv, ciphertext);
+}
+
+bool DescriptorScriptPubKeyMan::HaveCryptedPQSeeds() const
+{
+    LOCK(cs_desc_man);
+    return m_crypted_pq_seed.has_value() || m_crypted_pq_seed_map.has_value();
 }
 
 bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)
@@ -2374,6 +2593,12 @@ bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, Walle
         batch->WriteCryptedDescriptorKey(GetID(), pubkey, crypted_secret);
     }
     m_map_keys.clear();
+
+    // PQ-native descriptors keep their secret material in per-descriptor seed records rather than
+    // in m_map_keys; move those under the master key within the same batch so no plaintext survives.
+    if (!EncryptPQSeedsWithDB(*batch, master_key)) {
+        return false;
+    }
     return true;
 }
 
@@ -2665,9 +2890,15 @@ bool DescriptorScriptPubKeyMan::SetupPQDescriptorGeneration(WalletBatch& batch, 
 
     m_wallet_descriptor = GeneratePQWalletDescriptor(pq_seed, internal);
 
-    // Store PQ seed for this descriptor (no ECDSA key needed)
+    // Store PQ seed for this descriptor (no ECDSA key needed); encrypted wallets store it
+    // authenticated-encrypted under the master key and never in plaintext.
+    if (m_storage.HasEncryptionKeys() && m_storage.IsLocked()) {
+        throw std::runtime_error(std::string(__func__) + ": Wallet is locked, cannot persist PQ descriptor seed");
+    }
     std::vector<unsigned char> seed_vec(pq_seed.begin(), pq_seed.end());
-    if (!batch.WritePQDescriptorSeed(GetID(), seed_vec)) {
+    const bool seed_written = WritePQSeedsWithDB(batch, seed_vec, /*seed_map=*/{});
+    CleansePQSeedBytes(seed_vec);
+    if (!seed_written) {
         throw std::runtime_error(std::string(__func__) + ": writing PQ descriptor seed failed");
     }
     if (!batch.WriteDescriptor(GetID(), m_wallet_descriptor)) {
@@ -2704,6 +2935,10 @@ bool DescriptorScriptPubKeyMan::HavePrivateKeys() const
         return true;
     }
     // PQ-native descriptors keep private material in provider seeds rather than m_map_keys.
+    // An encrypted seed record makes this SPKM private-capable once unlocked.
+    if (m_crypted_pq_seed || m_crypted_pq_seed_map) {
+        return true;
+    }
     // If the descriptor can render a private form, treat this SPKM as private-capable.
     if (m_wallet_descriptor.descriptor) {
         std::string priv_desc;

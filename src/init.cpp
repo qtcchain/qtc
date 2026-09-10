@@ -587,7 +587,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-reindex-chainstate", "If enabled, wipe chain state, and rebuild it from blk*.dat files on disk. If an assumeutxo snapshot was loaded, its chainstate will be wiped as well. The snapshot can then be reloaded via RPC. Note: this does not rerun all contextual block checks; use -reindex for full historical re-validation after changing MatMul validation mode.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-settings=<file>", strprintf("Specify path to dynamic settings data file. Can be disabled with -nosettings. File is written at runtime and not meant to be edited by users (use %s instead for custom settings). Relative paths will be prefixed by datadir location. (default: %s)", BITCOIN_CONF_FILENAME, BITCOIN_SETTINGS_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-softwareexpiry", strprintf("Stop working after this POSIX timestamp (default: %s)", DEFAULT_SOFTWARE_EXPIRY), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
-    argsman.AddArg("-autoupdate", "Enable signed auto-update polling (default: 0). QTC ships no release channel: enabling requires -autoupdatemanifesturl, -autoupdatetrustedorigin and -autoupdatepubkey; the updater no-ops unless the manifest signature and installer script hash verify.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-autoupdate", "Enable signed auto-update polling (default: 0 on every chain, including mainnet; never enabled implicitly by a configured release key). QTC ships no release channel: enabling requires -autoupdatemanifesturl, -autoupdatetrustedorigin and -autoupdatepubkey; the updater no-ops unless the manifest signature and the mandatory installer script hash verify.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-autoupdatemanifesturl=<url>", strprintf("Signed auto-update manifest URL (default: %s)", node::DEFAULT_AUTOUPDATE_MANIFEST_URL), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-autoupdatetrustedorigin=<origin>", strprintf("Trusted auto-update origin. Manifest, signature, and installer URLs must all stay on this origin (default: %s)", node::DEFAULT_AUTOUPDATE_TRUSTED_ORIGIN), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-autoupdatepubkey=<hex>", "Release public key (hex) for version.txt signatures, in the scheme set by -autoupdatepubkeyalgo. Set to 0 to make auto-update inert.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -598,11 +598,10 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-autoupdateretryinterval=<n>", strprintf("Initial seconds before retrying transient auto-update fetch, signature-download, script-download, or launch failures. Retries back off from this value (default: %d)", node::DEFAULT_AUTOUPDATE_RETRY_SECONDS), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-autoupdatecohort=<n>", "Pin this node's staged-rollout cohort to n in [0,99] (e.g. 0 for an early canary). A signed release with rollout_percent P is applied only when the cohort is < P. Default: derived stably from the datadir.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-autoupdateseamless", "If enabled, launch the verified installer script for a newer signed release (default: 1). If disabled, only log that a verified update exists.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
-    argsman.AddArg("-autoupdaterequirescripthash", "Require the signed manifest to include script_sha256/install_sha256 matching the downloaded installer before execution (default: 1).", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-autoupdatetelemetry", "Attach privacy-minimized auto-update request metrics query parameters: update-flow marker, client version, platform, architecture, and rollout cohort. No wallet data, addresses, peer IPs, txids, or persistent client ID are sent by default (default: 1).", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-autoupdatetelemetryclientid", "Also attach a persistent random auto-update client UUID stored under the datadir. This is useful for controlled release cohorts but is off by default for privacy/GDPR minimization.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-autoupdatepython=<path>", "Python interpreter used only for HTTPS manifest/signature/script fetching (default: python3).", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
-    argsman.AddArg("-autoupdatedevorigin", "Allow non-HTTPS auto-update origins for local testing only.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-autoupdatedevorigin", "Allow non-HTTPS auto-update origins for local testing only. Refused on mainnet.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
 #if HAVE_SYSTEM
     argsman.AddArg("-startupnotify=<cmd>", "Execute command on startup.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-shutdownnotify=<cmd>", "Execute command immediately before beginning shutdown. The need for shutdown may be urgent, so be careful not to delay it long (if the command doesn't require interaction with the server, consider having it fork into the background).", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -840,14 +839,14 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-blockmaxweight=<n>", strprintf("Set maximum BIP141 block weight (default: %d)", DEFAULT_BLOCK_MAX_WEIGHT), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-blockreservedweight=<n>", strprintf("Reserve space for the fixed-size block header plus the largest coinbase transaction the mining software may add to the block. (default: %d).", DEFAULT_BLOCK_RESERVED_WEIGHT), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-blockmintxfee=<amt>", strprintf("Set lowest fee rate (in %s/kvB) for transactions to be included in block creation. (default: %s)", CURRENCY_UNIT, FormatMoney(DEFAULT_BLOCK_MIN_TX_FEE)), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
-    argsman.AddArg("-blockmaxtemplatetxs=<n>", strprintf("Maximum number of mempool transactions to select into locally-created block templates before returning work. Use 0 for unlimited selection. (default: %u)", DEFAULT_BLOCK_MAX_TEMPLATE_TXS), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
+    argsman.AddArg("-blockmaxtemplatetxs=<n>", strprintf("Maximum number of mempool transactions to select into locally-created block templates before returning work. 0 means unlimited selection. (default: %u)", DEFAULT_BLOCK_MAX_TEMPLATE_TXS), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-blockprioritysize=<n>", strprintf("Set maximum size of high-priority/low-fee transactions in bytes (default: %d)", DEFAULT_BLOCK_PRIORITY_SIZE), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-blockversion=<n>", "Override block version to test forking scenarios", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-miningminoutboundpeers=<n>", "Outbound-peer advisory threshold reported in mining diagnostics; peer count no longer blocks getblocktemplate by itself (default: 3 on mainnet and 0 on other chains).", ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-miningminsyncedoutboundpeers=<n>", "Synced-outbound-peer advisory threshold reported in mining diagnostics; peer lag no longer blocks getblocktemplate by itself (default: 2 on mainnet and 0 on other chains).", ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-miningmaxpeersyncheightlag=<n>", "Maximum sync-height lag, in blocks, used for mining peer diagnostics (default: 1 on mainnet and 0 on other chains).", ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-miningmaxheaderlag=<n>", "Best-header lag advisory threshold reported in mining diagnostics; header lag no longer blocks getblocktemplate by itself (default: 3 on mainnet and 0 on other chains).", ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
-    argsman.AddArg("-miningchainguard", "Report local mining stale-tip and reorg-hysteresis risk using outbound peer signals, and request peer recovery when unhealthy; this guard no longer blocks getblocktemplate or local block generation (default: 1 on mainnet, 0 on test chains)", ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
+    argsman.AddArg("-miningchainguard", "Report local mining stale-tip and reorg-hysteresis risk using outbound peer signals, and request peer recovery when unhealthy; this guard no longer blocks getblocktemplate or local block generation (default: 0 on every chain until a public reference mining peer mesh exists)", ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-miningchainguardminpeers=<n>", strprintf("Outbound peers with usable tip heights expected before local mining chain_guard reports healthy (default: %d)", node::DEFAULT_MINING_CHAIN_GUARD_MIN_PEERS), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-miningchainguardminneartippeers=<n>", strprintf("Outbound peers that should be within -miningchainguardneartipwindow blocks of the local tip before local mining chain_guard reports healthy (default: %d)", node::DEFAULT_MINING_CHAIN_GUARD_MIN_NEAR_TIP_PEERS), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-miningchainguardmaxmediangap=<n>", strprintf("Maximum block gap between the local tip and the median outbound peer tip before local-behind or local-ahead warnings trigger (default: %d)", node::DEFAULT_MINING_CHAIN_GUARD_MAX_MEDIAN_GAP), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
@@ -1162,7 +1161,10 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         InitWarning(warnings);
     }
 
-    const bool auto_update_enabled = args.GetBoolArg("-autoupdate", false); // QTC: off by default on every chain (no release channel yet)
+    // QTC: off by default on every chain (no release channel yet). This block must mirror the
+    // condition under which node::MakeAutoUpdateManager constructs a manager (-autoupdate=1), so
+    // every enabled configuration is validated here before the updater thread can start.
+    const bool auto_update_enabled = args.GetBoolArg("-autoupdate", false);
     if (auto_update_enabled) {
         const int64_t interval = args.GetIntArg("-autoupdateinterval", node::DEFAULT_AUTOUPDATE_INTERVAL_SECONDS);
         if (interval < 1 || interval > 24 * 60 * 60) {
@@ -1187,6 +1189,9 @@ bool AppInitParameterInteraction(const ArgsManager& args)
             }
         }
         const bool dev_origin = args.GetBoolArg("-autoupdatedevorigin", false);
+        if (dev_origin && chain == ChainType::MAIN) {
+            return InitError(_("-autoupdatedevorigin is for local testing only and cannot be used on mainnet."));
+        }
         const std::string manifest_url = args.GetArg("-autoupdatemanifesturl", std::string{node::DEFAULT_AUTOUPDATE_MANIFEST_URL});
         const std::string trusted_origin = args.GetArg("-autoupdatetrustedorigin", std::string{node::DEFAULT_AUTOUPDATE_TRUSTED_ORIGIN});
         if (!node::AutoUpdateUrlMatchesTrustedOrigin(manifest_url, trusted_origin, dev_origin)) {

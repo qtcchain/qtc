@@ -18,6 +18,8 @@
 
 #include <cstddef>
 #include <script/script.h>
+#include <set>
+#include <util/transaction_identifier.h>
 #include <vector>
 
 namespace node {
@@ -86,6 +88,10 @@ struct BlockCreateOptions {
     // Internal retry option: when the post-sunset velocity cap rejects a
     // template, retry with positive shielded-pool egress excluded.
     bool exclude_shielded_exit_txs_for_velocity{false};
+    // Internal retry option: mempool transactions that must not be selected
+    // into the template. Descendants are implicitly excluded as well because
+    // they can only be selected together with their in-mempool ancestors.
+    std::set<Txid> excluded_txids;
     bool print_modified_fee{DEFAULT_PRINT_MODIFIED_FEE};
     // Allow RPC template providers to surface chain-guard status without
     // duplicating the same guard observation in lower-level template creation.

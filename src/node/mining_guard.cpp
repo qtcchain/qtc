@@ -289,6 +289,15 @@ MiningChainGuardStatus GetMiningChainGuardStatus(const NodeContext& node)
         CNodeStateStats state_stats;
         if (!node.peerman->GetNodeStateStats(peer_stats.nodeid, state_stats)) continue;
 
+        // Limitation (audit P-8): nSyncHeight is the height of the peer's best
+        // *known header* (pindexBestKnownBlock), i.e. header-chain work that
+        // passed our anti-DoS and Phase-1 checks but whose blocks we have not
+        // necessarily downloaded or fully validated. net_processing keeps no
+        // per-peer record of which blocks the peer itself has validated, and
+        // nCommonHeight (pindexLastCommonBlock) is capped by our own tip, so it
+        // cannot signal that peers are ahead of us. Restricting the sample to
+        // outbound peers (above) is what bounds spoofing here; treat the median
+        // as a hint for the mining guard, not as validated chain state.
         const int peer_height =
             state_stats.nSyncHeight >= 0 ? state_stats.nSyncHeight : state_stats.nCommonHeight;
         if (peer_height >= 0) {

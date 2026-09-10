@@ -29,7 +29,10 @@ QTC_START_IF_STOPPED="${QTC_START_IF_STOPPED:-0}"
 # Prefer a signed prebuilt binary matching this platform (manifest `prebuilt` map) over a source
 # build, when the manifest pins git_commit. Set 0 to always build from source.
 QTC_PREFER_PREBUILT="${QTC_PREFER_PREBUILT:-1}"
-QTC_ALLOW_GIT_REF_FALLBACK="${QTC_ALLOW_GIT_REF_FALLBACK:-1}"
+# Allow resolving the source from a mutable branch head (manifest `git_ref`) when no tag/commit is
+# pinned. Off by default: an unattended updater must only ever build a signed, pinned git_commit.
+# Set 1 explicitly for interactive/dev use only.
+QTC_ALLOW_GIT_REF_FALLBACK="${QTC_ALLOW_GIT_REF_FALLBACK:-0}"
 QTC_ENSURE_RETAIN_INDEX="${QTC_ENSURE_RETAIN_INDEX:-1}"
 QTC_AUTOUPDATE="${QTC_AUTOUPDATE:-0}"
 QTC_AUTOUPDATE_PID="${QTC_AUTOUPDATE_PID:-}"
@@ -38,8 +41,13 @@ QTC_AUTOUPDATE_TELEMETRY_QUERY="${QTC_AUTOUPDATE_TELEMETRY_QUERY:-}"
 # Release-signature scheme + key forwarded by the node. When the scheme is a post-quantum one
 # (ml-dsa-44 / slh-dsa-128s) the installer verifies signatures with `qtc-util verifyupdatesig`
 # instead of openssl, so the source/commit trust is quantum-safe and matches the node.
-QTC_AUTOUPDATE_PUBKEY_ALGO="${QTC_AUTOUPDATE_PUBKEY_ALGO:-secp256k1}"
+# Default matches the daemon (DEFAULT_AUTOUPDATE_RELEASE_PUBKEY_ALGO): post-quantum ML-DSA-44.
+QTC_AUTOUPDATE_PUBKEY_ALGO="${QTC_AUTOUPDATE_PUBKEY_ALGO:-ml-dsa-44}"
+# The release public key MUST be supplied by the operator (or forwarded by the node); this script
+# embeds no key. Post-quantum schemes: QTC_AUTOUPDATE_PUBKEY (hex) or QTC_AUTOUPDATE_PUBKEY_FILE
+# (file whose first line is the hex key). Classical secp256k1: QTC_RELEASE_PUB (PEM file).
 QTC_AUTOUPDATE_PUBKEY="${QTC_AUTOUPDATE_PUBKEY:-}"
+QTC_AUTOUPDATE_PUBKEY_FILE="${QTC_AUTOUPDATE_PUBKEY_FILE:-}"
 QTC_UTIL="${QTC_UTIL:-}"
 QTC_TARGET_PID="${QTC_TARGET_PID:-}"
 QTC_TARGET_DATADIR="${QTC_TARGET_DATADIR:-}"
@@ -324,26 +332,39 @@ require_trusted_url() {
   esac
 }
 
-write_default_release_pub() {
-  local target_path="$1"
-  cat >"$target_path" <<'EOF'
------BEGIN PUBLIC KEY-----
-MFYwEAYHKoZIzj0CAQYFK4EEAAoDQgAER46df5hoI6HXfE4rt19GANPcy1R1Nx5F
-ki6/w5UhQgxBcePbnlrBeXjZ9nWUvnKdzucPwpvaFks18AP2qsbjQQ==
------END PUBLIC KEY-----
-EOF
-}
-
+# Resolve the release public key. There is deliberately NO embedded default: a key baked into this
+# script would silently make whoever holds its private half a release signer for every node that
+# runs the updater. Refuse to proceed unless the operator (or the node, via the forwarded
+# QTC_AUTOUPDATE_PUBKEY) supplied one for the configured scheme.
 resolve_release_pub_path() {
+  local algo
+  algo="$(printf '%s' "$QTC_AUTOUPDATE_PUBKEY_ALGO" | tr '[:upper:]' '[:lower:]')"
+
   if [[ -n "$QTC_RELEASE_PUB" ]]; then
     [[ -f "$QTC_RELEASE_PUB" ]] || die "QTC_RELEASE_PUB does not exist: $QTC_RELEASE_PUB"
     printf '%s\n' "$QTC_RELEASE_PUB"
     return 0
   fi
 
-  local embedded_pub="$QTC_TMPDIR/qtc-release.pub"
-  write_default_release_pub "$embedded_pub"
-  printf '%s\n' "$embedded_pub"
+  case "$algo" in
+    ml-dsa-44|mldsa44|slh-dsa-128s|slhdsa128s)
+      if [[ -z "$QTC_AUTOUPDATE_PUBKEY" && -n "$QTC_AUTOUPDATE_PUBKEY_FILE" ]]; then
+        [[ -f "$QTC_AUTOUPDATE_PUBKEY_FILE" ]] || die "QTC_AUTOUPDATE_PUBKEY_FILE does not exist: $QTC_AUTOUPDATE_PUBKEY_FILE"
+        QTC_AUTOUPDATE_PUBKEY="$(head -n 1 "$QTC_AUTOUPDATE_PUBKEY_FILE" | tr -d '[:space:]')"
+      fi
+      [[ -n "$QTC_AUTOUPDATE_PUBKEY" ]] \
+        || die "no release public key configured: set QTC_AUTOUPDATE_PUBKEY=<hex> or QTC_AUTOUPDATE_PUBKEY_FILE=<path> for $algo (this installer embeds no key)"
+      [[ "$QTC_AUTOUPDATE_PUBKEY" =~ ^[0-9a-fA-F]+$ ]] || die "QTC_AUTOUPDATE_PUBKEY is not a hex string"
+      # PQ verification uses the hex key directly; record it in the temp dir so callers that expect
+      # a key file path still get one.
+      local hex_pub="$QTC_TMPDIR/qtc-release.pub.hex"
+      printf '%s\n' "$QTC_AUTOUPDATE_PUBKEY" >"$hex_pub"
+      printf '%s\n' "$hex_pub"
+      ;;
+    *)
+      die "no release public key configured: set QTC_RELEASE_PUB=<path to PEM public key> for $algo (this installer embeds no key)"
+      ;;
+  esac
 }
 
 # Locate the installed qtc-util used for post-quantum signature verification, portably (macOS/BSD
@@ -1148,11 +1169,13 @@ stop_running_node() {
   [[ -n "$rpcconnect" ]] && cli_args+=("-rpcconnect=$rpcconnect")
   [[ -n "$rpccookiefile" ]] && cli_args+=("-rpccookiefile=$rpccookiefile")
   [[ -n "$rpcuser" ]] && cli_args+=("-rpcuser=$rpcuser")
-  [[ -n "$rpcpassword" ]] && cli_args+=("-rpcpassword=$rpcpassword")
+  # Never place the RPC password on the qtc-cli command line (readable by every local process via
+  # ps/procfs); hand it over on stdin with -stdinrpcpass instead.
+  [[ -n "$rpcpassword" ]] && cli_args+=("-stdinrpcpass")
 
   note "Stopping running QTC node (pid $pid)"
   require_same_process "$pid" "$fingerprint" "RPC stop"
-  if ! "$cli_bin" ${cli_args[@]+"${cli_args[@]}"} stop >/dev/null 2>&1; then
+  if ! printf '%s\n' "$rpcpassword" | "$cli_bin" ${cli_args[@]+"${cli_args[@]}"} stop >/dev/null 2>&1; then
     warn "RPC stop failed, sending TERM to pid $pid"
     require_same_process "$pid" "$fingerprint" "TERM fallback"
     kill "$pid" >/dev/null 2>&1 || true
@@ -1281,12 +1304,18 @@ main() {
   [[ -n "$repo_url" ]] || die "manifest did not contain repo_url"
   [[ -n "$script_url" ]] || die "manifest did not contain script_url"
   QTC_STATUS_VERSION="$version"
+  # Unattended (node-launched) updates must only ever build a signed, immutable commit: a manifest
+  # that merely names a tag or branch could be re-pointed by anyone with push access to the repo.
+  if [[ "$QTC_AUTOUPDATE" == "1" && -z "$expected_commit" ]]; then
+    die "signed manifest for $version does not pin git_commit; refusing unattended auto-update"
+  fi
 
   source_ref="${QTC_GIT_REF:-}"
   if [[ -z "$source_ref" && -n "$release_tag" ]] && ref_exists_remote "$repo_url" "$release_tag"; then
     source_ref="$release_tag"
   fi
   if [[ -z "$source_ref" && -n "$git_ref" && "$QTC_ALLOW_GIT_REF_FALLBACK" == "1" ]]; then
+    warn "resolving source from mutable git_ref '$git_ref' (QTC_ALLOW_GIT_REF_FALLBACK=1); the checkout is still pinned to the signed git_commit when present"
     if branch_exists_remote "$repo_url" "$git_ref"; then
       source_ref="origin/$git_ref"
     else

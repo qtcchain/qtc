@@ -57,7 +57,7 @@ Options:
   --rpcconnect=HOST         RPC host override
   --rpcport=PORT            RPC port override
   --rpcuser=USER            RPC username override
-  --rpcpassword=PASS        RPC password override
+  --rpcpassword=PASS        RPC password override (prefer QTC_MINING_RPCPASSWORD or --rpccookiefile; argv is visible to other users)
   --rpccookiefile=PATH      RPC cookie file override
   --wallet=NAME             Wallet used for mining rewards (default: miner)
   --address=ADDR            Explicit payout address
@@ -281,12 +281,13 @@ rpc_cli() {
     cmd+=("-rpcuser=${RPC_USER}")
   fi
   if [[ -n "${RPC_PASSWORD}" ]]; then
-    cmd+=("-rpcpassword=${RPC_PASSWORD}")
+    # Password goes over stdin, never onto the qtc-cli command line (visible in ps/procfs).
+    cmd+=("-stdinrpcpass")
   fi
   if [[ -n "${RPC_COOKIEFILE}" ]]; then
     cmd+=("-rpccookiefile=${RPC_COOKIEFILE}")
   fi
-  "${cmd[@]}" "$@"
+  printf '%s\n' "${RPC_PASSWORD}" | "${cmd[@]}" "$@"
 }
 
 rpc_wallet_cli() {
@@ -310,13 +311,14 @@ rpc_wallet_cli() {
     cmd+=("-rpcuser=${RPC_USER}")
   fi
   if [[ -n "${RPC_PASSWORD}" ]]; then
-    cmd+=("-rpcpassword=${RPC_PASSWORD}")
+    # Password goes over stdin, never onto the qtc-cli command line (visible in ps/procfs).
+    cmd+=("-stdinrpcpass")
   fi
   if [[ -n "${RPC_COOKIEFILE}" ]]; then
     cmd+=("-rpccookiefile=${RPC_COOKIEFILE}")
   fi
   cmd+=("-rpcwallet=${WALLET}")
-  "${cmd[@]}" "$@"
+  printf '%s\n' "${RPC_PASSWORD}" | "${cmd[@]}" "$@"
 }
 
 ensure_wallet_loaded() {
@@ -389,7 +391,9 @@ if [[ -n "${RPC_USER}" ]]; then
   cmd+=("--rpcuser=${RPC_USER}")
 fi
 if [[ -n "${RPC_PASSWORD}" ]]; then
-  cmd+=("--rpcpassword=${RPC_PASSWORD}")
+  # Forward the password through the environment (live-mining-loop.sh reads
+  # QTC_MINING_RPCPASSWORD) instead of the child's command line.
+  export QTC_MINING_RPCPASSWORD="${RPC_PASSWORD}"
 fi
 if [[ -n "${RPC_COOKIEFILE}" ]]; then
   cmd+=("--rpccookiefile=${RPC_COOKIEFILE}")

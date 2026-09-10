@@ -36,7 +36,7 @@ Configuration files
 
 * `trusted-git-root`: This file should contain a single git commit hash which is the first unsigned git commit (hence it is the "root of trust").
 * `trusted-sha512-root-commit`: This file should contain a single git commit hash which is the first commit without a SHA512 root commitment.
-* `trusted-keys`: This file should contain a \n-delimited list of all PGP fingerprints of authorized commit signers (primary, not subkeys).
+* `trusted-keys`: This file should contain a \n-delimited list of all PGP fingerprints of authorized commit signers (primary, not subkeys). QTC has not yet established commit-signing keys, so this file is currently empty and `verify-commits.py` cannot verify any commit after `trusted-git-root` (the QTC public root commit) until a key ceremony populates it.
 * `allow-revsig-commits`: This file should contain a \n-delimited list of git commit hashes. See next section for more info.
 
 Import trusted keys

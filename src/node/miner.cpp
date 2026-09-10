@@ -24,11 +24,13 @@
 #include <pow.h>
 #include <primitives/transaction.h>
 #include <random.h>
+#include <serialize.h>
 #include <shielded/bundle.h>
 #include <shielded/unshield_velocity.h>
 #include <shielded/validation.h>
 #include <util/check.h>
 #include <util/moneystr.h>
+#include <util/string.h>
 #include <util/time.h>
 #include <validation.h>
 #include <validationinterface.h>
@@ -864,6 +866,13 @@ void RegenerateCommitments(CBlock& block, ChainstateManager& chainman)
     block.hashMerkleRoot = BlockMerkleRoot(block);
 }
 
+uint64_t GetMatMulProductPayloadSerializedSize(const Consensus::Params& consensus, int height)
+{
+    if (!consensus.fMatMulPOW || !consensus.IsMatMulProductPayloadRequired(height)) return 0;
+    const uint64_t words{static_cast<uint64_t>(consensus.nMatMulDimension) * consensus.nMatMulDimension};
+    return words * sizeof(uint32_t) + GetSizeOfCompactSize(words);
+}
+
 BlockCreateOptions BlockCreateOptions::Clamped() const
 {
     BlockAssembler::Options options = *this;
@@ -982,6 +991,14 @@ std::shared_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     if (!TryGetNextBlockHeight(pindexPrev->nHeight, nHeight)) {
         LogWarning("CreateNewBlock(): block height overflow at prev height %d\n", pindexPrev->nHeight);
         throw std::runtime_error("CreateNewBlock(): block height overflow");
+    }
+    // Reserve room for the Freivalds product payload that PopulateFreivaldsPayload
+    // appends once the block is solved: CheckBlock counts it against both the
+    // stripped/weight and the serialized-size limits (WITNESS_SCALE_FACTOR
+    // applies because the payload is serialized in both forms).
+    if (const uint64_t payload_bytes{GetMatMulProductPayloadSerializedSize(chainparams.GetConsensus(), nHeight)}; payload_bytes > 0) {
+        nBlockSize += payload_bytes;
+        nBlockWeight += payload_bytes * WITNESS_SCALE_FACTOR;
     }
     const CAmount base_shielded_pool_balance{m_chainstate.m_chainman.GetShieldedPoolBalance()};
     if (!m_blockShieldedPoolBalance.SetBalance(base_shielded_pool_balance)) {
@@ -1124,8 +1141,7 @@ std::shared_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     BlockValidationState state;
     if (m_options.test_block_validity) {
         LogDebug(BCLog::MINING, "CreateNewBlock(): running TestBlockValidity for height %d\n", nHeight);
-        if (!TestBlockValidity(state, chainparams, m_chainstate, *pblock, pindexPrev,
-                               /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/false)) {
+        if (!TestTemplateBlockValidity(state, *pblock, pindexPrev)) {
             LogWarning("CreateNewBlock(): TestBlockValidity failed at height %d: %s\n", nHeight, state.ToString());
             if (m_mempool != nullptr && nBlockTx > 0) {
                 if (IsPostSunsetShieldedExitVelocityFilterActive(chainparams.GetConsensus(), nHeight) &&
@@ -1146,6 +1162,11 @@ std::shared_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
                     auto fallback_template = BlockAssembler{m_chainstate, m_mempool, retry_options, m_node}.CreateNewBlock();
                     fallback_template->m_mempool_validation_fallback = true;
                     return fallback_template;
+                }
+                // Find and evict the transaction(s) that fail block validity so
+                // they cannot poison every later template until they expire.
+                if (auto retried_template{EvictInvalidTemplateTransactionsAndRetry(pindexPrev)}) {
+                    return retried_template;
                 }
                 LogWarning("CreateNewBlock(): retrying with an empty template after mempool-selected transactions failed block validation\n");
                 Options retry_options = m_options;
@@ -1171,6 +1192,129 @@ std::shared_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     if (m_node.validation_signals) m_node.validation_signals->NewBlockTemplate(pblocktemplate);
 
     return std::move(pblocktemplate);
+}
+
+bool BlockAssembler::TestTemplateBlockValidity(BlockValidationState& state, CBlock& block, CBlockIndex* pindexPrev) const
+{
+    AssertLockHeld(::cs_main);
+    const Consensus::Params& consensus{chainparams.GetConsensus()};
+    // The template carries no payload (it is produced after solving), so stand
+    // in with a zero-filled payload of the final size. TestBlockValidity runs
+    // with fCheckPOW=false, which skips all MatMul/Freivalds verification, so
+    // only the size accounting observes it.
+    const bool inject_payload{block.matrix_c_data.empty() &&
+                              GetMatMulProductPayloadSerializedSize(consensus, nHeight) > 0};
+    if (inject_payload) {
+        const size_t n{consensus.nMatMulDimension};
+        block.matrix_c_data.assign(n * n, 0);
+    }
+    const bool valid{TestBlockValidity(state, chainparams, m_chainstate, block, pindexPrev,
+                                       /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/false)};
+    if (inject_payload) block.matrix_c_data.clear();
+    return valid;
+}
+
+std::shared_ptr<CBlockTemplate> BlockAssembler::EvictInvalidTemplateTransactionsAndRetry(CBlockIndex* pindexPrev)
+{
+    AssertLockHeld(::cs_main);
+    if (m_mempool == nullptr || !pblocktemplate) return nullptr;
+    CTxMemPool& mempool{*const_cast<CTxMemPool*>(m_mempool)};
+
+    // Invariant: `failing` holds, in block order, the mempool transactions of a
+    // template that is known to fail TestBlockValidity.
+    std::vector<Txid> failing;
+    failing.reserve(pblocktemplate->block.vtx.size());
+    for (size_t i = 1; i < pblocktemplate->block.vtx.size(); ++i) {
+        failing.push_back(pblocktemplate->block.vtx[i]->GetHash());
+    }
+    if (failing.empty()) return nullptr;
+
+    // Every transaction seen in a probed template so far. Probes exclude all of
+    // them except the half under test, so transactions cleared by an earlier
+    // probe cannot re-enter as newcomers and confuse the search.
+    std::set<Txid> known(failing.begin(), failing.end());
+
+    // Bound the number of validity probes to ~2*log2(N)+2.
+    size_t max_probes{2};
+    for (size_t n = failing.size(); n > 1; n = (n + 1) / 2) max_probes += 2;
+    size_t probes{0};
+
+    // Rebuild the template with everything known except `keep` (and the
+    // in-mempool ancestors it needs to be selectable) excluded from selection
+    // and test it. Returns std::nullopt when the probe template is valid,
+    // otherwise the transactions of the (failing) probe template. Transactions
+    // that entered the probe because excluding others freed space are suspects
+    // as well.
+    Options probe_options{m_options};
+    probe_options.test_block_validity = false;
+    const auto probe = [&](const std::set<Txid>& keep) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) -> std::optional<std::vector<Txid>> {
+        AssertLockHeld(::cs_main);
+        ++probes;
+        std::set<Txid> keep_with_ancestors{keep};
+        {
+            LOCK(mempool.cs);
+            for (const Txid& txid : keep) {
+                const CTxMemPoolEntry* entry{mempool.GetEntry(txid)};
+                if (entry == nullptr) continue;
+                for (CTxMemPool::txiter ancestor : mempool.AssumeCalculateMemPoolAncestors(
+                         __func__, *entry, CTxMemPool::Limits::NoLimits(), /*fSearchForParents=*/false)) {
+                    keep_with_ancestors.insert(ancestor->GetTx().GetHash());
+                }
+            }
+        }
+        probe_options.excluded_txids.clear();
+        for (const Txid& txid : known) {
+            if (!keep_with_ancestors.count(txid)) probe_options.excluded_txids.insert(txid);
+        }
+        auto probe_template{BlockAssembler{m_chainstate, m_mempool, probe_options, m_node}.CreateNewBlock()};
+        BlockValidationState probe_state;
+        if (TestTemplateBlockValidity(probe_state, probe_template->block, pindexPrev)) return std::nullopt;
+        std::vector<Txid> txids;
+        for (size_t i = 1; i < probe_template->block.vtx.size(); ++i) {
+            txids.push_back(probe_template->block.vtx[i]->GetHash());
+        }
+        return txids;
+    };
+
+    while (failing.size() > 1 && probes < max_probes) {
+        const size_t half{failing.size() / 2};
+        bool narrowed{false};
+        for (int part = 0; part < 2 && !narrowed && probes < max_probes; ++part) {
+            const std::set<Txid> keep(part == 0 ? failing.begin() : failing.begin() + half,
+                                      part == 0 ? failing.begin() + half : failing.end());
+            const auto result{probe(keep)};
+            if (!result.has_value()) continue;
+            // A template with no mempool transactions still fails: the failure
+            // is not caused by mempool contents, leave it to the caller.
+            if (result->empty()) return nullptr;
+            // The kept half needed the other half as ancestors and the whole
+            // set failed again: repeating the split cannot make progress.
+            if (std::set<Txid>(result->begin(), result->end()) == std::set<Txid>(failing.begin(), failing.end())) break;
+            failing = *result;
+            known.insert(failing.begin(), failing.end());
+            narrowed = true;
+        }
+        // Neither half fails on its own (the failure needs both, or the probe
+        // budget is exhausted): fall back to evicting the whole failing set.
+        if (!narrowed) break;
+    }
+
+    std::vector<std::string> evicted;
+    {
+        LOCK(mempool.cs);
+        for (const Txid& txid : failing) {
+            const CTxMemPoolEntry* entry{mempool.GetEntry(txid)};
+            if (entry == nullptr) continue; // already removed as a descendant of another offender
+            const CTransactionRef tx{entry->GetSharedTx()};
+            mempool.removeRecursive(*tx, MemPoolRemovalReason::CONFLICT);
+            evicted.push_back(txid.ToString());
+        }
+    }
+    if (evicted.empty()) return nullptr;
+    LogWarning("CreateNewBlock(): evicted %u mempool transaction(s) failing block validity at height %d after %u probe(s): %s\n",
+               evicted.size(), nHeight, probes, util::Join(evicted, ", "));
+
+    return BlockAssembler{m_chainstate, m_mempool, m_options, m_node}.CreateNewBlock();
 }
 
 void BlockAssembler::onlyUnconfirmed(CTxMemPool::setEntries& testSet)
@@ -1262,6 +1406,9 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool& mempool,
     }
     for (CTxMemPool::txiter it : package) {
         if (it->GetTx().IsCoinBase()) {
+            return false;
+        }
+        if (!m_options.excluded_txids.empty() && m_options.excluded_txids.count(it->GetTx().GetHash())) {
             return false;
         }
         TxValidationState tx_state;

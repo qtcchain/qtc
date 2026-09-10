@@ -29,5 +29,5 @@
  "any_above_floor": false,
  "failures": [],
  "wall_s": 233,
- "csv": "/Users/gavinwhyte/Documents/btx/qtc-chain/contrib/qtc-launch/results-600s/qtc-stall-nodrift.csv"
+ "csv": "<repo>/contrib/qtc-launch/results-600s/qtc-stall-nodrift.csv"
 }

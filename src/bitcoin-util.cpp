@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <fstream>
 #include <functional>
+#include <iostream>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -47,7 +48,7 @@ static void SetupBitcoinUtilArgs(ArgsManager &argsman)
     argsman.AddCommand("grind", "Perform proof of work on hex header string");
     argsman.AddCommand("verifyupdatesig", "Verify a detached auto-update release signature offline. Args: <algo> <pubkey-hex> <file> <sig-file>; algo is ml-dsa-44, slh-dsa-128s, or secp256k1. Prints OK and exits 0 on success.");
     argsman.AddCommand("genupdatekey", "Generate an OFFLINE post-quantum auto-update release keypair. Args: [algo] (ml-dsa-44 default, or slh-dsa-128s). Prints the secret SEED (store offline -- it is the private key) and the public key hex for -autoupdatepubkey.");
-    argsman.AddCommand("signupdatesig", "Sign a release artifact with an OFFLINE post-quantum release key. Args: <algo> <seed-hex> <file> [out-sig]. Writes a detached signature (default <file>.sig) that 'verifyupdatesig' and the node accept.");
+    argsman.AddCommand("signupdatesig", "Sign a release artifact with an OFFLINE post-quantum release key. Args: <algo> <seed-source> <file> [out-sig]. <seed-source> is '-' to read the seed hex from standard input, or the path of a file (keep it mode 0600) whose first line is the seed hex; the seed is never accepted on the command line, since argv is visible to every local process. Writes a detached signature (default <file>.sig) that 'verifyupdatesig' and the node accept.");
 
     SetupChainParamsBaseOptions(argsman);
 }
@@ -227,15 +228,30 @@ static int GenUpdateKey(const std::vector<std::string>& args, std::string& strPr
 static int SignUpdateSig(const std::vector<std::string>& args, std::string& strPrint)
 {
     if (args.size() < 3 || args.size() > 4) {
-        strPrint = "signupdatesig requires: <algo> <seed-hex> <file> [out-sig]";
+        strPrint = "signupdatesig requires: <algo> <seed-source> <file> [out-sig]  (seed-source: '-' for stdin, or a seed file path)";
         return EXIT_FAILURE;
     }
     std::string canonical;
     const auto algo = ParsePQUpdateAlgo(args[0], canonical);
     if (!algo) { strPrint = "unknown algo (expected ml-dsa-44 or slh-dsa-128s): " + args[0]; return EXIT_FAILURE; }
 
-    const auto seed = TryParseHex<unsigned char>(args[1]);
-    if (!seed || seed->empty()) { strPrint = "invalid seed hex"; return EXIT_FAILURE; }
+    // The seed IS the private key. Read it from stdin ("-") or a file, never from argv, so it does
+    // not leak through process listings or shell history.
+    std::string seed_hex;
+    if (args[1] == "-") {
+        std::getline(std::cin, seed_hex);
+    } else {
+        std::ifstream seed_in{args[1]};
+        if (!seed_in.is_open()) {
+            strPrint = "cannot read seed file: " + args[1] + " (pass '-' to read the seed from stdin; raw seed hex on the command line is not accepted)";
+            return EXIT_FAILURE;
+        }
+        std::getline(seed_in, seed_hex);
+    }
+    seed_hex = util::TrimString(seed_hex);
+    if (seed_hex.rfind("seed=", 0) == 0) seed_hex.erase(0, 5); // accept a pasted 'genupdatekey' line
+    const auto seed = TryParseHex<unsigned char>(seed_hex);
+    if (!seed || seed->empty()) { strPrint = "invalid seed hex in seed source"; return EXIT_FAILURE; }
     const auto message = ReadAllBytes(args[2]);
     if (!message) { strPrint = "cannot read file: " + args[2]; return EXIT_FAILURE; }
     const std::string out_path = args.size() == 4 ? args[3] : (args[2] + ".sig");

@@ -588,8 +588,8 @@ For the prepackaged Linux CPU/CUDA release matrix, supported GPU hardware, and
 target-host driver requirements, see
 [doc/linux-release-builds.md](doc/linux-release-builds.md).
 
-If you only need the generic precompiled Windows x64 CLI archive from this
-branch, use the files in `contrib/prebuilt/windows/`.
+No precompiled binaries are committed to this repository; QTC binaries are
+distributed only as signed releases.
 
 ### Build Options
 

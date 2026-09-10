@@ -211,6 +211,11 @@ if [ "$RUN_FUNCTIONAL_TESTS" = "true" ]; then
   if [ "${TEST_RUNNER_QUIET:-true}" = "true" ]; then
     TEST_RUNNER_ARGS+=(--quiet)
   fi
+  # QTC_RUN_UPSTREAM_BASE_SUITE=1 would include the full upstream BASE_SCRIPTS matrix; the upstream
+  # suites still need porting to QTC (P2MR-only addresses, MatMul payload sizes, port numbers) and
+  # would fail, so they stay opt-in until ported (security review M-9).
+  # (plus the QTC fork matrix) instead of only the QTC fork matrix; TEST_RUNNER_EXTRA exclusions
+  # from the per-job env files still apply.
   LD_LIBRARY_PATH="${DEPENDS_DIR}/${HOST}/lib" test/functional/test_runner.py "${TEST_RUNNER_ARGS[@]}"
 fi
 

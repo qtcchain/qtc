@@ -70,6 +70,8 @@ const std::string WALLETDESCRIPTORCKEY{"walletdescriptorckey"};
 const std::string WALLETDESCRIPTORKEY{"walletdescriptorkey"};
 const std::string WALLETDESCRIPTORPQSEED{"walletdescriptorpqseed"};
 const std::string WALLETDESCRIPTORPQSEEDMAP{"walletdescriptorpqseedmap"};
+const std::string WALLETDESCRIPTORPQSEEDCRYPT{"walletdescriptorpqseedcrypt"};
+const std::string WALLETDESCRIPTORPQSEEDMAPCRYPT{"walletdescriptorpqseedmapcrypt"};
 const std::string WATCHMETA{"watchmeta"};
 const std::string WATCHS{"watchs"};
 const std::string PQMASTERSEED{"pqmasterseed"};
@@ -412,16 +414,66 @@ bool WalletBatch::ReadPQDescriptorSeed(const uint256& desc_id, std::vector<unsig
     return m_batch->Read(std::make_pair(DBKeys::WALLETDESCRIPTORPQSEED, desc_id), seed);
 }
 
-bool WalletBatch::WritePQDescriptorSeedMap(const uint256& desc_id,
-                                            const std::vector<std::pair<std::array<unsigned char, 4>, std::vector<unsigned char>>>& seed_map)
+bool WalletBatch::ErasePQDescriptorSeed(const uint256& desc_id)
+{
+    return EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORPQSEED, desc_id));
+}
+
+bool WalletBatch::WritePQDescriptorSeedMap(const uint256& desc_id, const PQDescriptorSeedMap& seed_map)
 {
     return WriteIC(std::make_pair(DBKeys::WALLETDESCRIPTORPQSEEDMAP, desc_id), seed_map);
 }
 
-bool WalletBatch::ReadPQDescriptorSeedMap(const uint256& desc_id,
-                                           std::vector<std::pair<std::array<unsigned char, 4>, std::vector<unsigned char>>>& seed_map)
+bool WalletBatch::ReadPQDescriptorSeedMap(const uint256& desc_id, PQDescriptorSeedMap& seed_map)
 {
     return m_batch->Read(std::make_pair(DBKeys::WALLETDESCRIPTORPQSEEDMAP, desc_id), seed_map);
+}
+
+bool WalletBatch::ErasePQDescriptorSeedMap(const uint256& desc_id)
+{
+    return EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORPQSEEDMAP, desc_id));
+}
+
+bool WalletBatch::WriteCryptedPQDescriptorSeed(const uint256& desc_id, const uint256& iv, const std::vector<unsigned char>& ciphertext)
+{
+    return WriteIC(std::make_pair(DBKeys::WALLETDESCRIPTORPQSEEDCRYPT, desc_id), std::make_pair(iv, ciphertext));
+}
+
+bool WalletBatch::ReadCryptedPQDescriptorSeed(const uint256& desc_id, uint256& iv, std::vector<unsigned char>& ciphertext)
+{
+    std::pair<uint256, std::vector<unsigned char>> payload;
+    if (!m_batch->Read(std::make_pair(DBKeys::WALLETDESCRIPTORPQSEEDCRYPT, desc_id), payload)) {
+        return false;
+    }
+    iv = payload.first;
+    ciphertext = std::move(payload.second);
+    return true;
+}
+
+bool WalletBatch::EraseCryptedPQDescriptorSeed(const uint256& desc_id)
+{
+    return EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORPQSEEDCRYPT, desc_id));
+}
+
+bool WalletBatch::WriteCryptedPQDescriptorSeedMap(const uint256& desc_id, const uint256& iv, const std::vector<unsigned char>& ciphertext)
+{
+    return WriteIC(std::make_pair(DBKeys::WALLETDESCRIPTORPQSEEDMAPCRYPT, desc_id), std::make_pair(iv, ciphertext));
+}
+
+bool WalletBatch::ReadCryptedPQDescriptorSeedMap(const uint256& desc_id, uint256& iv, std::vector<unsigned char>& ciphertext)
+{
+    std::pair<uint256, std::vector<unsigned char>> payload;
+    if (!m_batch->Read(std::make_pair(DBKeys::WALLETDESCRIPTORPQSEEDMAPCRYPT, desc_id), payload)) {
+        return false;
+    }
+    iv = payload.first;
+    ciphertext = std::move(payload.second);
+    return true;
+}
+
+bool WalletBatch::EraseCryptedPQDescriptorSeedMap(const uint256& desc_id)
+{
+    return EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORPQSEEDMAPCRYPT, desc_id));
 }
 
 bool WalletBatch::WriteShieldedState(const std::vector<unsigned char>& state)
@@ -969,8 +1021,9 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
     int num_keys = 0;
     int num_ckeys= 0;
     int num_pq_seeds = 0;
+    int num_crypted_pq_seeds = 0;
     LoadResult desc_res = LoadRecords(pwallet, batch, DBKeys::WALLETDESCRIPTOR,
-        [&batch, &num_keys, &num_ckeys, &num_pq_seeds, &last_client] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
+        [&batch, &num_keys, &num_ckeys, &num_pq_seeds, &num_crypted_pq_seeds, &last_client] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
         DBErrors result = DBErrors::LOAD_OK;
 
         uint256 id;
@@ -1152,13 +1205,31 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
         result = std::max(result, ckey_res.m_result);
         num_ckeys = ckey_res.m_records;
 
-        // Load PQ descriptor seeds and inject into PQHDPubkeyProviders.
-        // Try the multi-seed map first (for multisig descriptors with
-        // providers from different seeds), then fall back to the legacy
-        // single-seed entry.
+        // Load PQ descriptor seeds. Encrypted records (written by encrypted wallets) are handed to
+        // the SPKM and only decrypted and injected into the PQHDPubkeyProviders on unlock; the
+        // plaintext records are used otherwise (unencrypted wallets, or encrypted wallets that
+        // predate PQ seed encryption and get migrated on their next unlock).
         {
-            std::vector<std::pair<std::array<unsigned char, 4>, std::vector<unsigned char>>> seed_map;
-            if (batch.Read(std::make_pair(DBKeys::WALLETDESCRIPTORPQSEEDMAP, id), seed_map) && !seed_map.empty()) {
+            bool have_crypted_seed{false};
+            std::pair<uint256, std::vector<unsigned char>> crypted_map;
+            if (batch.Read(std::make_pair(DBKeys::WALLETDESCRIPTORPQSEEDMAPCRYPT, id), crypted_map) && !crypted_map.second.empty()) {
+                spkm.AddCryptedPQSeedMap(crypted_map.first, crypted_map.second);
+                have_crypted_seed = true;
+                ++num_crypted_pq_seeds;
+            }
+            std::pair<uint256, std::vector<unsigned char>> crypted_seed;
+            if (batch.Read(std::make_pair(DBKeys::WALLETDESCRIPTORPQSEEDCRYPT, id), crypted_seed) && !crypted_seed.second.empty()) {
+                spkm.AddCryptedPQSeed(crypted_seed.first, crypted_seed.second);
+                have_crypted_seed = true;
+                ++num_crypted_pq_seeds;
+            }
+
+            // Plaintext seeds: try the multi-seed map first (for multisig descriptors with
+            // providers from different seeds), then fall back to the legacy single-seed entry.
+            PQDescriptorSeedMap seed_map;
+            if (have_crypted_seed) {
+                // Never inject plaintext material into a descriptor that has encrypted seeds.
+            } else if (batch.Read(std::make_pair(DBKeys::WALLETDESCRIPTORPQSEEDMAP, id), seed_map) && !seed_map.empty()) {
                 for (const auto& [fingerprint, seed_vec] : seed_map) {
                     if (seed_vec.size() == 32) {
                         desc.descriptor->InjectPQSeedByFingerprint(fingerprint, seed_vec);
@@ -1179,8 +1250,8 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
 
     if (desc_res.m_result <= DBErrors::NONCRITICAL_ERROR) {
         // Only log if there are no critical errors
-        pwallet->WalletLogPrintf("Descriptors: %u, Descriptor Keys: %u plaintext, %u encrypted, %u total, PQ Seeds: %u.\n",
-               desc_res.m_records, num_keys, num_ckeys, num_keys + num_ckeys, num_pq_seeds);
+        pwallet->WalletLogPrintf("Descriptors: %u, Descriptor Keys: %u plaintext, %u encrypted, %u total, PQ Seeds: %u plaintext, %u encrypted.\n",
+               desc_res.m_records, num_keys, num_ckeys, num_keys + num_ckeys, num_pq_seeds, num_crypted_pq_seeds);
     }
 
     return desc_res.m_result;

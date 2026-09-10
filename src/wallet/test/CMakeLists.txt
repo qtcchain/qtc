@@ -17,6 +17,7 @@ target_sources(test_qtc
     bridge_wallet_tests.cpp
     psbt_wallet_tests.cpp
     pq_multisig_wallet_tests.cpp
+    pq_wallet_encryption_tests.cpp
     pq_wallet_tests.cpp
     shielded_fee_tests.cpp
     scriptpubkeyman_tests.cpp

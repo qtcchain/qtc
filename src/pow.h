@@ -213,7 +213,15 @@ MatMulPhase2Punishment RegisterMatMulPhase2Failure(
     const Consensus::Params& params,
     std::chrono::steady_clock::time_point now,
     uint32_t* failures_out = nullptr);
+/** Multipliers applied to the steady-state per-address / global Phase-2 verification
+ *  budgets while the local node is catching up (IBD or a stale validated tip). Both
+ *  caps stay finite: an attacker who manages to put us in catch-up mode gains a bounded,
+ *  not unlimited, amount of verification CPU (security audit N-2). */
+static constexpr uint32_t MATMUL_CATCHUP_PEER_VERIFY_BUDGET_MULTIPLIER{16};
+static constexpr uint32_t MATMUL_CATCHUP_GLOBAL_VERIFY_BUDGET_MULTIPLIER{16};
 uint32_t EffectiveMatMulPeerVerifyBudgetPerMin(const Consensus::Params& params, bool is_ibd);
+/** Global (all peers combined) Phase-2 budget per minute; scaled, never unlimited, in catch-up. */
+uint32_t EffectiveMatMulGlobalVerifyBudgetPerMin(const Consensus::Params& params, bool catch_up);
 bool ConsumeMatMulPeerVerifyBudget(
     MatMulPeerVerificationBudget& budget,
     const Consensus::Params& params,

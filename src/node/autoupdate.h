@@ -29,7 +29,8 @@ static constexpr std::string_view DEFAULT_AUTOUPDATE_TRUSTED_ORIGIN{""};
 // release key, manifest URL or trusted origin is compiled in. To enable it, an operator
 // must pass -autoupdate=1 together with -autoupdatemanifesturl, -autoupdatetrustedorigin
 // and -autoupdatepubkey (+ -autoupdatepubkeyalgo). Bake a QTC release key here only once a
-// signing ceremony has produced one; never inherit another chain's key.
+// signing ceremony has produced one; never inherit another chain's key. Even with a baked key,
+// auto-update stays off unless -autoupdate=1 is given explicitly (mainnet included).
 static constexpr std::string_view DEFAULT_AUTOUPDATE_RELEASE_PUBKEY{""};
 // Release-signature scheme for the manifest. On a post-quantum chain the update
 // channel (which can ship code to every node) must itself be quantum-safe, so the
@@ -53,7 +54,6 @@ struct AutoUpdateConfig {
     bool enabled{false};
     bool seamless{true};
     bool dev_origin{false};
-    bool require_script_hash{true};
     bool telemetry{true};
     bool telemetry_client_id_enabled{false};
     std::string manifest_url{std::string{DEFAULT_AUTOUPDATE_MANIFEST_URL}};
@@ -103,6 +103,7 @@ enum class AutoUpdateStatus {
     UNSIGNED_MANIFEST,
     BAD_SIGNATURE,
     NOT_NEWER,
+    DOWNGRADE_REJECTED,
     ROLLOUT_DEFERRED,
     SCRIPT_ORIGIN_REJECTED,
     SCRIPT_HASH_MISSING,
@@ -175,6 +176,13 @@ private:
 std::optional<AutoUpdateUrl> ParseAutoUpdateUrl(std::string_view url);
 bool AutoUpdateUrlMatchesTrustedOrigin(std::string_view url, std::string_view trusted_origin, bool dev_origin);
 int CompareAutoUpdateVersion(std::string_view remote_version);
+// Three-way compare of two "major.minor.build" version strings (-1/0/1); 0 if either is unparsable.
+int CompareAutoUpdateVersions(std::string_view lhs, std::string_view rhs);
+// Downgrade/replay protection: the highest release version this node has launched a verified
+// installer for, persisted at <datadir>/autoupdate/last_applied_version. Manifests whose version
+// is not newer than this are refused even if validly signed.
+std::optional<std::string> ReadLastAppliedAutoUpdateVersion(const fs::path& datadir);
+bool WriteLastAppliedAutoUpdateVersion(const fs::path& datadir, std::string_view version);
 std::string AutoUpdateStatusString(AutoUpdateStatus status);
 std::string AutoUpdateTelemetryQuery(const AutoUpdateConfig& config);
 std::string AutoUpdateTrackedUrl(std::string_view url, const AutoUpdateConfig& config);

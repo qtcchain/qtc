@@ -35,10 +35,10 @@ BOOST_AUTO_TEST_CASE(connections_desirable_service_flags)
 {
     std::unique_ptr<PeerManager> peerman = PeerManager::make(*m_node.connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool, *m_node.warnings, {});
     auto consensus = m_node.chainman->GetParams().GetConsensus();
-    const ServiceFlags desirable_full{
-        ServiceFlags(NODE_NETWORK | NODE_WITNESS | NODE_MATMUL_CONSENSUS)};
-    const ServiceFlags desirable_limited{
-        ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS | NODE_MATMUL_CONSENSUS)};
+    // NODE_MATMUL_CONSENSUS is a soft download preference, not a connection
+    // requirement (security review P-5), so it is not part of the desirable set.
+    const ServiceFlags desirable_full{ServiceFlags(NODE_NETWORK | NODE_WITNESS)};
+    const ServiceFlags desirable_limited{ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS)};
 
     // Check we start connecting to full nodes
     ServiceFlags peer_flags{NODE_WITNESS | NODE_NETWORK_LIMITED};
@@ -87,10 +87,14 @@ BOOST_AUTO_TEST_CASE(matmul_consensus_tier_desirable_service_flags)
     const ServiceFlags consensus_peer{ServiceFlags(base | NODE_MATMUL_CONSENSUS)};
     const ServiceFlags economic_peer{ServiceFlags(base | NODE_MATMUL_ECONOMIC)};
 
-    BOOST_CHECK(peerman->GetDesirableServiceFlags(base) == ServiceFlags(base | NODE_MATMUL_CONSENSUS));
+    // The self-asserted NODE_MATMUL_CONSENSUS bit must never gate connections:
+    // any attacker can set it, and requiring it shrinks the honest peer pool
+    // (security review P-5). Peers with and without it are equally desirable.
+    BOOST_CHECK(peerman->GetDesirableServiceFlags(base) == base);
+    BOOST_CHECK(!(peerman->GetDesirableServiceFlags(base) & NODE_MATMUL_CONSENSUS));
     BOOST_CHECK(peerman->HasAllDesirableServiceFlags(consensus_peer));
-    BOOST_CHECK(!peerman->HasAllDesirableServiceFlags(base));
-    BOOST_CHECK(!peerman->HasAllDesirableServiceFlags(economic_peer));
+    BOOST_CHECK(peerman->HasAllDesirableServiceFlags(base));
+    BOOST_CHECK(peerman->HasAllDesirableServiceFlags(economic_peer));
 }
 
 BOOST_AUTO_TEST_CASE(broadcast_transaction_fails_closed_without_peerman)

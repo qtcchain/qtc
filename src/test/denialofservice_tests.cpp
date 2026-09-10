@@ -7,8 +7,13 @@
 #include <banman.h>
 #include <chainparams.h>
 #include <common/args.h>
+#include <consensus/params.h>
+#include <consensus/validation.h>
 #include <net.h>
 #include <net_processing.h>
+#include <netaddress.h>
+#include <netbase.h>
+#include <pow.h>
 #include <pubkey.h>
 #include <script/sign.h>
 #include <script/signingprovider.h>
@@ -21,6 +26,8 @@
 #include <validation.h>
 
 #include <array>
+#include <chrono>
+#include <limits>
 #include <stdint.h>
 
 #include <boost/test/unit_test.hpp>
@@ -426,6 +433,108 @@ BOOST_AUTO_TEST_CASE(DoS_bantime)
     BOOST_CHECK(banman->IsDiscouraged(addr));
 
     peerLogic->FinalizeNode(dummyNode);
+}
+
+
+// Security audit N-2: the MatMul verification budgets used while catching up
+// (IBD / stale tip) must be finite, and the global budget must be enforced
+// (scaled, not skipped) in that mode.
+BOOST_AUTO_TEST_CASE(matmul_verify_budget_catchup_caps_are_finite)
+{
+    Consensus::Params params; // defaults: 32/min per address, 512/min global
+    params.fMatMulPOW = true;
+
+    const uint32_t steady_peer = EffectiveMatMulPeerVerifyBudgetPerMin(params, /*is_ibd=*/false);
+    const uint32_t catchup_peer = EffectiveMatMulPeerVerifyBudgetPerMin(params, /*is_ibd=*/true);
+    const uint32_t steady_global = EffectiveMatMulGlobalVerifyBudgetPerMin(params, /*catch_up=*/false);
+    const uint32_t catchup_global = EffectiveMatMulGlobalVerifyBudgetPerMin(params, /*catch_up=*/true);
+
+    BOOST_CHECK_EQUAL(steady_peer, params.nMatMulPeerVerifyBudgetPerMin);
+    BOOST_CHECK_EQUAL(steady_global, params.nMatMulGlobalVerifyBudgetPerMin);
+    BOOST_CHECK_EQUAL(catchup_global, params.nMatMulGlobalVerifyBudgetPerMin * MATMUL_CATCHUP_GLOBAL_VERIFY_BUDGET_MULTIPLIER);
+    BOOST_CHECK(catchup_peer >= steady_peer * MATMUL_CATCHUP_PEER_VERIFY_BUDGET_MULTIPLIER);
+    BOOST_CHECK(catchup_peer >= catchup_global); // a lone -connect sync peer may use the whole catch-up budget
+    BOOST_CHECK(catchup_peer < 200'000U);        // the previous, effectively unlimited, IBD cap
+    BOOST_CHECK(catchup_peer < std::numeric_limits<uint32_t>::max());
+    BOOST_CHECK(catchup_global < std::numeric_limits<uint32_t>::max());
+
+    // Per-address cap is enforced in catch-up mode.
+    MatMulPeerVerificationBudget budget;
+    const auto t0 = std::chrono::steady_clock::time_point{std::chrono::hours{1}};
+    for (uint32_t i = 0; i < catchup_peer; ++i) {
+        BOOST_REQUIRE(ConsumeMatMulPeerVerifyBudget(budget, params, t0, /*is_ibd=*/true));
+    }
+    BOOST_CHECK(!ConsumeMatMulPeerVerifyBudget(budget, params, t0, /*is_ibd=*/true));
+
+    // Global cap is enforced in catch-up mode. The global counter is process-wide,
+    // so use a private window ahead of wall-clock time and reset it afterwards.
+    const auto window = std::chrono::steady_clock::now() + std::chrono::minutes{10};
+    BOOST_CHECK(ConsumeGlobalMatMulPhase2Budget(catchup_global, catchup_global, window));
+    BOOST_CHECK(!ConsumeGlobalMatMulPhase2Budget(catchup_global, 1, window));
+    // A saturated count must never wrap the window counter into acceptance.
+    BOOST_CHECK(!ConsumeGlobalMatMulPhase2Budget(catchup_global, std::numeric_limits<uint32_t>::max(), window));
+    // Open a fresh (near-empty) window so later tests are not throttled.
+    BOOST_CHECK(ConsumeGlobalMatMulPhase2Budget(std::numeric_limits<uint32_t>::max(), 1, window + std::chrono::minutes{2}));
+}
+
+// Security audit N-3: a block whose Freivalds product payload was substituted or
+// stripped by the sender is BLOCK_MUTATED (the header stays valid) but must be
+// routed to the MatMul Phase-2 punishment ladder like a transcript mismatch.
+BOOST_AUTO_TEST_CASE(matmul_phase2_failure_matches_payload_mutation)
+{
+    BlockValidationState invalid_payload;
+    invalid_payload.Invalid(BlockValidationResult::BLOCK_MUTATED, "invalid-product-payload",
+                            "block carries non-canonical Freivalds product matrix payload");
+    BOOST_CHECK(IsMatMulPhase2Failure(invalid_payload));
+
+    BlockValidationState missing_payload;
+    missing_payload.Invalid(BlockValidationResult::BLOCK_MUTATED, "missing-product-payload",
+                            "block missing required Freivalds product matrix payload");
+    BOOST_CHECK(IsMatMulPhase2Failure(missing_payload));
+
+    BlockValidationState transcript_mismatch;
+    transcript_mismatch.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "high-hash", "matmul phase2 proof of work failed");
+    BOOST_CHECK(IsMatMulPhase2Failure(transcript_mismatch));
+
+    BlockValidationState other_mutation;
+    other_mutation.Invalid(BlockValidationResult::BLOCK_MUTATED, "bad-txnmrklroot", "hashMerkleRoot mismatch");
+    BOOST_CHECK(!IsMatMulPhase2Failure(other_mutation));
+
+    BlockValidationState phase1;
+    phase1.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "matmul phase1 proof of work failed");
+    BOOST_CHECK(!IsMatMulPhase2Failure(phase1));
+
+    BlockValidationState valid;
+    BOOST_CHECK(!IsMatMulPhase2Failure(valid));
+}
+
+// Security audit P-4: budget keys must not be shared by unrelated onion peers
+// (which all present the proxy address) and must bucket IPv6 by /64.
+BOOST_AUTO_TEST_CASE(matmul_budget_key_buckets)
+{
+    const CNetAddr proxy{LookupHost("127.0.0.1", /*fAllowLookup=*/false).value()};
+    const auto onion1 = MatMulBudgetKeyFor(proxy, NET_ONION, /*node_id=*/1);
+    const auto onion2 = MatMulBudgetKeyFor(proxy, NET_ONION, /*node_id=*/2);
+    BOOST_CHECK(onion1 != onion2);
+    BOOST_CHECK(onion1 == MatMulBudgetKeyFor(proxy, NET_ONION, /*node_id=*/1));
+    // Onion, I2P and CJDNS connections never collide with the plain-IPv4 bucket of the same address.
+    BOOST_CHECK(onion1 != MatMulBudgetKeyFor(proxy, NET_IPV4, /*node_id=*/1));
+    BOOST_CHECK(MatMulBudgetKeyFor(proxy, NET_I2P, 7) != MatMulBudgetKeyFor(proxy, NET_I2P, 8));
+    BOOST_CHECK(MatMulBudgetKeyFor(proxy, NET_CJDNS, 7) != MatMulBudgetKeyFor(proxy, NET_CJDNS, 8));
+
+    // IPv4: keyed by address, independent of the connection.
+    const CNetAddr v4a{LookupHost("1.2.3.4", false).value()};
+    const CNetAddr v4b{LookupHost("1.2.3.5", false).value()};
+    BOOST_CHECK(MatMulBudgetKeyFor(v4a, NET_IPV4, 10) == MatMulBudgetKeyFor(v4a, NET_IPV4, 11));
+    BOOST_CHECK(MatMulBudgetKeyFor(v4a, NET_IPV4, 10) != MatMulBudgetKeyFor(v4b, NET_IPV4, 10));
+
+    // IPv6: same /64 -> same bucket; different /64 -> different bucket.
+    const CNetAddr v6a{LookupHost("2001:db8:1:2::1", false).value()};
+    const CNetAddr v6b{LookupHost("2001:db8:1:2:ffff:ffff:ffff:ffff", false).value()};
+    const CNetAddr v6c{LookupHost("2001:db8:1:3::1", false).value()};
+    BOOST_CHECK(MatMulBudgetKeyFor(v6a, NET_IPV6, 20) == MatMulBudgetKeyFor(v6b, NET_IPV6, 21));
+    BOOST_CHECK(MatMulBudgetKeyFor(v6a, NET_IPV6, 20) != MatMulBudgetKeyFor(v6c, NET_IPV6, 20));
+    BOOST_CHECK(MatMulBudgetKeyFor(v6a, NET_IPV6, 20) != MatMulBudgetKeyFor(v4a, NET_IPV4, 20));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

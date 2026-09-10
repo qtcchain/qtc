@@ -615,10 +615,27 @@ private:
     //! keeps track of whether Unlock has run a thorough check before
     bool m_decryption_thoroughly_checked = false;
 
+    //! Encrypted PQ seed material for this descriptor, as loaded from the
+    //! walletdescriptorpqseedcrypt / walletdescriptorpqseedmapcrypt records: an (iv, authenticated
+    //! ciphertext) pair each. Encrypted wallets never persist PQ seeds in plaintext; the seeds are
+    //! decrypted and injected into the descriptor's pqhd() providers on unlock (UnlockPQSeeds).
+    using CryptedPQSeed = std::pair<uint256, std::vector<unsigned char>>;
+    std::optional<CryptedPQSeed> m_crypted_pq_seed GUARDED_BY(cs_desc_man);
+    std::optional<CryptedPQSeed> m_crypted_pq_seed_map GUARDED_BY(cs_desc_man);
+
     //! Number of pre-generated keys/scripts (part of the look-ahead process, used to detect payments)
     int64_t m_keypool_size GUARDED_BY(cs_desc_man){DEFAULT_KEYPOOL_SIZE};
 
     bool AddDescriptorKeyWithDB(WalletBatch& batch, const CKey& key, const CPubKey &pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+
+    //! Encrypt a PQ seed (or seed map) under master_key and write the encrypted record for this descriptor.
+    bool WriteCryptedPQSeedWithDB(WalletBatch& batch, const CKeyingMaterial& master_key, const std::vector<unsigned char>& seed);
+    bool WriteCryptedPQSeedMapWithDB(WalletBatch& batch, const CKeyingMaterial& master_key, const PQDescriptorSeedMap& seed_map);
+    //! Replace any plaintext PQ seed records of this descriptor with encrypted ones, within batch.
+    bool EncryptPQSeedsWithDB(WalletBatch& batch, const CKeyingMaterial& master_key);
+    //! Decrypt-and-authenticate the encrypted PQ seed records with master_key and inject the seeds
+    //! into the descriptor. Returns false if any record does not authenticate under master_key.
+    bool UnlockPQSeeds(const CKeyingMaterial& master_key) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
     KeyMap GetKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
@@ -720,6 +737,16 @@ public:
 
     bool AddKey(const CKeyID& key_id, const CKey& key);
     bool AddCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& crypted_key);
+    //! Load an encrypted PQ seed / seed map record (wallet load time). The seed is injected on unlock.
+    void AddCryptedPQSeed(const uint256& iv, const std::vector<unsigned char>& ciphertext);
+    void AddCryptedPQSeedMap(const uint256& iv, const std::vector<unsigned char>& ciphertext);
+    bool HaveCryptedPQSeeds() const;
+    //! Persist PQ seed material for this descriptor: authenticated-encrypted under the wallet master
+    //! key when the wallet is encrypted (which must be unlocked), plaintext otherwise. seed_map may be empty.
+    bool WritePQSeedsWithDB(WalletBatch& batch, const std::vector<unsigned char>& seed, const PQDescriptorSeedMap& seed_map);
+    //! Migrate plaintext PQ seed records of an already-encrypted wallet to encrypted records.
+    //! No-op unless the wallet is encrypted and unlocked and plaintext records exist.
+    void UpgradePQSeedEncryption();
 
     bool HasWalletDescriptor(const WalletDescriptor& desc) const;
     void UpdateWalletDescriptor(WalletDescriptor& descriptor);

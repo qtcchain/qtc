@@ -243,6 +243,54 @@ BOOST_AUTO_TEST_CASE(same_version_does_not_launch)
     BOOST_CHECK_EQUAL(h.runner.calls, 0);
 }
 
+BOOST_AUTO_TEST_CASE(last_applied_version_rejects_downgrade_and_replay)
+{
+    const fs::path datadir = m_args.GetDataDirBase();
+    BOOST_CHECK(!node::ReadLastAppliedAutoUpdateVersion(datadir));
+
+    {
+        Harness h;
+        h.config.datadir = datadir;
+        h.AddManifest("99.0.0");
+        h.AddSignature();
+        h.AddScript();
+        BOOST_CHECK(h.Run().status == node::AutoUpdateStatus::LAUNCHED);
+    }
+    BOOST_REQUIRE(node::ReadLastAppliedAutoUpdateVersion(datadir));
+    BOOST_CHECK_EQUAL(*node::ReadLastAppliedAutoUpdateVersion(datadir), "99.0.0");
+
+    // A replayed copy of the same signed manifest, or an older one, is refused before the
+    // installer runs even though the signature is valid and the version is newer than the binary.
+    for (const auto* version : {"99.0.0", "98.5.0"}) {
+        Harness h;
+        h.config.datadir = datadir;
+        h.AddManifest(version);
+        h.AddSignature();
+        h.AddScript();
+        const auto result = h.Run();
+        BOOST_CHECK(result.status == node::AutoUpdateStatus::DOWNGRADE_REJECTED);
+        BOOST_CHECK_EQUAL(h.runner.calls, 0);
+    }
+
+    // A genuinely newer release still launches and raises the marker.
+    {
+        Harness h;
+        h.config.datadir = datadir;
+        h.AddManifest("100.0.0");
+        h.AddSignature();
+        h.AddScript();
+        BOOST_CHECK(h.Run().status == node::AutoUpdateStatus::LAUNCHED);
+    }
+    BOOST_CHECK_EQUAL(*node::ReadLastAppliedAutoUpdateVersion(datadir), "100.0.0");
+
+    // The marker is raise-only: writing a lower version is a no-op.
+    BOOST_CHECK(node::WriteLastAppliedAutoUpdateVersion(datadir, "1.0.0"));
+    BOOST_CHECK_EQUAL(*node::ReadLastAppliedAutoUpdateVersion(datadir), "100.0.0");
+    BOOST_CHECK_EQUAL(node::CompareAutoUpdateVersions("1.2.3", "1.2.4"), -1);
+    BOOST_CHECK_EQUAL(node::CompareAutoUpdateVersions("2.0.0", "1.9.9"), 1);
+    BOOST_CHECK_EQUAL(node::CompareAutoUpdateVersions("v1.0.0", "1.0.0"), 0);
+}
+
 BOOST_AUTO_TEST_CASE(script_hash_is_required_before_launch)
 {
     Harness h;

@@ -17,13 +17,11 @@ to:
 If you already know the QTC build flow and only want the shorter technical
 version, see [build-windows-msvc.md](./build-windows-msvc.md).
 
-## Precompiled Archive on This Branch
+## Precompiled Archives
 
-If you only want a generic precompiled Windows x64 CLI archive from this
-branch, use:
-
-- `contrib\prebuilt\windows\qtc-29.4.0-generic-win64-x86_64-w64-mingw32.zip`
-- `contrib\prebuilt\windows\qtc-29.4.0-generic-win64-x86_64-w64-mingw32.zip.sha256`
+No precompiled binaries are committed to this repository; QTC binaries are
+distributed only as signed releases. Everything else is built from source as
+described below.
 
 ## What This Handbook Recommends
 

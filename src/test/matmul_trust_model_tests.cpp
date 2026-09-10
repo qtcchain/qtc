@@ -385,7 +385,13 @@ BOOST_AUTO_TEST_CASE(validation_rate_limit_ibd_budget_floor_supports_repeated_he
     params.nMatMulPeerVerifyBudgetPerMin = 32;
 
     BOOST_CHECK_EQUAL(EffectiveMatMulPeerVerifyBudgetPerMin(params, /*is_ibd=*/false), 32U);
-    BOOST_CHECK_GE(EffectiveMatMulPeerVerifyBudgetPerMin(params, /*is_ibd=*/true), 200'000U);
+    // Catch-up (IBD) cap is higher but FINITE (security review N-2): it is
+    // max(16x per-peer, the catch-up global cap), never the old 200,000 floor,
+    // and the global budget is enforced in every mode.
+    const uint32_t catchup = EffectiveMatMulPeerVerifyBudgetPerMin(params, /*is_ibd=*/true);
+    BOOST_CHECK_GE(catchup, 32U * MATMUL_CATCHUP_PEER_VERIFY_BUDGET_MULTIPLIER);
+    BOOST_CHECK_GE(catchup, EffectiveMatMulGlobalVerifyBudgetPerMin(params, /*catch_up=*/true));
+    BOOST_CHECK_LT(catchup, 200'000U);
 }
 
 BOOST_AUTO_TEST_CASE(validation_rate_limit_fast_phase_budget_floor_outside_ibd)
@@ -398,10 +404,11 @@ BOOST_AUTO_TEST_CASE(validation_rate_limit_fast_phase_budget_floor_outside_ibd)
     MatMulPeerVerificationBudget budget;
     const auto now = std::chrono::steady_clock::now();
     budget.window_start = now;
-    budget.expensive_verifications_this_minute = 199'999;
-
-    // Outside IBD but still in fast-phase heights, we should retain the
-    // bootstrap floor to avoid disconnect churn during honest catch-up.
+    // Outside IBD but still in fast-phase heights, the finite catch-up cap
+    // applies (security review N-2): one more verification at cap-1, none at cap.
+    const uint32_t cap = EffectiveMatMulPeerVerifyBudgetPerMin(params, /*is_ibd=*/true);
+    BOOST_CHECK_GT(cap, 32U);
+    budget.expensive_verifications_this_minute = cap - 1;
     BOOST_CHECK(ConsumeMatMulPeerVerifyBudget(
         budget, params, now, /*is_ibd=*/false, /*reference_height=*/4000));
     BOOST_CHECK(!ConsumeMatMulPeerVerifyBudget(

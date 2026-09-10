@@ -151,8 +151,10 @@ worktree to save disk space:
 ## Attesting to build outputs
 
 Much like how Gitian build outputs are attested to in a `gitian.sigs`
-repository, Guix build outputs are attested to in the [`guix.sigs`
-repository](https://github.com/bitcoin-core/guix.sigs).
+repository, Guix build outputs are attested to in a `guix.sigs`-style
+attestation repository. QTC placeholder: no public QTC attestation repository
+exists yet; `<path/to/guix.sigs>` below refers to the QTC repository once it is
+created.
 
 After you've cloned the `guix.sigs` repository, to attest to the current
 worktree's commit/tag:

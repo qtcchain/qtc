@@ -820,6 +820,55 @@ int CompareAutoUpdateVersion(std::string_view remote_version)
     return 0;
 }
 
+int CompareAutoUpdateVersions(std::string_view lhs, std::string_view rhs)
+{
+    const auto l = ParseVersionTriple(lhs);
+    const auto r = ParseVersionTriple(rhs);
+    if (!l || !r) return 0;
+    if (*l > *r) return 1;
+    if (*l < *r) return -1;
+    return 0;
+}
+
+static fs::path LastAppliedVersionPath(const fs::path& datadir)
+{
+    return datadir / "autoupdate" / "last_applied_version";
+}
+
+std::optional<std::string> ReadLastAppliedAutoUpdateVersion(const fs::path& datadir)
+{
+    if (datadir.empty()) return std::nullopt;
+    try {
+        std::ifstream in{LastAppliedVersionPath(datadir)};
+        std::string existing;
+        std::getline(in, existing);
+        existing = TrimAscii(existing);
+        if (ParseVersionTriple(existing)) return existing;
+    } catch (const std::exception&) {
+    }
+    return std::nullopt;
+}
+
+bool WriteLastAppliedAutoUpdateVersion(const fs::path& datadir, std::string_view version)
+{
+    if (datadir.empty() || !ParseVersionTriple(version)) return false;
+    // Never move the marker backwards: it records the highest version ever applied.
+    if (const auto existing = ReadLastAppliedAutoUpdateVersion(datadir);
+        existing && CompareAutoUpdateVersions(version, *existing) <= 0) {
+        return true;
+    }
+    try {
+        fs::create_directories(datadir / "autoupdate");
+        std::ofstream out{LastAppliedVersionPath(datadir), std::ios::trunc};
+        if (!out.is_open()) return false;
+        out << TrimAscii(std::string{version}) << '\n';
+        return out.good();
+    } catch (const std::exception& e) {
+        LogDebug(BCLog::AUTOUPDATE, "Unable to persist auto-update last applied version: %s\n", e.what());
+        return false;
+    }
+}
+
 int AutoUpdateRolloutCohort(const AutoUpdateConfig& config)
 {
     if (config.rollout_cohort) {
@@ -890,6 +939,7 @@ std::string AutoUpdateStatusString(AutoUpdateStatus status)
     case AutoUpdateStatus::UNSIGNED_MANIFEST: return "unsigned-manifest";
     case AutoUpdateStatus::BAD_SIGNATURE: return "bad-signature";
     case AutoUpdateStatus::NOT_NEWER: return "not-newer";
+    case AutoUpdateStatus::DOWNGRADE_REJECTED: return "downgrade-rejected";
     case AutoUpdateStatus::ROLLOUT_DEFERRED: return "rollout-deferred";
     case AutoUpdateStatus::SCRIPT_ORIGIN_REJECTED: return "script-origin-rejected";
     case AutoUpdateStatus::SCRIPT_HASH_MISSING: return "script-hash-missing";
@@ -916,6 +966,7 @@ bool AutoUpdateStatusIsTransient(AutoUpdateStatus status)
     case AutoUpdateStatus::BAD_MANIFEST:
     case AutoUpdateStatus::BAD_SIGNATURE:
     case AutoUpdateStatus::NOT_NEWER:
+    case AutoUpdateStatus::DOWNGRADE_REJECTED:
     case AutoUpdateStatus::ROLLOUT_DEFERRED:
     case AutoUpdateStatus::SCRIPT_ORIGIN_REJECTED:
     case AutoUpdateStatus::SCRIPT_HASH_MISSING:
@@ -993,6 +1044,18 @@ AutoUpdateCheckResult CheckForAutoUpdate(const AutoUpdateConfig& config,
         return result;
     }
 
+    // Downgrade/replay protection: a validly signed but stale manifest (e.g. replayed by a
+    // compromised mirror, or after an operator rolled the binary back) must never re-launch an
+    // installer for a version this node has already applied.
+    // TODO(manifest freshness): manifests carry no issue/expiry timestamp yet; once the signer
+    // tooling emits one, also reject manifests older than a bounded age here.
+    if (const auto last_applied = ReadLastAppliedAutoUpdateVersion(config.datadir);
+        last_applied && CompareAutoUpdateVersions(manifest->version, *last_applied) <= 0) {
+        result.status = AutoUpdateStatus::DOWNGRADE_REJECTED;
+        result.detail = strprintf("manifest %s is not newer than last applied %s", manifest->version, *last_applied);
+        return result;
+    }
+
     // Staged/canary gate: the manifest is signed, so rollout_percent is trusted. Apply only if this
     // node's stable cohort is within the rolled-out fraction; otherwise defer (not an error) and the
     // node will re-check on the normal interval as the operator widens the rollout.
@@ -1002,7 +1065,8 @@ AutoUpdateCheckResult CheckForAutoUpdate(const AutoUpdateConfig& config,
         return result;
     }
 
-    if (config.require_script_hash && !LooksLikeSHA256Hex(manifest->script_sha256)) {
+    // The installer hash is always mandatory: an unpinned script must never run.
+    if (!LooksLikeSHA256Hex(manifest->script_sha256)) {
         result.status = AutoUpdateStatus::SCRIPT_HASH_MISSING;
         return result;
     }
@@ -1020,7 +1084,7 @@ AutoUpdateCheckResult CheckForAutoUpdate(const AutoUpdateConfig& config,
         return result;
     }
 
-    if (LooksLikeSHA256Hex(manifest->script_sha256) && SHA256Hex(script_fetch.body) != manifest->script_sha256) {
+    if (SHA256Hex(script_fetch.body) != manifest->script_sha256) {
         result.status = AutoUpdateStatus::SCRIPT_HASH_MISMATCH;
         return result;
     }
@@ -1029,6 +1093,7 @@ AutoUpdateCheckResult CheckForAutoUpdate(const AutoUpdateConfig& config,
         result.status = AutoUpdateStatus::LAUNCH_FAILED;
         return result;
     }
+    WriteLastAppliedAutoUpdateVersion(config.datadir, manifest->version);
 
     result.status = AutoUpdateStatus::LAUNCHED;
     return result;
@@ -1122,12 +1187,19 @@ void AutoUpdateManager::ThreadLoop()
 std::unique_ptr<AutoUpdateManager> MakeAutoUpdateManager(const ArgsManager& args, ChainType chain)
 {
     AutoUpdateConfig config;
-    config.enabled = args.IsArgSet("-autoupdate") ? args.GetBoolArg("-autoupdate", true) : chain == ChainType::MAIN;
+    // Off by default on every chain, mainnet included: a configured release key alone must never
+    // switch on a channel that can ship code to the node. init.cpp validates the remaining options
+    // whenever -autoupdate=1 is given.
+    config.enabled = args.GetBoolArg("-autoupdate", false);
     if (!config.enabled) return nullptr;
 
     config.seamless = args.GetBoolArg("-autoupdateseamless", true);
     config.dev_origin = args.GetBoolArg("-autoupdatedevorigin", false);
-    config.require_script_hash = args.GetBoolArg("-autoupdaterequirescripthash", true);
+    if (config.dev_origin && chain == ChainType::MAIN) {
+        // Defence in depth; init.cpp already rejects this combination with an InitError.
+        LogPrintf("Auto-update disabled: -autoupdatedevorigin is not allowed on mainnet\n");
+        return nullptr;
+    }
     config.telemetry = args.GetBoolArg("-autoupdatetelemetry", true);
     config.telemetry_client_id_enabled = args.GetBoolArg("-autoupdatetelemetryclientid", false);
     config.manifest_url = args.GetArg("-autoupdatemanifesturl", std::string{DEFAULT_AUTOUPDATE_MANIFEST_URL});
@@ -1151,6 +1223,9 @@ std::unique_ptr<AutoUpdateManager> MakeAutoUpdateManager(const ArgsManager& args
         config.rollout_cohort = std::clamp<int>(args.GetIntArg("-autoupdatecohort", 0), 0, 99);
     }
     config.datadir = args.GetDataDirBase();
+    // The running binary is by definition the last successfully applied release; record it so the
+    // downgrade guard also covers releases applied before this marker existed (raise-only).
+    WriteLastAppliedAutoUpdateVersion(config.datadir, LocalClientVersion());
     if (config.telemetry && config.telemetry_client_id_enabled) {
         config.telemetry_client_id = GetOrCreateAutoUpdateClientId(config.datadir);
     }

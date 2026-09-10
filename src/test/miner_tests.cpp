@@ -8,6 +8,7 @@
 #include <consensus/consensus.h>
 #include <consensus/merkle.h>
 #include <consensus/tx_verify.h>
+#include <core_memusage.h>
 #include <hash.h>
 #include <interfaces/mining.h>
 #include <node/miner.h>
@@ -64,6 +65,8 @@ struct MinerTestingSetup : public TestingSetup {
     void TestFastTemplateCapSkipsUnusableTopCandidate(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     void TestBasicMining(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst, int baseheight) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     void TestConsensusSerializedSizeLimit(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    void TestTemplateReservesProductPayload(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    void TestBlockValidityFailureEvictsOffendingTx(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     void TestPrioritisedMining(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     void TestShieldedAnchorTemplateCleanup(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst);
     bool TestSequenceLocks(const CTransaction& tx, CTxMemPool& tx_mempool) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
@@ -1120,6 +1123,157 @@ void MinerTestingSetup::TestConsensusSerializedSizeLimit(const CScript& scriptPu
     BOOST_CHECK_LE(::GetSerializeSize(TX_WITH_WITNESS(block)), MAX_BLOCK_SERIALIZED_SIZE);
 }
 
+// N-7: the template must leave room for the Freivalds product payload that is
+// appended after solving, so the final block never exceeds the consensus
+// weight/serialized-size limits.
+void MinerTestingSetup::TestTemplateReservesProductPayload(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst)
+{
+    const Consensus::Params& consensus{Assert(m_node.chainman)->GetConsensus()};
+    const int next_height{m_node.chainman->ActiveChain().Height() + 1};
+    BOOST_REQUIRE(consensus.IsMatMulProductPayloadRequired(next_height));
+    const uint64_t n{consensus.nMatMulDimension};
+    const uint64_t payload_bytes{n * n * sizeof(uint32_t) + GetSizeOfCompactSize(n * n)};
+    BOOST_CHECK_EQUAL(node::GetMatMulProductPayloadSerializedSize(consensus, next_height), payload_bytes);
+
+    CTxMemPool& tx_mempool{MakeMempool()};
+    BlockAssembler::Options options;
+    options.coinbase_output_script = scriptPubKey;
+
+    // With validity testing on (the default), the synthetic payload used for
+    // the size check must not leak into the returned template.
+    {
+        auto block_template = BlockAssembler{Assert(m_node.chainman)->ActiveChainstate(), &tx_mempool, options, m_node}.CreateNewBlock();
+        BOOST_REQUIRE(block_template);
+        BOOST_CHECK_EQUAL(block_template->block.vtx.size(), 1U);
+        BOOST_CHECK(block_template->block.matrix_c_data.empty());
+        BOOST_CHECK(!block_template->m_mempool_validation_fallback);
+    }
+
+    constexpr uint64_t kBlockLimit{400'000};
+    options.nBlockMaxWeight = kBlockLimit;
+    options.nBlockMaxSize = kBlockLimit;
+    // The witness-padded filler below is not script-valid; only size accounting matters here.
+    options.test_block_validity = false;
+
+    LOCK(tx_mempool.cs);
+    TestMemPoolEntryHelper entry;
+
+    // One fan-out parent spending a mature coinbase into kFillerCount outputs,
+    // then kFillerCount independent ~1 kB children so the template can be
+    // packed to within one child of the budget.
+    constexpr unsigned int kFillerCount{450};
+    CMutableTransaction parent;
+    parent.vin.resize(1);
+    parent.vin[0].prevout.hash = txFirst[3]->GetHash();
+    parent.vin[0].prevout.n = 0;
+    parent.vin[0].scriptSig = CScript() << OP_1;
+    const CAmount child_input_value{txFirst[3]->vout[0].nValue / kFillerCount};
+    BOOST_REQUIRE_GT(child_input_value, 2 * 1000);
+    parent.vout.resize(kFillerCount);
+    for (auto& out : parent.vout) {
+        out.nValue = child_input_value;
+        out.scriptPubKey = CScript() << OP_1;
+    }
+    const Txid parent_txid = parent.GetHash();
+    AddToMempool(tx_mempool, entry.Fee(100'000).Time(Now<NodeSeconds>()).SpendsCoinbase(true).FromTx(parent));
+
+    CMutableTransaction tx;
+    tx.vin.resize(1);
+    tx.vin[0].prevout.hash = parent_txid;
+    tx.vin[0].scriptSig = CScript() << OP_1;
+    tx.vin[0].scriptWitness.stack.emplace_back(1000, 0x42);
+    tx.vout.resize(1);
+    tx.vout[0].nValue = child_input_value - 1000;
+    tx.vout[0].scriptPubKey = CScript() << OP_1;
+    uint64_t mempool_bytes{0};
+    uint64_t filler_tx_size{0};
+    for (unsigned int i = 0; i < kFillerCount; ++i) {
+        tx.vin[0].prevout.n = i;
+        // Well above the template's minimum fee rate so every filler is selectable.
+        AddToMempool(tx_mempool, entry.Fee(20'000).Time(Now<NodeSeconds>()).SpendsCoinbase(false).FromTx(tx));
+        const CTransaction filler{tx};
+        filler_tx_size = ::GetSerializeSize(TX_WITH_WITNESS(filler));
+        mempool_bytes += filler_tx_size;
+    }
+    BOOST_REQUIRE_GT(mempool_bytes, kBlockLimit);
+
+    auto block_template = BlockAssembler{Assert(m_node.chainman)->ActiveChainstate(), &tx_mempool, options, m_node}.CreateNewBlock();
+    BOOST_REQUIRE(block_template);
+    CBlock block{block_template->block};
+    BOOST_CHECK_GT(block.vtx.size(), 2U);
+    BOOST_CHECK_LT(FindBlockTxIndex(block, parent_txid), block.vtx.size());
+    BOOST_CHECK(block.matrix_c_data.empty());
+
+    const uint64_t size_without_payload{::GetSerializeSize(TX_WITH_WITNESS(block))};
+    block.matrix_c_data.assign(n * n, 0);
+    const uint64_t size_with_payload{::GetSerializeSize(TX_WITH_WITNESS(block))};
+    BOOST_CHECK_EQUAL(size_with_payload - size_without_payload, payload_bytes);
+
+    // The solved block (template + payload) fits the configured and consensus limits.
+    BOOST_CHECK_LE(size_with_payload, kBlockLimit);
+    BOOST_CHECK_LE(static_cast<uint64_t>(GetBlockWeight(block)), kBlockLimit);
+    BOOST_CHECK_LE(size_with_payload, consensus.nMaxBlockSerializedSize);
+    BOOST_CHECK_LE(::GetSerializeSize(TX_NO_WITNESS_WITH_SHIELDED(block)), consensus.nMaxBlockWeight / WITNESS_SCALE_FACTOR);
+    // ... and the template was filled up to the payload-adjusted budget, so the
+    // reservation (not a half-empty template) is what keeps it under the limit.
+    BOOST_CHECK_GT(size_with_payload + options.block_reserved_weight + 2 * filler_tx_size, kBlockLimit);
+}
+
+// N-8: a mempool transaction that passes template selection but fails block
+// validity is identified by bisection and evicted, so later templates are not
+// empty until it expires.
+void MinerTestingSetup::TestBlockValidityFailureEvictsOffendingTx(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst)
+{
+    CTxMemPool& tx_mempool{MakeMempool()};
+    BlockAssembler::Options options;
+    options.coinbase_output_script = scriptPubKey;
+
+    LOCK(tx_mempool.cs);
+    TestMemPoolEntryHelper entry;
+    CMutableTransaction tx;
+    tx.vin.resize(1);
+    tx.vin[0].prevout.n = 0;
+    tx.vin[0].scriptSig = CScript() << OP_1;
+    tx.vout.resize(1);
+    tx.vout[0].scriptPubKey = CScript() << OP_1;
+
+    // Creates more value than it spends: template selection does not check
+    // input/output balances, ConnectBlock rejects it (bad-txns-in-belowout).
+    tx.vin[0].prevout.hash = txFirst[0]->GetHash();
+    tx.vout[0].nValue = txFirst[0]->vout[0].nValue + COIN;
+    const Txid invalid_txid = tx.GetHash();
+    AddToMempool(tx_mempool, entry.Fee(20'000).Time(Now<NodeSeconds>()).SpendsCoinbase(true).FromTx(tx));
+
+    tx.vin[0].prevout.hash = txFirst[1]->GetHash();
+    tx.vout[0].nValue = txFirst[1]->vout[0].nValue - 10'000;
+    const Txid valid_txid = tx.GetHash();
+    AddToMempool(tx_mempool, entry.Fee(10'000).Time(Now<NodeSeconds>()).SpendsCoinbase(true).FromTx(tx));
+
+    tx.vin[0].prevout.hash = txFirst[2]->GetHash();
+    tx.vout[0].nValue = txFirst[2]->vout[0].nValue - 5'000;
+    const Txid second_valid_txid = tx.GetHash();
+    AddToMempool(tx_mempool, entry.Fee(5'000).Time(Now<NodeSeconds>()).SpendsCoinbase(true).FromTx(tx));
+
+    auto block_template = BlockAssembler{Assert(m_node.chainman)->ActiveChainstate(), &tx_mempool, options, m_node}.CreateNewBlock();
+    BOOST_REQUIRE(block_template);
+    {
+        const CBlock& block = block_template->block;
+        BOOST_CHECK_EQUAL(block.vtx.size(), 3U);
+        BOOST_CHECK_LT(FindBlockTxIndex(block, valid_txid), block.vtx.size());
+        BOOST_CHECK_LT(FindBlockTxIndex(block, second_valid_txid), block.vtx.size());
+        BOOST_CHECK_EQUAL(FindBlockTxIndex(block, invalid_txid), block.vtx.size());
+    }
+    BOOST_CHECK(!tx_mempool.exists(GenTxid::Txid(invalid_txid)));
+    BOOST_CHECK(tx_mempool.exists(GenTxid::Txid(valid_txid)));
+    BOOST_CHECK(tx_mempool.exists(GenTxid::Txid(second_valid_txid)));
+
+    // Subsequent templates are full templates again, not the empty fallback.
+    block_template = BlockAssembler{Assert(m_node.chainman)->ActiveChainstate(), &tx_mempool, options, m_node}.CreateNewBlock();
+    BOOST_REQUIRE(block_template);
+    BOOST_CHECK_EQUAL(block_template->block.vtx.size(), 3U);
+    BOOST_CHECK(!block_template->m_mempool_validation_fallback);
+}
+
 void MinerTestingSetup::TestPrioritisedMining(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst)
 {
     auto mining{MakeMining()};
@@ -1366,6 +1520,8 @@ BOOST_AUTO_TEST_CASE(CreateNewBlock_validity)
     TestBasicMining(scriptPubKey, txFirst, baseheight);
     TestConsensusSerializedSizeLimit(scriptPubKey, txFirst);
     TestFastTemplateCapSkipsUnusableTopCandidate(scriptPubKey, txFirst);
+    TestTemplateReservesProductPayload(scriptPubKey, txFirst);
+    TestBlockValidityFailureEvictsOffendingTx(scriptPubKey, txFirst);
 
     m_node.chainman->ActiveChain().Tip()->nHeight--;
     SetMockTime(0);
@@ -1377,6 +1533,46 @@ BOOST_AUTO_TEST_CASE(CreateNewBlock_validity)
 
     TestPrioritisedMining(scriptPubKey, txFirst);
     TestShieldedAnchorTemplateCleanup(scriptPubKey, txFirst);
+}
+
+// N-9: mempool memory accounting must include shielded bundle allocations,
+// otherwise TrimToSize undercounts shielded transactions by nearly their size.
+BOOST_AUTO_TEST_CASE(shielded_bundle_dynamic_usage_is_counted)
+{
+    constexpr size_t kProofBytes{64 * 1024};
+
+    CMutableTransaction mtx;
+    mtx.vin.resize(1);
+    mtx.vout.resize(1);
+    mtx.vout[0].scriptPubKey = CScript() << OP_1;
+    BOOST_REQUIRE(!mtx.HasShieldedBundle());
+    const size_t bare_mutable_usage{RecursiveDynamicUsage(mtx)};
+    const size_t bare_usage{RecursiveDynamicUsage(CTransaction{mtx})};
+
+    // Legacy bundle: the proof vector dominates.
+    mtx.shielded_bundle.proof.assign(kProofBytes, 0x5a);
+    BOOST_REQUIRE(mtx.HasShieldedBundle());
+    BOOST_CHECK_GE(RecursiveDynamicUsage(mtx), bare_mutable_usage + kProofBytes);
+    const CTransaction tx{mtx};
+    BOOST_REQUIRE(tx.HasShieldedBundle());
+    BOOST_CHECK_EQUAL(tx.GetShieldedBundle().GetProofSize(), kProofBytes);
+    BOOST_CHECK_GE(RecursiveDynamicUsage(tx), bare_usage + tx.GetShieldedBundle().GetProofSize());
+
+    // v2 bundle: the proof payload and nested payload vectors are counted too.
+    CMutableTransaction v2_mtx;
+    v2_mtx.vin.resize(1);
+    v2_mtx.vout.resize(1);
+    const size_t v2_bare_usage{RecursiveDynamicUsage(v2_mtx)};
+    shielded::v2::TransactionBundle v2_bundle;
+    v2_bundle.proof_payload.assign(kProofBytes, 0x11);
+    shielded::v2::SendPayload send_payload;
+    send_payload.outputs.resize(2);
+    send_payload.outputs[0].encrypted_note.ciphertext.assign(2048, 0x22);
+    send_payload.outputs[1].encrypted_note.ciphertext.assign(2048, 0x33);
+    v2_bundle.payload = std::move(send_payload);
+    v2_mtx.shielded_bundle.v2_bundle = std::move(v2_bundle);
+    BOOST_REQUIRE(v2_mtx.HasShieldedBundle());
+    BOOST_CHECK_GE(RecursiveDynamicUsage(v2_mtx), v2_bare_usage + kProofBytes + 2 * 2048);
 }
 
 BOOST_AUTO_TEST_CASE(update_time_clamps_to_future_mtp_policy)

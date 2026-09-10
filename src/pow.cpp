@@ -3165,12 +3165,32 @@ MatMulPhase2Punishment RegisterMatMulPhase2Failure(
     return MatMulPhase2Punishment::DISCONNECT;
 }
 
+static uint32_t SaturatingMulU32(uint32_t a, uint32_t b)
+{
+    const uint64_t product = static_cast<uint64_t>(a) * static_cast<uint64_t>(b);
+    return product > std::numeric_limits<uint32_t>::max()
+        ? std::numeric_limits<uint32_t>::max()
+        : static_cast<uint32_t>(product);
+}
+
+uint32_t EffectiveMatMulGlobalVerifyBudgetPerMin(const Consensus::Params& params, bool catch_up)
+{
+    if (!catch_up) return params.nMatMulGlobalVerifyBudgetPerMin;
+    return SaturatingMulU32(params.nMatMulGlobalVerifyBudgetPerMin, MATMUL_CATCHUP_GLOBAL_VERIFY_BUDGET_MULTIPLIER);
+}
+
 uint32_t EffectiveMatMulPeerVerifyBudgetPerMin(const Consensus::Params& params, bool is_ibd)
 {
     if (!is_ibd) return params.nMatMulPeerVerifyBudgetPerMin;
-    // IBD needs to process repeated 2000-header batches without disconnect
-    // churn. Keep a finite but substantially higher cap than steady-state.
-    return std::max<uint32_t>(params.nMatMulPeerVerifyBudgetPerMin, 200'000U);
+    // Catch-up (IBD / stale tip) legitimately verifies many blocks per minute, so
+    // the per-address cap is raised -- but it stays finite (previously 200,000/min,
+    // i.e. effectively unlimited). A lone sync peer (-connect / -addnode) must be
+    // able to draw on the whole catch-up global budget, so the per-address cap is
+    // the larger of 16x steady-state and the catch-up global cap; the global cap
+    // bounds aggregate verification CPU either way.
+    return std::max<uint32_t>(
+        SaturatingMulU32(params.nMatMulPeerVerifyBudgetPerMin, MATMUL_CATCHUP_PEER_VERIFY_BUDGET_MULTIPLIER),
+        EffectiveMatMulGlobalVerifyBudgetPerMin(params, /*catch_up=*/true));
 }
 
 bool ConsumeMatMulPeerVerifyBudget(
@@ -3193,9 +3213,10 @@ bool ConsumeMatMulPeerVerifyBudget(
         if (in_fast_phase) {
             // Bootstrap fast phase (heights [0, nFastMineHeight)) can require a
             // large number of expensive header checks per minute. If the local
-            // node leaves IBD early due tip timestamp heuristics, keep a high
-            // finite cap so honest bootstrap peers are not disconnected.
-            effective_budget = std::max<uint32_t>(effective_budget, 200'000U);
+            // node leaves IBD early due tip timestamp heuristics, use the same
+            // finite catch-up cap so honest bootstrap peers are not disconnected.
+            effective_budget = std::max<uint32_t>(
+                effective_budget, EffectiveMatMulPeerVerifyBudgetPerMin(params, /*is_ibd=*/true));
         } else if (rapid_block_context) {
             // Regtest/test-like chains can legitimately burst. Keep an elevated
             // finite cap in those environments.
@@ -3226,7 +3247,9 @@ bool ConsumeGlobalMatMulPhase2Budget(
         g_matmul_global_phase2_this_minute = 0;
     }
 
-    if (g_matmul_global_phase2_this_minute + count > max_global_per_minute) {
+    // Overflow-safe: callers may pass a saturated count.
+    if (count > max_global_per_minute ||
+        g_matmul_global_phase2_this_minute > max_global_per_minute - count) {
         return false;
     }
     g_matmul_global_phase2_this_minute += count;

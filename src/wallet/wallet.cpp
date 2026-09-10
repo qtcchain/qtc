@@ -5193,6 +5193,14 @@ bool CWallet::Unlock(const CKeyingMaterial& vMasterKeyIn)
             }
         }
         vMasterKey = vMasterKeyIn;
+
+        // Encrypted wallets created before PQ descriptor seeds were encrypted still hold them in
+        // plaintext records; now that the master key is verified, move them under it.
+        for (const auto& spk_man_pair : m_spk_managers) {
+            if (auto* desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man_pair.second.get())) {
+                desc_spk_man->UpgradePQSeedEncryption();
+            }
+        }
     }
     NotifyStatusChanged(this);
     return true;
@@ -5793,6 +5801,12 @@ ScriptPubKeyMan* CWallet::AddWalletDescriptor(WalletDescriptor& desc, const Flat
         return nullptr;
     }
 
+    // PQ seeds carried by pqhd() providers can only be persisted under the master key while unlocked.
+    if (IsCrypted() && IsLocked() && !desc.descriptor->ExtractAllPQSeeds().empty()) {
+        WalletLogPrintf("Cannot add a WalletDescriptor with PQ seeds while the wallet is locked\n");
+        return nullptr;
+    }
+
     auto spk_man = GetDescriptorScriptPubKeyMan(desc);
     if (spk_man) {
         WalletLogPrintf("Update existing descriptor: %s\n", desc.descriptor->ToString());
@@ -5847,26 +5861,26 @@ ScriptPubKeyMan* CWallet::AddWalletDescriptor(WalletDescriptor& desc, const Flat
     // For multisig descriptors with multiple pqhd() providers using different
     // seeds, we persist ALL seeds keyed by fingerprint via the seed map.
     // For single-seed descriptors we also write the legacy single-seed entry
-    // for backward compatibility.
+    // for backward compatibility. Encrypted wallets store both records
+    // authenticated-encrypted under the master key, never in plaintext.
     auto all_seeds = desc.descriptor->ExtractAllPQSeeds();
     if (!all_seeds.empty()) {
         WalletBatch batch(GetDatabase());
-        // Write the seed map (fingerprint → seed) for full multi-seed support.
-        std::vector<std::pair<std::array<unsigned char, 4>, std::vector<unsigned char>>> seed_map;
+        // The seed map (fingerprint → seed) for full multi-seed support.
+        PQDescriptorSeedMap seed_map;
         seed_map.reserve(all_seeds.size());
         for (const auto& [fp, seed] : all_seeds) {
             seed_map.emplace_back(fp, std::vector<unsigned char>(seed.begin(), seed.end()));
         }
-        if (!batch.WritePQDescriptorSeedMap(spk_man->GetID(), seed_map)) {
-            WalletLogPrintf("Warning: failed to persist PQ seed map for descriptor %s\n",
-                            desc.descriptor->ToString());
-        }
-        // Also write the legacy single-seed entry for backward compatibility.
+        // The legacy single-seed entry.
         std::vector<unsigned char> seed_vec(all_seeds[0].second.begin(), all_seeds[0].second.end());
-        if (!batch.WritePQDescriptorSeed(spk_man->GetID(), seed_vec)) {
-            WalletLogPrintf("Warning: failed to persist PQ seed for descriptor %s\n",
+        if (!spk_man->WritePQSeedsWithDB(batch, seed_vec, seed_map)) {
+            WalletLogPrintf("Warning: failed to persist PQ seeds for descriptor %s\n",
                             desc.descriptor->ToString());
         }
+        memory_cleanse(seed_vec.data(), seed_vec.size());
+        for (auto& entry : seed_map) memory_cleanse(entry.second.data(), entry.second.size());
+        for (auto& entry : all_seeds) memory_cleanse(entry.second.data(), entry.second.size());
     }
 
     return spk_man;

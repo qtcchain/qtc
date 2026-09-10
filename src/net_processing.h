@@ -47,6 +47,18 @@ static constexpr size_t MAX_SHIELDED_TX_RELAY_BYTES_PER_SECOND{500'000};
 /** Maximum getshieldeddata requests accepted per peer each second. */
 static constexpr size_t MAX_SHIELDEDDATA_REQUESTS_PER_SECOND{8};
 
+/** Key under which reconnect-resistant MatMul verification budgets and the
+ *  Phase-2 failure ladder are tracked. IPv4: the address. IPv6: the /64 prefix.
+ *  Onion / I2P / CJDNS: the connection (NodeId), since inbound onion peers all
+ *  carry the proxy/local address and I2P/CJDNS identities are free to mint. */
+using MatMulBudgetKey = std::vector<unsigned char>;
+MatMulBudgetKey MatMulBudgetKeyFor(const CNetAddr& addr, Network connected_through, NodeId node_id);
+
+/** Whether a block validation failure belongs to the MatMul Phase-2 punishment
+ *  ladder: a transcript/product mismatch, or a BLOCK_MUTATED block whose
+ *  Freivalds product payload is missing or invalid (sender-substituted). */
+bool IsMatMulPhase2Failure(const BlockValidationState& state);
+
 struct CNodeStateStats {
     int nSyncHeight = -1;
     int nCommonHeight = -1;

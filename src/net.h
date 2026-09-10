@@ -61,8 +61,13 @@ static constexpr std::chrono::minutes TIMEOUT_INTERVAL{20};
 static constexpr auto FEELER_INTERVAL = 2min;
 /** Run the extra block-relay-only connection loop once every 5 minutes. **/
 static constexpr auto EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL = 5min;
-/** Maximum length of incoming protocol messages. Must accommodate consensus-valid block relay payloads. */
-static const unsigned int MAX_PROTOCOL_MESSAGE_LENGTH = 16 * 1000 * 1000;
+/** Maximum length of protocol messages (both directions). Must accommodate any
+ *  consensus-valid block including its MatMul product payload
+ *  (Consensus::Params::nMaxBlockSerializedSize, 24,000,000 bytes) plus framing
+ *  headroom; the previous 16 MB limit made ~8 MB of consensus-valid block space
+ *  unrelayable (audit N-4). Enforced on receive by both the V1 and V2 transports
+ *  and on send by CConnman::PushMessage. */
+static const unsigned int MAX_PROTOCOL_MESSAGE_LENGTH = 25 * 1000 * 1000;
 /** Maximum length of the user agent string in `version` message */
 static const unsigned int MAX_SUBVERSION_LENGTH = 256;
 /** Maximum number of automatic outgoing nodes over which we'll relay everything (blocks, tx, addrs, etc) */

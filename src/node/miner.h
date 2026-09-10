@@ -27,6 +27,7 @@
 #include <boost/multi_index_container.hpp>
 
 class ArgsManager;
+class BlockValidationState;
 class CBlockIndex;
 class CChainParams;
 class CScript;
@@ -279,7 +280,31 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Sort the package in an order that is valid to appear in a block */
     void SortForBlock(const CTxMemPool::setEntries& package, std::vector<CTxMemPool::txiter>& sortedEntries);
+
+    /** Run TestBlockValidity on a template block. When consensus requires the
+      * Freivalds product payload at this height, a zero-filled payload of the
+      * final size is attached for the duration of the check so the consensus
+      * size limits are exercised against the size the solved block will have
+      * (PoW is not checked, so the payload contents are irrelevant). The block
+      * is returned without the payload. */
+    bool TestTemplateBlockValidity(BlockValidationState& state, CBlock& block, CBlockIndex* pindexPrev) const
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** After the assembled template failed TestBlockValidity, bisect its
+      * mempool transactions to find the offending one(s), evict them from the
+      * mempool, and rebuild the template. Returns nullptr when the failure
+      * could not be attributed to mempool transactions. */
+    std::shared_ptr<CBlockTemplate> EvictInvalidTemplateTransactionsAndRetry(CBlockIndex* pindexPrev)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 };
+
+/**
+ * Serialized size (payload bytes plus compactsize prefix) of the Freivalds
+ * product-matrix payload (C' = A'B') that PopulateFreivaldsPayload appends to a
+ * solved block at the given height, or 0 when consensus does not require it.
+ * CheckBlock counts the payload against both the weight and serialized-size
+ * limits, so templates must reserve room for it.
+ */
+uint64_t GetMatMulProductPayloadSerializedSize(const Consensus::Params& consensus, int height);
 
 /**
  * Get the minimum time a miner should use in the next block, including

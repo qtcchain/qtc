@@ -12,8 +12,10 @@
 #include <wallet/walletutil.h>
 #include <key.h>
 
+#include <array>
 #include <stdint.h>
 #include <string>
+#include <utility>
 #include <vector>
 
 class CScript;
@@ -94,6 +96,8 @@ extern const std::string WALLETDESCRIPTORCKEY;
 extern const std::string WALLETDESCRIPTORKEY;
 extern const std::string WALLETDESCRIPTORPQSEED;
 extern const std::string WALLETDESCRIPTORPQSEEDMAP;
+extern const std::string WALLETDESCRIPTORPQSEEDCRYPT;
+extern const std::string WALLETDESCRIPTORPQSEEDMAPCRYPT;
 extern const std::string WATCHMETA;
 extern const std::string WATCHS;
 extern const std::string PQMASTERSEED;
@@ -103,6 +107,10 @@ extern const std::string SHIELDEDSTATECRYPT;
 // Keys in this set pertain only to the legacy wallet (LegacyScriptPubKeyMan) and are removed during migration from legacy to descriptors.
 extern const std::unordered_set<std::string> LEGACY_TYPES;
 } // namespace DBKeys
+
+//! Per-descriptor PQ seed map (pqhd() fingerprint -> 32-byte seed), used by multisig descriptors
+//! whose providers derive from different seeds.
+using PQDescriptorSeedMap = std::vector<std::pair<std::array<unsigned char, 4>, std::vector<unsigned char>>>;
 
 struct WalletReorgSettlementHold
 {
@@ -324,13 +332,28 @@ public:
     bool WritePQDescriptorSeed(const uint256& desc_id, const std::vector<unsigned char>& seed);
     //! Read a per-descriptor PQ seed
     bool ReadPQDescriptorSeed(const uint256& desc_id, std::vector<unsigned char>& seed);
+    //! Erase a plaintext per-descriptor PQ seed
+    bool ErasePQDescriptorSeed(const uint256& desc_id);
     //! Write per-descriptor PQ seed map (fingerprint → seed), for multisig descriptors
     //! with multiple pqhd() providers using different seeds.
-    bool WritePQDescriptorSeedMap(const uint256& desc_id,
-                                  const std::vector<std::pair<std::array<unsigned char, 4>, std::vector<unsigned char>>>& seed_map);
+    bool WritePQDescriptorSeedMap(const uint256& desc_id, const PQDescriptorSeedMap& seed_map);
     //! Read per-descriptor PQ seed map
-    bool ReadPQDescriptorSeedMap(const uint256& desc_id,
-                                 std::vector<std::pair<std::array<unsigned char, 4>, std::vector<unsigned char>>>& seed_map);
+    bool ReadPQDescriptorSeedMap(const uint256& desc_id, PQDescriptorSeedMap& seed_map);
+    //! Erase a plaintext per-descriptor PQ seed map
+    bool ErasePQDescriptorSeedMap(const uint256& desc_id);
+    //! Write a per-descriptor PQ seed that has been authenticated-encrypted with the wallet master key
+    //! (see EncryptAuthenticatedSecret). Encrypted wallets must use this instead of WritePQDescriptorSeed.
+    bool WriteCryptedPQDescriptorSeed(const uint256& desc_id, const uint256& iv, const std::vector<unsigned char>& ciphertext);
+    //! Read an encrypted per-descriptor PQ seed
+    bool ReadCryptedPQDescriptorSeed(const uint256& desc_id, uint256& iv, std::vector<unsigned char>& ciphertext);
+    //! Erase an encrypted per-descriptor PQ seed
+    bool EraseCryptedPQDescriptorSeed(const uint256& desc_id);
+    //! Write an encrypted per-descriptor PQ seed map (the serialized PQDescriptorSeedMap is the plaintext)
+    bool WriteCryptedPQDescriptorSeedMap(const uint256& desc_id, const uint256& iv, const std::vector<unsigned char>& ciphertext);
+    //! Read an encrypted per-descriptor PQ seed map
+    bool ReadCryptedPQDescriptorSeedMap(const uint256& desc_id, uint256& iv, std::vector<unsigned char>& ciphertext);
+    //! Erase an encrypted per-descriptor PQ seed map
+    bool EraseCryptedPQDescriptorSeedMap(const uint256& desc_id);
     //! Write shielded wallet persisted state blob.
     bool WriteShieldedState(const std::vector<unsigned char>& state);
     //! Read shielded wallet persisted state blob.

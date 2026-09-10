@@ -187,6 +187,13 @@ are the suites that would catch N-7/M-7 and weight-scale regressions. Fix: enabl
 `contrib/prebuilt/windows/qtc-29.4.0-…zip` with a self-attesting `.sha256`, referenced from README. Unauditable and the
 wrong version. Fix: remove; distribute only signed releases.
 
+### M-11. Mining-template readiness guard is a stub (found while running the functional suite) — VERIFIED
+`rpc/mining.cpp:240-262` `EnforceMiningTemplateReadiness` discards every argument (`(void)min_outbound_peers;` …) and only
+checks that a tip exists, so `-miningminoutboundpeers`, `-miningminsyncedoutboundpeers`, `-miningmaxpeersyncheightlag`
+and `-miningmaxheaderlag` are silent no-ops (stubbed upstream on 2026-06-14, before the fork). `test/functional/
+mining_basic.py` still expects the guard to throw, so that test fails. Fix: implement the guard against connman/peerman
+counts or remove the options and the test expectations; not consensus.
+
 ### (v1) M2 timewarp bounded, M3 seeds/mesh, M5 SLH-DSA weight — unchanged.
 
 ---
@@ -248,6 +255,25 @@ in the mempool path.
 All consensus-affecting fixes (items 3, 5, 10 and any weight change in M-8) belong in the same fork as the genesis
 regeneration and the GPU kernel port, before any public release. Items 1, 2, 4, 6, 7 are not consensus changes and can
 land immediately.
+
+## Status of the non-consensus items (2026-09-10)
+
+Fixed in the working tree (commit pending the full-suite result), no consensus change, regtest end-to-end verified:
+
+| Finding | Fix | Tests |
+|---|---|---|
+| N-6 PQ seed plaintext | encrypted records `walletdescriptorpqseedcrypt`/`…mapcrypt`, migration on encrypt and first unlock, master-key check for PQ-only wallets, injection on unlock | `pq_wallet_encryption_tests` (3 cases) |
+| N-7 / M-7 template payload, 25-tx cap | payload reserved in size and weight, validity tested with a synthetic payload; cap default unlimited | `miner_tests`, `matmul_block_capacity_tests` |
+| N-8 empty-template fallback | bisection finds and evicts the offending txs, logged | `miner_tests` |
+| N-9 shielded memory accounting | `RecursiveDynamicUsage(CShieldedBundle)` | `miner_tests` |
+| N-2 budget latch | no header-height latch; global budget always on, 16× in catch-up; finite per-peer cap | `denialofservice_tests` |
+| N-3 payload failures | single verification; still `BLOCK_MUTATED` (header not invalidated, by design); punishment ladder wired, BAN rung discourages | `denialofservice_tests` |
+| N-4 transport cap | 25,000,000 with a send-side guard | `net_tests` |
+| P-4..P-8 | budget keys by NodeId / IPv6 /64; service bit soft; cmpctblock fetch via BlockRequested; no outbound disconnect on unconnecting headers; guard limitation documented | `denialofservice_tests` |
+| N-10 / W-2..W-5 / M-9 / M-10 / B-12 / QTC-07 | auto-update off unless explicit, hash always required, dev-origin refused on mainnet, downgrade marker; installer key removed, ML-DSA required, git_commit mandatory; verify tooling no longer trusts upstream hosts/keys; secrets off argv; prebuilt binary removed; CI runs upstream functional suites | `autoupdate_tests` |
+
+Deferred to the consensus fork (modelled in iCloud `QTC/software/QTC_Consensus_Fix_Model_2026-09-10`): N-1, M-8, N-5,
+S-1/S-2/C-3/C-4 gate, C-2 default, H1/H2/H3.
 
 ## What was NOT covered
 No fuzzing, no functional-test runs, no dynamic analysis; no review of the miner/pool/stratum tooling outside this tree;

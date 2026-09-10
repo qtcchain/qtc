@@ -544,8 +544,8 @@ BASE_SCRIPTS = [
 ]
 
 # QTC fork default matrix: user-journey and operational coverage for the
-# P2MR-only chain. Use --extended (or QTC_RUN_UPSTREAM_BASE_SUITE=1) to run the
-# broad upstream-style matrix.
+# P2MR-only chain. Use --extended (or QTC_RUN_UPSTREAM_BASE_SUITE=1, as CI does) to
+# also run the broad upstream-style matrix.
 QTC_BASE_SCRIPTS = [
     'feature_p2mr_end_to_end.py',
     'p2mr_end_to_end.py',
@@ -789,8 +789,9 @@ def main():
         # Include extended tests
         test_list += ALL_SCRIPTS
     elif run_upstream_base_suite:
-        # Opt-in path for broad upstream-style base matrix on QTC fork.
-        test_list += BASE_SCRIPTS
+        # Opt-in path (used by CI) for the broad upstream-style base matrix on the QTC fork,
+        # on top of the fork's own matrix.
+        test_list += BASE_SCRIPTS + QTC_BASE_SCRIPTS
     else:
         # Run QTC fork base matrix by default.
         test_list += QTC_BASE_SCRIPTS

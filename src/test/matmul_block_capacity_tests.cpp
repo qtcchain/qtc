@@ -5,6 +5,7 @@
 #include <chainparams.h>
 #include <common/args.h>
 #include <consensus/consensus.h>
+#include <node/miner.h>
 #include <node/types.h>
 #include <policy/policy.h>
 #include <test/util/setup_common.h>
@@ -69,6 +70,46 @@ BOOST_AUTO_TEST_CASE(block_capacity_mining_policy_defaults)
     const node::BlockCreateOptions opts;
     BOOST_CHECK_EQUAL(opts.nBlockMaxWeight, 24'000'000U);
     BOOST_CHECK_EQUAL(opts.nBlockMaxSize, 24'000'000U);
+}
+
+// M-7: block templates are not capped at a fixed transaction count by default;
+// -blockmaxtemplatetxs=<n> still bounds selection when set explicitly.
+BOOST_AUTO_TEST_CASE(block_capacity_template_tx_cap_default_unlimited)
+{
+    BOOST_CHECK_EQUAL(DEFAULT_BLOCK_MAX_TEMPLATE_TXS, 0U);
+    BOOST_CHECK_EQUAL(node::BlockCreateOptions{}.nBlockMaxTemplateTxs, 0U);
+    BOOST_CHECK_EQUAL(node::BlockCreateOptions{}.Clamped().nBlockMaxTemplateTxs, 0U);
+
+    ArgsManager args;
+    for (const char* arg : {"-blockmaxweight=<n>", "-blockmaxsize=<n>", "-blockmaxtemplatetxs=<n>",
+                            "-blockmintxfee=<amt>", "-printpriority", "-blockreservedweight=<n>"}) {
+        args.AddArg(arg, "", ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
+    }
+    node::BlockAssembler::Options options;
+    node::ApplyArgsManOptions(args, options);
+    BOOST_CHECK_EQUAL(options.nBlockMaxTemplateTxs, 0U);
+
+    args.ForceSetArg("-blockmaxtemplatetxs", "7");
+    node::ApplyArgsManOptions(args, options);
+    BOOST_CHECK_EQUAL(options.nBlockMaxTemplateTxs, 7U);
+}
+
+// N-7: the Freivalds product payload size the template must reserve.
+BOOST_AUTO_TEST_CASE(block_capacity_product_payload_reservation)
+{
+    auto params = CreateChainParams(EmptyArgs(), ChainType::MAIN);
+    const auto& c = params->GetConsensus();
+    const uint64_t words{static_cast<uint64_t>(c.nMatMulDimension) * c.nMatMulDimension};
+    const uint64_t expected{words * sizeof(uint32_t) + GetSizeOfCompactSize(words)};
+    BOOST_CHECK_EQUAL(c.nMatMulDimension, 512U);
+    BOOST_CHECK_EQUAL(expected, 512ULL * 512ULL * 4ULL + 5ULL);
+    // Mainnet requires the payload from nMatMulProductDigestHeight onwards.
+    BOOST_CHECK_EQUAL(node::GetMatMulProductPayloadSerializedSize(c, c.nMatMulProductDigestHeight), expected);
+    if (!c.fMatMulRequireProductPayload && c.nMatMulProductDigestHeight > 0) {
+        BOOST_CHECK_EQUAL(node::GetMatMulProductPayloadSerializedSize(c, c.nMatMulProductDigestHeight - 1), 0U);
+    }
+    // The payload always fits alongside the coinbase reservation.
+    BOOST_CHECK_LT(expected + DEFAULT_BLOCK_RESERVED_WEIGHT, MAX_BLOCK_WEIGHT);
 }
 
 BOOST_AUTO_TEST_CASE(block_capacity_block_create_clamping)

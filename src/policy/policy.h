@@ -36,10 +36,10 @@ static const double MINIMUM_TX_PRIORITY = COIN * 144 / 250;
  * Raised to use the full consensus-allowed weight (24 MWU) for maximum throughput. **/
 static constexpr unsigned int DEFAULT_BLOCK_MAX_WEIGHT{MAX_BLOCK_WEIGHT};
 /** Default transaction-count cap for block templates created by mining code.
- * QTC transactions can be CPU-expensive to validate; bounding template work
- * gives miners a fast non-empty alternative to coinbase-only templates during
- * mempool pressure. Set -blockmaxtemplatetxs=0 to restore unlimited selection. */
-static constexpr unsigned int DEFAULT_BLOCK_MAX_TEMPLATE_TXS{25};
+ * 0 means unlimited selection (the template is bounded by weight, size and
+ * the mining-policy CPU budget instead). Operators can still bound template
+ * work explicitly with -blockmaxtemplatetxs=<n>. */
+static constexpr unsigned int DEFAULT_BLOCK_MAX_TEMPLATE_TXS{0};
 /** Default for BlockCreateOptions.block_reserved_size **/
 static constexpr unsigned int DEFAULT_BLOCK_RESERVED_SIZE{1000};
 /** Default for -blockreservedweight **/

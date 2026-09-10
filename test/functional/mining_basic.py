@@ -31,6 +31,10 @@ from test_framework.messages import (
     ser_uint256,
     WITNESS_SCALE_FACTOR
 )
+
+# QTC: the template also reserves the mandatory MatMul C' payload (n^2 * 4 bytes + compactsize,
+# regtest n = 64) so that the block still fits once the payload is attached after solving.
+QTC_PAYLOAD_RESERVED_WEIGHT = 64 * 64 * 4 + 3
 from test_framework.p2p import P2PDataStore
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.authproxy import JSONRPCException
@@ -94,7 +98,7 @@ class MiningTest(BitcoinTestFramework):
         if 'currentblocktx' in mining_info:
             assert_equal(mining_info['currentblocktx'], 0)
         if 'currentblockweight' in mining_info:
-            assert_equal(mining_info['currentblockweight'], DEFAULT_BLOCK_RESERVED_WEIGHT)
+            assert_equal(mining_info['currentblockweight'], DEFAULT_BLOCK_RESERVED_WEIGHT + QTC_PAYLOAD_RESERVED_WEIGHT)
         if 'currentblocksize' in mining_info:
             assert_greater_than_or_equal(mining_info['currentblocksize'], 0)
         if 'currentblockshieldedverifyunits' in mining_info:
@@ -660,7 +664,7 @@ class MiningTest(BitcoinTestFramework):
         if 'currentblocktx' in mining_info:
             assert_equal(mining_info['currentblocktx'], 0)
         if 'currentblockweight' in mining_info:
-            assert_equal(mining_info['currentblockweight'], DEFAULT_BLOCK_RESERVED_WEIGHT)
+            assert_equal(mining_info['currentblockweight'], DEFAULT_BLOCK_RESERVED_WEIGHT + QTC_PAYLOAD_RESERVED_WEIGHT)
         if 'currentblocksize' in mining_info:
             assert_greater_than_or_equal(mining_info['currentblocksize'], 0)
         if 'currentblockshieldedverifyunits' in mining_info:

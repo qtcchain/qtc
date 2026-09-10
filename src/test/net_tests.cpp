@@ -17,6 +17,7 @@
 #include <serialize.h>
 #include <span.h>
 #include <streams.h>
+#include <test/util/net.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <test/util/validation.h>
@@ -1703,6 +1704,50 @@ BOOST_AUTO_TEST_CASE(v2transport_pqonly_enforcement_test)
     }
 
     gArgs.ForceSetArg("-v2pqonly", "0"); // restore default for subsequent tests
+}
+
+
+// Security audit N-4: the send path must refuse (log + drop, never assert) any
+// message larger than MAX_PROTOCOL_MESSAGE_LENGTH, which every peer would
+// reject on receipt, while a consensus-maximum block still fits.
+BOOST_AUTO_TEST_CASE(pushmessage_rejects_oversized_message)
+{
+    static_assert(MAX_PROTOCOL_MESSAGE_LENGTH > 24'000'000U, "a consensus-maximum block must fit in one message");
+
+    in_addr ipv4Addr;
+    ipv4Addr.s_addr = 0xa0b0c001;
+    CNode node{/*id=*/0,
+               /*sock=*/nullptr,
+               CAddress(CService(ipv4Addr, 7777), NODE_NETWORK),
+               /*nKeyedNetGroupIn=*/0,
+               /*nLocalHostNonceIn=*/0,
+               CAddress(),
+               /*addrNameIn=*/"",
+               ConnectionType::OUTBOUND_FULL_RELAY,
+               /*inbound_onion=*/false,
+               /*network_key=*/0};
+
+    CSerializedNetMsg oversized;
+    oversized.m_type = NetMsgType::BLOCK;
+    oversized.data.resize(MAX_PROTOCOL_MESSAGE_LENGTH + 1);
+    m_node.connman->PushMessage(&node, std::move(oversized));
+    {
+        LOCK(node.cs_vSend);
+        BOOST_CHECK(node.vSendMsg.empty());
+        BOOST_CHECK_EQUAL(node.m_send_memusage, 0U);
+    }
+
+    CSerializedNetMsg at_limit;
+    at_limit.m_type = NetMsgType::BLOCK;
+    at_limit.data.resize(MAX_PROTOCOL_MESSAGE_LENGTH);
+    m_node.connman->PushMessage(&node, std::move(at_limit));
+    {
+        LOCK(node.cs_vSend);
+        // Without a socket nothing is flushed, so the accepted message stays queued
+        // (either still in vSendMsg or already handed to the transport).
+        const auto& [to_send, _more, _type] = node.m_transport->GetBytesToSend(/*have_next_message=*/false);
+        BOOST_CHECK(!node.vSendMsg.empty() || !to_send.empty());
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

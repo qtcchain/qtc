@@ -10152,18 +10152,18 @@ static bool ContextualCheckBlock(const CBlock& block,
 
             // Product-committed digest: pure O(n^2) verification with no
             // transcript recomputation. Available at and above nMatMulProductDigestHeight.
-            if (!matmul_verified &&
-                product_digest_active &&
-                payload_size_valid) {
+            // A failure here is final: at these heights the Freivalds path below
+            // evaluates exactly the same predicates (including the product-committed
+            // digest binding), so re-running it would only double the A'/B'
+            // reconstruction cost of a block that is rejected anyway (audit N-3).
+            // The outcome is unchanged; the block is still classified BLOCK_MUTATED
+            // below (the header stays valid, only the sender's payload is bad).
+            if (product_digest_active && payload_size_valid) {
                 matmul_verified = CheckMatMulProofOfWork_ProductCommitted(block, consensusParams, nHeight);
-            }
-
-            // Primary path: Freivalds' O(n^2) verification. The C' payload
-            // lets us verify A'*B'==C' probabilistically (error < 2^-62)
-            // without recomputing the O(n^3) transcript.
-            if (!matmul_verified &&
-                consensusParams.fMatMulFreivaldsEnabled &&
-                payload_size_valid) {
+            } else if (consensusParams.fMatMulFreivaldsEnabled && payload_size_valid) {
+                // Primary path: Freivalds' O(n^2) verification. The C' payload
+                // lets us verify A'*B'==C' probabilistically (error < 2^-62)
+                // without recomputing the O(n^3) transcript.
                 matmul_verified = CheckMatMulProofOfWork_Freivalds(block, consensusParams, nHeight);
             }
 
