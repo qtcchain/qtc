@@ -26,7 +26,7 @@ v1 (morning of 2026-09-09) is superseded. v1's H4 was fixed by O5 (`573e4608`). 
 ## HIGH
 
 ### H1 (v1) Genesis timestamp fixed at 2026-03-19 — unchanged; regenerate at launch.
-### H2 (v1) `powLimit` placeholder — unchanged; size from the fleet after the GPU kernel port.
+### H2 (v1) `powLimit` placeholder — **FIXED 2026-09-10**: sized from the measured A6000 (`0x1e033333`, one A6000 holds 600 s alone), mainnet genesis regenerated (QTC-LAUNCH-SAFETY.md §13). Re-check when the RTX 4000 Ada is measured.
 ### H3 (v1) Header-only MatMul work is unverified and free at floor difficulty — unchanged, and it is the root of N-2.
 
 ### N-1. Post-quantum sigop accounting can be zeroed by a miner (script) — VERIFIED
@@ -274,7 +274,7 @@ Fixed in the working tree (commit pending the full-suite result), no consensus c
 
 Consensus fork applied 2026-09-10 (QTC-LAUNCH-SAFETY.md §12): N-1, M-8, N-5, the S-1/S-2/C-3/C-4 gate, C-2 default, and
 the genesis regeneration. GPU digest kernels ported and un-gated 2026-09-10 (Metal on M5, CUDA on A6000; A6000 ≈ 8,800 attempts/s at mainnet
-shape). Still open: H2 (powLimit: measured rate now available, RTX 4000 Ada pending), H1 at launch (regenerate again),
+shape). powLimit sized from the measured A6000 and applied 2026-09-10 (H2 closed; re-check after the RTX 4000 Ada measurement). Still open: H1 at launch (regenerate again),
 H3 via minimum chain work and a checkpoint post-launch, M-11 (stubbed template readiness guard), porting the upstream
 functional suites (M-9).
 

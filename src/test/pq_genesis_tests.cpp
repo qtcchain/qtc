@@ -45,7 +45,7 @@ BOOST_AUTO_TEST_CASE(genesis_block_valid)
     BlockValidationState state;
     BOOST_CHECK(CheckBlock(genesis, state, params->GetConsensus(), /*fCheckPOW=*/true, /*fCheckMerkleRoot=*/true));
     BOOST_CHECK_EQUAL(genesis.nTime, 1789063200U);
-    BOOST_CHECK_EQUAL(strprintf("%08x", genesis.nBits), "1e013333"); // QTC Option B at 600 s: == compact(powLimit)
+    BOOST_CHECK_EQUAL(strprintf("%08x", genesis.nBits), "1e033333"); // QTC Option B at 600 s: == compact(powLimit), floor sized from the measured A6000
 }
 
 BOOST_AUTO_TEST_CASE(genesis_coinbase_amount_correct)

@@ -152,15 +152,18 @@ public:
         // throughput telemetry (~3.53 bps, ~0.283s over a 30s run) to target
         // the configured fast-phase SLA (~0.25s mean) on this host profile.
         // QTC Option B (QTC-LAUNCH-SAFETY.md D1/D3): ASERT governs from genesis and
-        // this powLimit IS the hard floor. Compact-exact (0x1e013333 = 0x013333 * 2^216,
-        // P = 7.2e-8 per full digest, i.e. the 2^-21 90-second placeholder scaled to 600 s) and the genesis nBits below MUST equal
+        // this powLimit IS the hard floor. Compact-exact (0x1e033333 = 0x033333 * 2^216)
+        // and the genesis nBits below MUST equal
         // compact(powLimit): consensus clamps a looser anchor, but rpc GetTarget
         // aborts on getblockheader 0 otherwise (verified in the §7 simulation).
-        // PLACEHOLDER SIZING: taken from the D3 worked example (a few A6000-class
-        // full-digest rate ~3.9e4/s -> ~360 s blocks at the floor, one CPU core
-        // -> ~4 days). Re-size from the MEASURED launch-fleet rate and regenerate
-        // the genesis (hash changes with nBits) before any public launch.
-        consensus.powLimit = uint256{"0000013333000000000000000000000000000000000000000000000000000000"};
+        // SIZED 2026-09-10 (security review H2, D3): 0x033333 * 2^216, compact 0x1e033333,
+        // P = 1.91e-7 per full digest. One RTX A6000 at its measured 8,800 digests/s
+        // (n=512, oracle v2, digest v4, containerized) holds the 600 s schedule alone at
+        // the floor; A6000 + RTX 4000 Ada (est.) ~400 s until ASERT settles (~163 blocks
+        // ahead over ~8 days); 100 CPU cores ~6 floor blocks/day. Model and alternatives:
+        // iCloud QTC/software/QTC_powLimit_Sizing_2026-09-10 (powlimit_sizing.py). Re-run the
+        // model if the launch fleet changes materially; genesis is regenerated at launch (H1).
+        consensus.powLimit = uint256{"0000033333000000000000000000000000000000000000000000000000000000"};
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
         consensus.nPowTargetSpacing = 600; // QTC: 10-minute blocks (Bitcoin)
         consensus.fPowAllowMinDifficultyBlocks = false;
@@ -354,13 +357,13 @@ public:
             1789063200,  // Sep 10, 2026 18:00:00 UTC — consensus fork v0.0.5 (REGENERATE AGAIN within hours of the real launch, security review H1)
             0,
             1,
-            0x1e013333,  // == compact(powLimit); QTC Option B at 600 s
+            0x1e033333,  // == compact(powLimit); QTC Option B at 600 s, floor sized from the measured A6000 (H2)
             1,
             consensus.nInitialSubsidy,
             static_cast<uint16_t>(consensus.nMatMulDimension),
             uint256{"07226e4fdc368a067ef904b9fdddf9763e2782fda4e695788240077805643edd"});
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"44c4f064d67cca8053e7dfe74f8935b146ce913f81bf87ec7ba65db69f1504d4"});
+        assert(consensus.hashGenesisBlock == uint256{"9ba00506445039aa7315dc1ce61eded19ec75d31edbfed3643cb1e4f3c3db8e2"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
 
         // QTC address prefixes (distinct from QTC). PUBKEY 58 → base58 'Q' lead;

@@ -1,8 +1,8 @@
 # QTC launch-safety proposal — difficulty curve, floors, and activation discipline
 
-**Status:** Option B **APPLIED to mainnet consensus** on 2026-09-06 (§8) with a
-**placeholder `powLimit`** — the floor must be re-sized from the measured launch
-fleet (D3) and the genesis regenerated again before any public launch.
+**Status:** Option B **APPLIED to mainnet consensus** on 2026-09-06 (§8). `powLimit`
+**sized from the measured A6000 on 2026-09-10** (§13); the genesis must still be
+regenerated with a launch-day timestamp before any public launch (H1).
 **Basis:** QTC's own difficulty history (v0.33.1 → v0.34.5) and the two incidents
 it records in-code: the ASERT "dump floor" (shipped at 191,714 after a stall could
 unwind difficulty ~2000×) and the network split at 199,295/199,299 (a flag-day
@@ -158,8 +158,8 @@ D4 needs the timewarp reconcile height alongside the drift bound.
 
 ## 6. Decisions required
 - [x] D1: Option B (no fast phase) — **applied** (§8)
-- [ ] D3: launch-fleet full-digest rate R (measured) → `powLimit` — **placeholder
-      applied; must be re-sized + genesis regenerated before launch**
+- [x] D3: launch-fleet full-digest rate R (measured) → `powLimit` — **sized from the
+      measured A6000 (8,800 digests/s), `0x1e033333`, applied 2026-09-10 (§13)**
 - [x] D2/D4/D5: 14,400 s τ, drift + reconcile + BIP94 from genesis, epsilon-18
       from genesis — **applied** (§8)
 - [ ] D6/D7: adopt the runway rule and early-checkpoint cadence as policy
@@ -240,7 +240,7 @@ moot for Option B (`next_height == nMatMulAsertHeight` is never reached at 0).
 `CMainParams` in `src/kernel/chainparams.cpp` now carries:
 
 ```
-consensus.powLimit                              = 0x013333·2^216 ("0000013333…", compact 0x1e013333)  // PLACEHOLDER sizing, re-derived for 600 s in §10
+consensus.powLimit                              = 0x033333·2^216 ("0000033333…", compact 0x1e033333)  // sized from the measured A6000, §13
 consensus.nFastMineHeight                       = 0;
 consensus.nMatMulAsertHeight                    = 0;
 consensus.nMatMulAsertHalfLife                  = 172'800;     // 2 days at 600 s (§10)
@@ -365,7 +365,7 @@ Halving table (block, year, coins/block): 0 → 50; 210,000 → 25 (y4); 420,000
 - `powLimit` re-derived for the longer spacing with the same 1.7× headroom as the
   90 s placeholder: **`0x013333 · 2^216`, compact `0x1e013333`** (P ≈ 7.2e-8 per
   full digest; the D3 worked-example fleet makes ~360 s blocks at the floor).
-  **Still a placeholder** — re-size from the measured fleet (D3).
+  Superseded 2026-09-10 by the measured sizing `0x1e033333` (§13).
 - **Drift bound scaled to τ/4 = 43,200 s** (not left at 3,600 s). The bound is
   relative to the parent's *median time past*, and the 11-block median lags ~5
   blocks, so the chain clock can advance at most drift/6 per block. At 600 s the
@@ -385,7 +385,7 @@ Halving table (block, year, coins/block): 0 → 50; 210,000 → 25 (y4); 420,000
   `stall_sim.py` gained `--spacing/--tau`.
 
 **Genesis regenerated** (the coinbase value is the subsidy, nBits = compact(powLimit)):
-- main    `44c4f064d67cca8053e7dfe74f8935b146ce913f81bf87ec7ba65db69f1504d4` (bits `1e013333`)
+- main    `9ba00506445039aa7315dc1ce61eded19ec75d31edbfed3643cb1e4f3c3db8e2` (bits `1e033333`)
 - test/testnet4/signet `2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb`
 - regtest `25d0b1c272072b56bb0e79aea8566b16378648775e7a517d9d022720f6a1fca6`
 - shieldedv2dev `309ae3de50712d4520cec19066979473a70de4a4b73d89b3327a07c845336e1f`
@@ -448,7 +448,31 @@ Applied together, from genesis, with a genesis regeneration (see `QTC-SECURITY-R
 | C-2 | default reorg profile `hysteresis_depth` 0 → 1 (fork-choice policy, same release) |
 | Genesis | `nTime 1789063200` (2026-09-10 18:00 UTC) on main/test/testnet4/signet: main `44c4f064…1504d4`, test/testnet4/signet `2532b498…7870cb`; regtest and shieldedv2dev unchanged; merkle unchanged |
 
-**Still placeholders:** `powLimit` (H2, needs the GPU throughput measurement after the kernel port) and the genesis
-timestamp itself, which must be regenerated within hours of the real launch (H1) — the procedure is
+**Still placeholders:** the genesis timestamp itself (`powLimit` was sized from the measured A6000 on 2026-09-10, §13), which must be regenerated within hours of the real launch (H1) — the procedure is
 `genesis_regen_hooks.py` → build → boot each chain → `genesis_bake4.py` (scratch scripts, copied to iCloud
 `QTC/software`). H3 is handled after launch by `nMinimumChainWork` and a checkpoint in the first point release.
+
+## 13. `powLimit` sized from the measured A6000 (applied 2026-09-10)
+
+Inputs: RTX A6000 8,800 full digests/s (n = 512, oracle v2, digest v4, containerized; GPU-bound ≈ 13,000), Apple M5
+Metal 840/s, one CPU core 1–3.6/s; RTX 4000 Ada not yet measured (0.5× A6000 assumed). Model and alternatives in
+iCloud `QTC/software/QTC_powLimit_Sizing_2026-09-10` (`powlimit_sizing.py`).
+
+| Candidate | compact | one A6000 at the floor | A6000 + Ada (est.) | launch overshoot (both cards) |
+|---|---|---|---|---|
+| placeholder | `0x1e013333` | 1,589 s | 1,059 s | none (chain slower than target) |
+| A fleet-sized | `0x1e021e4a` | 900 s | 600 s | none, no margin without Node B |
+| **B applied** | **`0x1e033333`** | **596 s** | **397 s** | ≈ 163 blocks over ≈ 8 days |
+| C 2× headroom | `0x1e066666` | 298 s | 199 s | ≈ 451 blocks over ≈ 10 days |
+
+Chosen: B — the one measured card holds the 600 s schedule alone; losing or under-delivering Node B never leaves the
+chain below target cadence. Post-stall catch-up excess is S/600 blocks for any floor (the floor only sets how fast it
+burns); CPU-only floor production ≈ 6 blocks/day per 100 M5 cores (H3 is closed post-launch by minimum chain work and a
+checkpoint). The value is compact-exact and genesis `nBits` equals `compact(powLimit)` (the two §7 requirements).
+
+Applied: mainnet `powLimit = 0x033333·2^216`, genesis `nBits 0x1e033333`, mainnet genesis regenerated at the unchanged
+`nTime 1789063200` → `9ba00506445039aa7315dc1ce61eded19ec75d31edbfed3643cb1e4f3c3db8e2` (merkle unchanged
+`68668615…`); test chains keep their own floors and genesis. The regtest stall simulation (§7) exercises the mechanics
+with an easy floor by design; the mainnet value itself (5.2 M digests per block) cannot be run on a CPU regtest.
+Re-run the model if the RTX 4000 Ada measurement or a fleet change moves R materially; genesis is regenerated again at
+launch (H1) and the floor carries over.

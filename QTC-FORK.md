@@ -339,7 +339,7 @@ placeholders are documentation/help-text only: `github.com/qtcchain/qtc`
 
 ### DONE — Bitcoin's monetary policy at 600 s ✅ → `QTC-LAUNCH-SAFETY.md` §10
 50 coins / 210,000-block halving / 10-minute blocks / 21 M (was 20 / 525,000 / 90 s).
-Spacing retune: ASERT τ 172,800 s (288 blocks), floor `0x1e013333` (placeholder,
+Spacing retune: ASERT τ 172,800 s (288 blocks), floor `0x1e033333` (sized from the measured A6000 2026-09-10; was placeholder `0x1e013333`,
 D3), drift 3,600 s = 6 blocks. Genesis regenerated again (main `c5343276…`);
 regtest @110 rebaked from the deterministic test chain; regtest keeps 90 s with a
 new `-regtestmatmulpowtargetspacing` knob so `stall_sim.py --spacing 600 --tau
@@ -369,6 +369,11 @@ on an M5 CPU because the one-lane oracle was not skippable). Fix chosen after mo
 ### Stage: security-review consensus fork (2026-09-10)
 N-1 PQ sigop accounting (annex mirrored, CSFS counted and cached, annex rejected), M-8 SLH-DSA weight 1,000, N-5
 legacy payload vectors rejected, mainnet shielded surface disabled (`fShieldedPoolDisabled`, recovery exit INT32_MAX),
-hysteresis depth 1, genesis regenerated at nTime 1789063200 (main 44c4f064…, test nets 2532b498…). Full detail in
-QTC-LAUNCH-SAFETY.md §12. Unit suite: see commit. Regenerate genesis again at launch (H1); size powLimit after the GPU
-kernel port (H2).
+hysteresis depth 1, genesis regenerated at nTime 1789063200 (main 9ba00506… after the H2 floor sizing (44c4f064… at v0.0.5), test nets 2532b498…). Full detail in
+QTC-LAUNCH-SAFETY.md §12. Unit suite: see commit. Regenerate genesis again at launch (H1).
+
+### DONE — powLimit sized from the measured A6000, mainnet genesis regenerated (2026-09-10) ✅
+Floor `0x1e013333` (placeholder) → `0x1e033333` (one A6000 at 8,800 digests/s holds 600 s alone; A6000 + Ada ≈ 400 s
+until ASERT settles). Mainnet genesis `9ba00506…b8e2` at the unchanged nTime 1789063200, merkle unchanged; test
+chains untouched. Model: iCloud `QTC/software/QTC_powLimit_Sizing_2026-09-10`; detail QTC-LAUNCH-SAFETY.md §13.
+Consensus-bearing: 0.0.6 nodes cannot follow. H2 closed; re-check after the RTX 4000 Ada measurement.
