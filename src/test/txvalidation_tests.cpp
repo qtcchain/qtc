@@ -4636,7 +4636,8 @@ BOOST_FIXTURE_TEST_CASE(tx_mempool_accepts_postfork_v2_lifecycle_control_with_mu
                                                 /*fee=*/V2_DIRECT_SEND_FEE,
                                                 &consensus,
                                                 consensus.nShieldedMatRiCTDisableHeight,
-                                                {CTxOut{10'000, extra_script}});
+                                                // 20,000 atoms: above the P2MR dust threshold (11,583 at 3 atoms/vB).
+                                                {CTxOut{20'000, extra_script}});
     BOOST_REQUIRE(lifecycle_tx.shielded_bundle.v2_bundle);
 
     std::string reject_reason;

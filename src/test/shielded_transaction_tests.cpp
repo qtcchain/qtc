@@ -42,7 +42,8 @@ CMutableTransaction BuildStandardBaseTx()
     CMutableTransaction mtx;
     mtx.vin.emplace_back(COutPoint(Txid::FromUint256(uint256{2}), 0), CScript{});
     std::vector<unsigned char> witness_program(32, 0x42);
-    mtx.vout.emplace_back(1000, CScript{} << OP_2 << witness_program);
+    // 20,000 atoms: above the P2MR dust threshold (11,583 at 3 atoms/vB).
+    mtx.vout.emplace_back(20'000, CScript{} << OP_2 << witness_program);
     return mtx;
 }
 

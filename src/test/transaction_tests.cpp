@@ -1460,4 +1460,26 @@ BOOST_AUTO_TEST_CASE(p2mr_multisig_witness_sigop_count)
                           VALIDATION_WEIGHT_PER_SLHDSA_MULTISIG_SIGOP);
 }
 
+// QTC: a P2MR output can only be spent with a post-quantum signature (~3.8 kB for ML-DSA-44), so its dust
+// threshold must reflect that future input, not Bitcoin's 148-byte assumption (fee proposal Q8).
+BOOST_AUTO_TEST_CASE(p2mr_dust_threshold_reflects_pq_spend_cost)
+{
+    const CFeeRate dust_rate{DUST_RELAY_TX_FEE};
+    CTxOut p2mr_out;
+    p2mr_out.scriptPubKey = CScript() << OP_2 << std::vector<unsigned char>(32, 0x42);
+    BOOST_REQUIRE_EQUAL(GetSerializeSize(p2mr_out), 43U);
+    const CAmount expected = dust_rate.GetFee(43 + P2MR_DUST_FUTURE_INPUT_SIZE);
+    BOOST_CHECK_EQUAL(GetDustThreshold(p2mr_out, dust_rate), expected);
+    BOOST_CHECK_EQUAL(expected, 11583);
+    p2mr_out.nValue = expected - 1;
+    BOOST_CHECK(IsDust(p2mr_out, dust_rate));
+    p2mr_out.nValue = expected;
+    BOOST_CHECK(!IsDust(p2mr_out, dust_rate));
+
+    // Non-P2MR outputs keep the inherited accounting.
+    CTxOut p2wpkh_out;
+    p2wpkh_out.scriptPubKey = CScript() << OP_0 << std::vector<unsigned char>(20, 0x11);
+    BOOST_CHECK_EQUAL(GetDustThreshold(p2wpkh_out, dust_rate), dust_rate.GetFee(GetSerializeSize(p2wpkh_out) + 148));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

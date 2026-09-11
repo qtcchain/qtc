@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <common/args.h>
 #include <common/messages.h>
+#include <coins.h>
 #include <common/system.h>
 #include <consensus/amount.h>
+#include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <interfaces/chain.h>
 #include <node/types.h>
@@ -105,9 +107,35 @@ static std::optional<int64_t> MaxInputWeight(const Descriptor& desc, const std::
     return {};
 }
 
-static std::optional<int64_t> DummySignInputWeight(const CTxOut& txout,
-                                                   const SigningProvider& provider,
-                                                   const bool use_max_sig)
+/** Node admission charges DEFAULT_BYTES_PER_SIGOP virtual bytes per sigop-cost unit (ML-DSA 50, SLH-DSA
+ *  1,000, ...), so an SLH-DSA spend is priced at 20,000 vB although it serializes to ~8 kB. The wallet must
+ *  quote the same policy size or its fee-rate quotes are ~2.5x too low for SLH-DSA (fee proposal gate M2). */
+static int64_t SigOpCostForInputs(const CTransaction& tx, const std::vector<CTxOut>& txouts)
+{
+    if (tx.vin.size() != txouts.size()) return 0;
+    CCoinsView dummy;
+    CCoinsViewCache view(&dummy);
+    for (size_t i = 0; i < txouts.size(); ++i) {
+        view.AddCoin(tx.vin[i].prevout, Coin{txouts[i], /*nHeight=*/1, /*fCoinBase=*/false}, /*possible_overwrite=*/true);
+    }
+    return GetTransactionSigOpCost(tx, view, STANDARD_SCRIPT_VERIFY_FLAGS);
+}
+
+/** Policy virtual size of one signed input: max(weight, sigop cost x bytes-per-sigop), exactly as the node
+ *  computes it for the whole transaction. */
+static int64_t SignedInputPolicySize(const CTxIn& signed_txin, const CTxOut& txout)
+{
+    CMutableTransaction probe;
+    probe.vin.push_back(signed_txin);
+    probe.vout.emplace_back(txout.nValue, txout.scriptPubKey);
+    const CTransaction probe_tx{probe};
+    const int64_t sigops = SigOpCostForInputs(probe_tx, {txout});
+    return GetVirtualTransactionSize(GetTransactionInputWeight(signed_txin), sigops, DEFAULT_BYTES_PER_SIGOP);
+}
+
+static std::optional<CTxIn> DummySignInput(const CTxOut& txout,
+                                           const SigningProvider& provider,
+                                           const bool use_max_sig)
 {
     SignatureData sig_data;
     if (!ProduceSignature(
@@ -120,7 +148,31 @@ static std::optional<int64_t> DummySignInputWeight(const CTxOut& txout,
 
     CTxIn txin;
     UpdateInput(txin, sig_data);
-    return GetTransactionInputWeight(txin);
+    return txin;
+}
+
+static std::optional<int64_t> DummySignInputWeight(const CTxOut& txout,
+                                                   const SigningProvider& provider,
+                                                   const bool use_max_sig)
+{
+    if (const auto txin = DummySignInput(txout, provider, use_max_sig)) {
+        return GetTransactionInputWeight(*txin);
+    }
+    return {};
+}
+
+/** Sigop cost of one dummy-signed P2MR input (0 when it cannot be dummy-signed). */
+static int64_t DummySignInputSigOpCost(const CTxOut& txout,
+                                       const SigningProvider& provider,
+                                       const bool use_max_sig)
+{
+    if (const auto txin = DummySignInput(txout, provider, use_max_sig)) {
+        CMutableTransaction probe;
+        probe.vin.push_back(*txin);
+        probe.vout.emplace_back(txout.nValue, txout.scriptPubKey);
+        return SigOpCostForInputs(CTransaction{probe}, {txout});
+    }
+    return 0;
 }
 
 static bool IsP2MROutput(const CScript& script_pubkey)
@@ -129,7 +181,7 @@ static bool IsP2MROutput(const CScript& script_pubkey)
     return Solver(script_pubkey, solutions) == TxoutType::WITNESS_V2_P2MR;
 }
 
-static std::optional<int64_t> WalletSignP2MRInputWeight(const CWallet* wallet, const CTxOut& txout)
+static std::optional<CTxIn> WalletSignP2MRInput(const CWallet* wallet, const CTxOut& txout)
 {
     CMutableTransaction tx;
     const COutPoint prevout{Txid::FromUint256(uint256{1}), 0};
@@ -144,7 +196,7 @@ static std::optional<int64_t> WalletSignP2MRInputWeight(const CWallet* wallet, c
         return {};
     }
     if (!input_errors.empty()) return {};
-    return GetTransactionInputWeight(tx.vin[0]);
+    return tx.vin[0];
 }
 
 static std::optional<TxSize> WalletSignP2MRTxSize(const CTransaction& tx,
@@ -166,7 +218,9 @@ static std::optional<TxSize> WalletSignP2MRTxSize(const CTransaction& tx,
     if (!input_errors.empty()) return {};
 
     const CTransaction signed_tx{tx_signed};
-    return TxSize{GetVirtualTransactionSize(signed_tx), GetTransactionWeight(signed_tx)};
+    const int64_t weight = GetTransactionWeight(signed_tx);
+    const int64_t sigops = SigOpCostForInputs(signed_tx, txouts);
+    return TxSize{GetVirtualTransactionSize(weight, sigops, DEFAULT_BYTES_PER_SIGOP), weight};
 }
 
 int CalculateMaximumSignedInputSize(const CTxOut& txout, const COutPoint outpoint, const SigningProvider* provider, bool can_grind_r, const CCoinControl* coin_control)
@@ -181,10 +235,11 @@ int CalculateMaximumSignedInputSize(const CTxOut& txout, const COutPoint outpoin
 
     std::vector<std::vector<unsigned char>> solutions;
     if (Solver(txout.scriptPubKey, solutions) == TxoutType::WITNESS_V2_P2MR) {
-        if (const auto weight = DummySignInputWeight(txout, *provider, !can_grind_r || UseMaxSig({}, coin_control))) {
-            return static_cast<int>(GetVirtualTransactionSize(*weight, 0, 0));
+        if (const auto txin = DummySignInput(txout, *provider, !can_grind_r || UseMaxSig({}, coin_control))) {
+            return static_cast<int>(SignedInputPolicySize(*txin, txout));
         }
-        return static_cast<int>(GetVirtualTransactionSize(P2MR_MAX_INPUT_WEIGHT, 0, 0));
+        // Unknown spending path: assume the largest single-signature policy size (SLH-DSA is sigop-bound).
+        return static_cast<int>(GetVirtualTransactionSize(P2MR_MAX_INPUT_WEIGHT, VALIDATION_WEIGHT_PER_SLHDSA_SIGOP, DEFAULT_BYTES_PER_SIGOP));
     }
 
     return -1;
@@ -193,8 +248,8 @@ int CalculateMaximumSignedInputSize(const CTxOut& txout, const COutPoint outpoin
 int CalculateMaximumSignedInputSize(const CTxOut& txout, const CWallet* wallet, const CCoinControl* coin_control)
 {
     if (IsP2MROutput(txout.scriptPubKey)) {
-        if (const auto weight = WalletSignP2MRInputWeight(wallet, txout)) {
-            return static_cast<int>(GetVirtualTransactionSize(*weight, 0, 0));
+        if (const auto txin = WalletSignP2MRInput(wallet, txout)) {
+            return static_cast<int>(SignedInputPolicySize(*txin, txout));
         }
     }
     const std::unique_ptr<SigningProvider> provider = GetSolvingProvider(wallet, coin_control, txout.scriptPubKey);
@@ -266,16 +321,25 @@ TxSize CalculateMaximumSignedTxSize(const CTransaction &tx, const CWallet *walle
     // Add the size of the transaction outputs.
     for (const auto& txo : tx.vout) weight += GetSerializeSize(txo) * WITNESS_SCALE_FACTOR;
 
-    // Add the size of the transaction inputs as if they were signed.
+    // Add the size of the transaction inputs as if they were signed, and the sigop cost the node will
+    // charge for the post-quantum inputs (QTC prices each PQ verification in policy virtual bytes).
+    int64_t sigop_cost{0};
     for (uint32_t i = 0; i < txouts.size(); i++) {
         const auto txin_weight = GetSignedTxinWeight(wallet, coin_control, tx.vin[i], txouts[i], is_segwit, wallet->CanGrindR());
         if (!txin_weight) return TxSize{-1, -1};
         assert(*txin_weight > -1);
         weight += *txin_weight;
+        if (IsP2MROutput(txouts[i].scriptPubKey)) {
+            const std::unique_ptr<SigningProvider> provider = GetSolvingProvider(wallet, coin_control, txouts[i].scriptPubKey);
+            const int64_t cost = provider
+                ? DummySignInputSigOpCost(txouts[i], *provider, !wallet->CanGrindR() || UseMaxSig({tx.vin[i]}, coin_control))
+                : 0;
+            // Unknown path: assume the most expensive single signature.
+            sigop_cost += cost > 0 ? cost : VALIDATION_WEIGHT_PER_SLHDSA_SIGOP;
+        }
     }
 
-    // It's ok to use 0 as the number of sigops since we never create any pathological transaction.
-    return TxSize{GetVirtualTransactionSize(weight, 0, 0), weight};
+    return TxSize{GetVirtualTransactionSize(weight, sigop_cost, DEFAULT_BYTES_PER_SIGOP), weight};
 }
 
 TxSize CalculateMaximumSignedTxSize(const CTransaction &tx, const CWallet *wallet, const CCoinControl* coin_control)

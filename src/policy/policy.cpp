@@ -71,6 +71,15 @@ CAmount GetDustThreshold(const CTxOut& txout, const CFeeRate& dustRelayFeeIn)
     int witnessversion = 0;
     std::vector<unsigned char> witnessprogram;
 
+    // QTC: a P2MR output can only be spent with a post-quantum signature, whose witness is ~3.8 kB
+    // (ML-DSA-44) rather than Bitcoin's 107-byte scriptSig. Use the marginal PQ input size so that
+    // outputs cheaper to burn than to spend are treated as dust (security review / fee proposal Q8).
+    if (txout.scriptPubKey.IsWitnessProgram(witnessversion, witnessprogram) &&
+        witnessversion == 2 && witnessprogram.size() == 32) {
+        nSize += P2MR_DUST_FUTURE_INPUT_SIZE;
+        return dustRelayFeeIn.GetFee(nSize);
+    }
+
     // Note this computation is for spending a Segwit v0 P2WPKH output (a 33 bytes
     // public key + an ECDSA signature). For Segwit v1 Taproot outputs the minimum
     // satisfaction is lower (a single BIP340 signature) but this computation was

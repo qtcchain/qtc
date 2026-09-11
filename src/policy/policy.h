@@ -119,6 +119,14 @@ static constexpr unsigned int MAX_STANDARD_SCRIPTSIG_SIZE{1650};
  * only increase the dust limit after prior releases were already not creating
  * outputs below the new threshold */
 static constexpr unsigned int DUST_RELAY_TX_FEE{3000};
+/** QTC: conservative marginal size of a future input spending a P2MR output, used for dust accounting in place
+ *  of Bitcoin's 148-byte assumption. Modelled on an ML-DSA-44 single-signature script-path spend, the everyday
+ *  path: 41-byte input prefix + witness [count 1, sig 3+2420, leaf 3+(3+1312+1), control 1+33] = 3,818 bytes.
+ *  Its sigop cost (50 × 20 = 1,000 vB) is below the byte size, so bytes bound the policy size. SLH-DSA spends
+ *  are larger (sigop-bound at 20,000 vB) but are meant for long-lived storage; the wallet applies its own
+ *  path-aware spend cost when choosing change. Dust for a P2MR output at the default 3 atoms/vB is therefore
+ *  (43 + 3,818) × 3 = 11,583 atoms. */
+static constexpr unsigned int P2MR_DUST_FUTURE_INPUT_SIZE{3818};
 static const std::string DEFAULT_DUST_DYNAMIC{"off"};
 static const int DEFAULT_DUST_RELAY_MULTIPLIER{3'000};
 static const std::string DEFAULT_SPKREUSE{"allow"};
