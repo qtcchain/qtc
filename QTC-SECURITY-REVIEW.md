@@ -273,9 +273,10 @@ Fixed in the working tree (commit pending the full-suite result), no consensus c
 | N-10 / W-2..W-5 / M-9 / M-10 / B-12 / QTC-07 | auto-update off unless explicit, hash always required, dev-origin refused on mainnet, downgrade marker; installer key removed, ML-DSA required, git_commit mandatory; verify tooling no longer trusts upstream hosts/keys; secrets off argv; prebuilt binary removed; CI runs upstream functional suites | `autoupdate_tests` |
 
 Consensus fork applied 2026-09-10 (QTC-LAUNCH-SAFETY.md §12): N-1, M-8, N-5, the S-1/S-2/C-3/C-4 gate, C-2 default, and
-the genesis regeneration. Still open: H2 (powLimit after the GPU measurement), H1 at launch (regenerate again), H3 via
-minimum chain work and a checkpoint post-launch, M-11 (stubbed template readiness guard), porting the upstream functional
-suites (M-9).
+the genesis regeneration. GPU digest kernels ported and un-gated 2026-09-10 (Metal on M5, CUDA on A6000; A6000 ≈ 8,800 attempts/s at mainnet
+shape). Still open: H2 (powLimit: measured rate now available, RTX 4000 Ada pending), H1 at launch (regenerate again),
+H3 via minimum chain work and a checkpoint post-launch, M-11 (stubbed template readiness guard), porting the upstream
+functional suites (M-9).
 
 ## What was NOT covered
 No fuzzing, no functional-test runs, no dynamic analysis; no review of the miner/pool/stratum tooling outside this tree;
