@@ -40,10 +40,10 @@ MatMulGeneratedBaseMatrixResult GenerateBaseMatrixFromSeedForTesting(uint32_t, c
     return result;
 }
 
-MatMulVariableBaseProductWordsResult GenerateVariableBaseProductWordsForTesting(
-    const MatMulVariableBaseProductWordsRequest&)
+MatMulVariableBaseProductResult GenerateVariableBaseProductForTesting(
+    const MatMulVariableBaseProductRequest&)
 {
-    MatMulVariableBaseProductWordsResult result;
+    MatMulVariableBaseProductResult result;
     result.available = false;
     result.success = false;
     result.error = "Metal MatMul acceleration is unavailable on this build";

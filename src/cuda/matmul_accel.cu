@@ -9,6 +9,7 @@
 #include <cuda/oracle_accel.h>
 
 #include <cuda_runtime.h>
+#include <span.h>
 
 #include <algorithm>
 #include <chrono>
@@ -30,19 +31,37 @@
 #include <utility>
 #include <vector>
 
+// Product-committed digest v4 pipeline (QTC O5), per request in a batch:
+//   1. A' = A + E_L*E_R and B' = B + F_L*F_R over GF(2^31-1). The base A/B
+//      come either from the host (cached on the device by seed key) or are
+//      regenerated on the device from the header seeds with oracle v2 (one
+//      SHA-256 per eight consecutive elements, per-lane retry chain).
+//   2. C' = A'B' in full via a shared-memory tiled GEMM (64x64x16 tiles).
+//   3. Every b x b tile of C' is hashed by one thread with a single SHA-256
+//      over its b*b LE32 elements in row-major order -> 32-byte tile hash.
+// The (n/b)^2 tile hashes per request go back to the host, which finishes the
+// digest with matmul::transcript::ComputeProductCommittedDigestFromTileHashes.
+// There is no linear compression anywhere in this file (the v3 compress vector
+// was the H4 shortcut); every C' element is materialised and hashed.
+
 namespace qtc::cuda {
 namespace {
 
 using Element = matmul::field::Element;
 constexpr Element MODULUS = matmul::field::MODULUS;
 constexpr uint32_t REDUCE_INTERVAL{4};
-constexpr uint32_t MAX_BLOCK_THREADS{256};
 constexpr uint32_t WORKSPACE_THREADS{256};
-constexpr uint32_t SLABBED_RHS_THREADS{512};
+constexpr uint32_t GEMM_BM{64};
+constexpr uint32_t GEMM_BN{64};
+constexpr uint32_t GEMM_BK{16};
+constexpr uint32_t GEMM_THREADS{256};
+constexpr uint32_t TILE_HASH_THREADS{128};
+constexpr uint32_t ORACLE_LANES{8};
+constexpr uint32_t MAX_SUPPORTED_BLOCK_SIZE{16};
 
 std::string CudaErrorString(cudaError_t error);
 
-struct DeviceSeedBytes {
+struct __align__(16) DeviceSeedBytes {
     uint8_t data[32];
 };
 
@@ -50,64 +69,64 @@ static_assert(uint256::size() == sizeof(DeviceSeedBytes));
 static_assert(sizeof(uint256) == sizeof(DeviceSeedBytes));
 static_assert(std::is_trivially_copyable_v<uint256>);
 
-struct DeviceDigestBytes {
+struct __align__(16) DeviceDigestBytes {
     uint8_t data[32];
 };
 
-struct DigestWorkspace {
-    struct HostStageBuffer {
-        Element* pinned{nullptr};
-        size_t capacity{0};
-        bool pinned_disabled{false};
-        std::vector<Element> fallback;
+template <typename T>
+struct HostStageBuffer {
+    T* pinned{nullptr};
+    size_t capacity{0};
+    bool pinned_disabled{false};
+    std::vector<T> fallback;
 
-        ~HostStageBuffer() { cudaFreeHost(pinned); }
+    ~HostStageBuffer() { cudaFreeHost(pinned); }
 
-        bool Ensure(size_t required, std::string& error)
-        {
-            if (required == 0) {
+    bool Ensure(size_t required, std::string& error)
+    {
+        if (required == 0) {
+            fallback.clear();
+            return true;
+        }
+
+        if (!pinned_disabled && pinned != nullptr && capacity >= required) {
+            return true;
+        }
+
+        if (!pinned_disabled) {
+            cudaFreeHost(pinned);
+            pinned = nullptr;
+            capacity = 0;
+
+            T* candidate{nullptr};
+            const cudaError_t alloc_error = cudaMallocHost(reinterpret_cast<void**>(&candidate), required * sizeof(T));
+            if (alloc_error == cudaSuccess) {
+                pinned = candidate;
+                capacity = required;
                 fallback.clear();
                 return true;
             }
 
-            if (!pinned_disabled && pinned != nullptr && capacity >= required) {
-                return true;
-            }
-
-            if (!pinned_disabled) {
-                cudaFreeHost(pinned);
-                pinned = nullptr;
-                capacity = 0;
-
-                Element* candidate{nullptr};
-                const cudaError_t alloc_error = cudaMallocHost(&candidate, required * sizeof(Element));
-                if (alloc_error == cudaSuccess) {
-                    pinned = candidate;
-                    capacity = required;
-                    fallback.clear();
-                    return true;
-                }
-
-                pinned_disabled = true;
-                error = "cudaMallocHost failed:" + CudaErrorString(alloc_error) + "; falling back to pageable host memory";
-            }
-
-            try {
-                fallback.resize(required);
-            } catch (const std::bad_alloc&) {
-                error = "host staging allocation failed";
-                return false;
-            }
-            return true;
+            pinned_disabled = true;
+            error = "cudaMallocHost failed:" + CudaErrorString(alloc_error) + "; falling back to pageable host memory";
         }
 
-        Element* data()
-        {
-            return pinned != nullptr ? pinned : fallback.data();
+        try {
+            fallback.resize(required);
+        } catch (const std::bad_alloc&) {
+            error = "host staging allocation failed";
+            return false;
         }
+        return true;
+    }
 
-    };
+    T* data()
+    {
+        return pinned != nullptr ? pinned : fallback.data();
+    }
+};
 
+struct DigestWorkspace {
     int device_index{-1};
     cudaStream_t stream{nullptr};
 
@@ -116,15 +135,18 @@ struct DigestWorkspace {
     uint32_t cached_matrix_elements{0};
     bool cached_matrix_keys_valid{false};
 
+    // Base A/B (host supplied, cached by seed key).
     Element* device_base_a{nullptr};
     Element* device_base_b{nullptr};
     size_t base_a_capacity{0};
     size_t base_b_capacity{0};
 
+    // Perturbed A'/B' per request.
     Element* device_matrix_a{nullptr};
     Element* device_matrix_b{nullptr};
     size_t matrix_a_capacity{0};
     size_t matrix_b_capacity{0};
+
     DeviceSeedBytes* device_seed_a{nullptr};
     DeviceSeedBytes* device_seed_b{nullptr};
     DeviceSeedBytes* device_sigma{nullptr};
@@ -132,59 +154,53 @@ struct DigestWorkspace {
     size_t seed_b_capacity{0};
     size_t sigma_capacity{0};
 
-    Element* device_noise_e_l{nullptr};
-    Element* device_noise_e_r{nullptr};
-    Element* device_noise_f_l{nullptr};
-    Element* device_noise_f_r{nullptr};
-    size_t noise_e_l_capacity{0};
-    size_t noise_e_r_capacity{0};
-    size_t noise_f_l_capacity{0};
-    size_t noise_f_r_capacity{0};
+    // Host-supplied noise packed per request as [E_L | E_R | F_L | F_R].
+    Element* device_packed_noise{nullptr};
+    size_t packed_noise_capacity{0};
     const Element** device_prepared_input_ptrs{nullptr};
     size_t prepared_input_ptr_capacity{0};
 
-    Element* device_compress{nullptr};
-    size_t compress_capacity{0};
-
+    // Full C' per request (n^2 words) and its (n/b)^2 tile hashes.
     Element* device_output{nullptr};
     size_t output_capacity{0};
+    DeviceDigestBytes* device_tile_hashes{nullptr};
+    size_t tile_hash_capacity{0};
     DeviceDigestBytes* device_digests{nullptr};
     size_t digest_capacity{0};
-
-    // Factored-compression staging (PRODUCT_FINAL_BLOCKS path): D[j][x][m]
-    // per request - block_size * n * blocks_per_axis words (1 MiB at n=512).
-    Element* device_factored_rhs{nullptr};
-    size_t factored_rhs_capacity{0};
 
     // Per-seed SHA midstates for matrix generation: 16 words/seed (8 packed seed
     // words + 8 post-round-7 state words). Tiny (batch_size * 64 B).
     uint32_t* device_seed_midstates{nullptr};
     size_t seed_midstates_capacity{0};
 
-    HostStageBuffer host_matrix_a;
-    HostStageBuffer host_matrix_b;
-    HostStageBuffer host_noise_e_l;
-    HostStageBuffer host_noise_e_r;
-    HostStageBuffer host_noise_f_l;
-    HostStageBuffer host_noise_f_r;
-    HostStageBuffer host_compress;
-    HostStageBuffer host_output;
+    // Stage timing events (build -> gemm -> tile hash), read after the stream sync.
+    cudaEvent_t event_build_start{nullptr};
+    cudaEvent_t event_gemm_start{nullptr};
+    cudaEvent_t event_gemm_end{nullptr};
+    cudaEvent_t event_hash_end{nullptr};
+    cudaEvent_t event_copy_end{nullptr};
+    bool build_event_recorded{false};
+
+    HostStageBuffer<Element> host_matrix_a;
+    HostStageBuffer<Element> host_matrix_b;
+    HostStageBuffer<Element> host_packed_noise;
+    HostStageBuffer<const Element*> host_pointer_table;
+    HostStageBuffer<DeviceSeedBytes> host_seeds;
+    HostStageBuffer<DeviceSeedBytes> host_sigma;
+    HostStageBuffer<DeviceDigestBytes> host_tile_hashes;
+    HostStageBuffer<DeviceDigestBytes> host_digests;
 
     void ReleaseDeviceBuffers()
     {
         cudaFree(device_seed_midstates);
         cudaFree(device_digests);
-        cudaFree(device_factored_rhs);
+        cudaFree(device_tile_hashes);
         cudaFree(device_output);
-        cudaFree(device_compress);
-        cudaFree(device_noise_f_r);
-        cudaFree(device_noise_f_l);
-        cudaFree(device_noise_e_r);
-        cudaFree(device_noise_e_l);
         cudaFree(device_prepared_input_ptrs);
+        cudaFree(device_packed_noise);
+        cudaFree(device_sigma);
         cudaFree(device_seed_b);
         cudaFree(device_seed_a);
-        cudaFree(device_sigma);
         cudaFree(device_matrix_b);
         cudaFree(device_matrix_a);
         cudaFree(device_base_b);
@@ -192,17 +208,13 @@ struct DigestWorkspace {
 
         device_seed_midstates = nullptr;
         device_digests = nullptr;
-        device_factored_rhs = nullptr;
+        device_tile_hashes = nullptr;
         device_output = nullptr;
-        device_compress = nullptr;
-        device_noise_f_r = nullptr;
-        device_noise_f_l = nullptr;
-        device_noise_e_r = nullptr;
-        device_noise_e_l = nullptr;
         device_prepared_input_ptrs = nullptr;
+        device_packed_noise = nullptr;
+        device_sigma = nullptr;
         device_seed_b = nullptr;
         device_seed_a = nullptr;
-        device_sigma = nullptr;
         device_matrix_b = nullptr;
         device_matrix_a = nullptr;
         device_base_b = nullptr;
@@ -210,17 +222,13 @@ struct DigestWorkspace {
 
         seed_midstates_capacity = 0;
         digest_capacity = 0;
-        factored_rhs_capacity = 0;
+        tile_hash_capacity = 0;
         output_capacity = 0;
-        compress_capacity = 0;
-        noise_f_r_capacity = 0;
-        noise_f_l_capacity = 0;
-        noise_e_r_capacity = 0;
-        noise_e_l_capacity = 0;
         prepared_input_ptr_capacity = 0;
+        packed_noise_capacity = 0;
+        sigma_capacity = 0;
         seed_b_capacity = 0;
         seed_a_capacity = 0;
-        sigma_capacity = 0;
         matrix_b_capacity = 0;
         matrix_a_capacity = 0;
         base_b_capacity = 0;
@@ -238,6 +246,29 @@ struct DigestWorkspace {
             cudaStreamDestroy(stream);
             stream = nullptr;
         }
+        for (cudaEvent_t* event : {&event_build_start, &event_gemm_start, &event_gemm_end, &event_hash_end, &event_copy_end}) {
+            if (*event != nullptr) {
+                cudaEventDestroy(*event);
+                *event = nullptr;
+            }
+        }
+    }
+
+    bool EnsureTimingEvents()
+    {
+        for (cudaEvent_t* event : {&event_build_start, &event_gemm_start, &event_gemm_end, &event_hash_end, &event_copy_end}) {
+            if (*event == nullptr && cudaEventCreate(event) != cudaSuccess) {
+                *event = nullptr;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void MarkBuildStart()
+    {
+        build_event_recorded = EnsureTimingEvents() &&
+            cudaEventRecord(event_build_start, stream) == cudaSuccess;
     }
 
     ~DigestWorkspace()
@@ -293,6 +324,10 @@ struct DigestProfilingSample {
     bool used_device_prepared_inputs{false};
     bool used_pinned_host_staging{true};
     bool base_matrix_cache_hit{false};
+    double gpu_build_us{0.0};
+    double gpu_gemm_us{0.0};
+    double gpu_tile_hash_us{0.0};
+    double gpu_copy_us{0.0};
     std::string mode;
 };
 
@@ -316,6 +351,10 @@ struct DigestProfilingContext {
     bool last_used_device_prepared_inputs{false};
     bool last_used_pinned_host_staging{false};
     bool last_base_matrix_cache_hit{false};
+    double last_gpu_build_us{0.0};
+    double last_gpu_gemm_us{0.0};
+    double last_gpu_tile_hash_us{0.0};
+    double last_gpu_copy_us{0.0};
     std::string last_mode;
     std::string reason{"no_samples"};
 };
@@ -420,53 +459,6 @@ std::optional<uint32_t> ResolveCudaPoolSlotOverride(int device_index)
     return std::nullopt;
 }
 
-bool ShouldStreamProductDigestBIntoFactoredRhs(uint32_t n, uint32_t b)
-{
-    const char* env = std::getenv("QTC_MATMUL_CUDA_STREAM_B_RHS");
-    if (env != nullptr && env[0] == '0') {
-        return false;
-    }
-
-    const uint32_t blocks_per_axis = n / b;
-    return b == 16U && n % 32U == 0U && (blocks_per_axis & 1U) == 0U;
-}
-
-bool ShouldUseSplitBLowRankProductDigestRhs(uint32_t n, uint32_t b, uint32_t r, bool stream_b_rhs)
-{
-    const char* env = std::getenv("QTC_MATMUL_CUDA_SPLIT_B_LOWRANK_RHS");
-    if (env != nullptr && env[0] == '0') {
-        return false;
-    }
-
-    return stream_b_rhs && n == 512U && b == 16U && r == 8U;
-}
-
-bool ShouldUseSlabbedSplitBLowRankProductDigestWords(uint32_t n, uint32_t b, uint32_t r, bool stream_b_rhs)
-{
-    const char* env = std::getenv("QTC_MATMUL_CUDA_SLAB_RHS_WORDS");
-    if (env == nullptr || env[0] != '1') {
-        return false;
-    }
-
-    return stream_b_rhs && n == 512U && b == 16U && r == 8U;
-}
-
-bool ShouldUseStreamALowRankProductDigestWords(uint32_t n, uint32_t b, uint32_t r, bool stream_b_rhs)
-{
-    const char* env = std::getenv("QTC_MATMUL_CUDA_STREAM_A_WORDS");
-    if (env != nullptr && env[0] == '0') {
-        return false;
-    }
-
-    return stream_b_rhs && n == 512U && b == 16U && r == 8U;
-}
-
-bool ShouldUseStreamARowPairWords()
-{
-    const char* env = std::getenv("QTC_MATMUL_CUDA_STREAM_A_ROW_PAIR");
-    return env != nullptr && env[0] == '1';
-}
-
 uint32_t ResolveCudaPoolSlotCount(int device_index)
 {
     constexpr uint32_t DEFAULT_SLOTS{1};
@@ -542,17 +534,6 @@ double DurationMillis(const SteadyClock::time_point start, const SteadyClock::ti
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-std::string ModeToString(MatMulCompressedWordsMode mode)
-{
-    switch (mode) {
-    case MatMulCompressedWordsMode::TRANSCRIPT_PREFIXES:
-        return "transcript_prefixes";
-    case MatMulCompressedWordsMode::PRODUCT_FINAL_BLOCKS:
-        return "product_final_blocks";
-    }
-    return "unknown";
-}
-
 bool IsBaseMatrixCacheHit(const DigestWorkspace& workspace,
                           const uint256* matrix_a_cache_key,
                           const uint256* matrix_b_cache_key,
@@ -590,6 +571,10 @@ void RecordProfilingSample(const DigestProfilingSample& sample)
     context.last_used_device_prepared_inputs = sample.used_device_prepared_inputs;
     context.last_used_pinned_host_staging = sample.used_pinned_host_staging;
     context.last_base_matrix_cache_hit = sample.base_matrix_cache_hit;
+    context.last_gpu_build_us = sample.gpu_build_us;
+    context.last_gpu_gemm_us = sample.gpu_gemm_us;
+    context.last_gpu_tile_hash_us = sample.gpu_tile_hash_us;
+    context.last_gpu_copy_us = sample.gpu_copy_us;
     context.last_mode = sample.mode;
     context.reason = "samples_recorded";
 }
@@ -607,16 +592,12 @@ uint64_t DeviceCapacityBytes(const DigestWorkspace& workspace)
     add(workspace.matrix_b_capacity, sizeof(Element));
     add(workspace.seed_a_capacity, sizeof(DeviceSeedBytes));
     add(workspace.seed_b_capacity, sizeof(DeviceSeedBytes));
-    add(workspace.sigma_capacity, sizeof(DeviceSeedBytes));
-    add(workspace.noise_e_l_capacity, sizeof(Element));
-    add(workspace.noise_e_r_capacity, sizeof(Element));
-    add(workspace.noise_f_l_capacity, sizeof(Element));
-    add(workspace.noise_f_r_capacity, sizeof(Element));
+    add(workspace.packed_noise_capacity, sizeof(Element));
     add(workspace.prepared_input_ptr_capacity, sizeof(Element*));
-    add(workspace.compress_capacity, sizeof(Element));
     add(workspace.output_capacity, sizeof(Element));
+    add(workspace.tile_hash_capacity, sizeof(DeviceDigestBytes));
     add(workspace.digest_capacity, sizeof(DeviceDigestBytes));
-    add(workspace.factored_rhs_capacity, sizeof(Element));
+    add(workspace.sigma_capacity, sizeof(DeviceSeedBytes));
     add(workspace.seed_midstates_capacity, sizeof(uint32_t));
     return bytes;
 }
@@ -637,6 +618,21 @@ public:
         other.m_context = nullptr;
         other.m_slot = nullptr;
     }
+
+    BufferPoolLease& operator=(BufferPoolLease&& other) noexcept
+    {
+        if (this != &other) {
+            Release();
+            m_context = other.m_context;
+            m_slot = other.m_slot;
+            other.m_context = nullptr;
+            other.m_slot = nullptr;
+        }
+        return *this;
+    }
+
+    BufferPoolLease(const BufferPoolLease&) = delete;
+    BufferPoolLease& operator=(const BufferPoolLease&) = delete;
 
     ~BufferPoolLease() { Release(); }
 
@@ -719,7 +715,6 @@ std::optional<BufferPoolLease> AcquireBufferPoolSlot(int device_index, std::stri
                     slot->workspace.matrix_a_capacity > 0 ||
                     slot->workspace.matrix_b_capacity > 0 ||
                     slot->workspace.output_capacity > 0 ||
-                    slot->workspace.compress_capacity > 0 ||
                     slot->workspace.prepared_input_ptr_capacity > 0;
                 if (prefer_reused_buffers && !has_reusable_buffers) {
                     continue;
@@ -755,6 +750,10 @@ std::optional<BufferPoolLease> AcquireBufferPoolSlot(int device_index, std::stri
     }
 }
 
+// ---------------------------------------------------------------------------
+// Device arithmetic over GF(2^31 - 1)
+// ---------------------------------------------------------------------------
+
 __host__ __device__ __forceinline__ Element Reduce64(uint64_t value)
 {
     const uint64_t fold1 = (value & static_cast<uint64_t>(MODULUS)) + (value >> 31);
@@ -775,10 +774,9 @@ __host__ __device__ __forceinline__ Element FieldAdd(Element a, Element b)
     return sum;
 }
 
-__host__ __device__ __forceinline__ Element FieldMul(Element a, Element b)
-{
-    return Reduce64(static_cast<uint64_t>(a) * static_cast<uint64_t>(b));
-}
+// ---------------------------------------------------------------------------
+// Device SHA-256
+// ---------------------------------------------------------------------------
 
 __device__ __forceinline__ uint32_t RotR(uint32_t x, uint32_t n)
 {
@@ -833,6 +831,14 @@ __device__ __forceinline__ void SetShaByte(uint32_t w[16], uint32_t offset, uint
     w[word_index] |= (byte & 0xffU) << shift;
 }
 
+__device__ __forceinline__ void SetShaLE32(uint32_t w[16], uint32_t offset, uint32_t value)
+{
+    SetShaByte(w, offset, value & 0xffU);
+    SetShaByte(w, offset + 1U, (value >> 8U) & 0xffU);
+    SetShaByte(w, offset + 2U, (value >> 16U) & 0xffU);
+    SetShaByte(w, offset + 3U, (value >> 24U) & 0xffU);
+}
+
 __device__ __forceinline__ uint32_t Bswap32(uint32_t x)
 {
     return ((x & 0x000000ffU) << 24U) |
@@ -854,10 +860,9 @@ __device__ inline void Sha256Init(uint32_t state[8])
 }
 
 // WINDOWED SHA-256 compression: 16-word sliding schedule instead of a 64-word
-// array - the same transform as sha-windowed-scanner.patch (oracle_accel.cu),
-// applied to this file's duplicate of the SHA code. Hot via the per-candidate
-// GenerateBaseMatrixFromSeedBatchKernel (2 x n^2 = 524k compressions per
-// candidate at n=512), where the 64-word local array spills to local memory.
+// array (byte-identical output, halves the per-thread local-memory frame).
+// NOTE: w[] is consumed/overwritten by the schedule; re-fill it fully before
+// the next call.
 __device__ inline void Sha256Compress(uint32_t state[8], uint32_t w[16])
 {
     uint32_t a = state[0];
@@ -900,29 +905,6 @@ __device__ inline void Sha256Compress(uint32_t state[8], uint32_t w[16])
     state[7] += h;
 }
 
-__device__ inline void SetShaBytes(uint32_t w[16], uint32_t offset, const uint8_t* data, uint32_t size)
-{
-    for (uint32_t i = 0; i < size; ++i) {
-        SetShaByte(w, offset + i, data[i]);
-    }
-}
-
-__device__ inline void SetShaLE32(uint32_t w[16], uint32_t offset, uint32_t value)
-{
-    SetShaByte(w, offset, value & 0xffU);
-    SetShaByte(w, offset + 1U, (value >> 8U) & 0xffU);
-    SetShaByte(w, offset + 2U, (value >> 16U) & 0xffU);
-    SetShaByte(w, offset + 3U, (value >> 24U) & 0xffU);
-}
-
-__device__ inline void SetShaBE64(uint32_t w[16], uint32_t offset, uint64_t value)
-{
-    for (uint32_t i = 0; i < 8U; ++i) {
-        const uint32_t shift = (7U - i) * 8U;
-        SetShaByte(w, offset + i, static_cast<uint8_t>((value >> shift) & 0xffU));
-    }
-}
-
 __device__ inline void Sha256StateToBytes(const uint32_t state[8], uint8_t out[32])
 {
     for (uint32_t i = 0; i < 8U; ++i) {
@@ -933,182 +915,16 @@ __device__ inline void Sha256StateToBytes(const uint32_t state[8], uint8_t out[3
     }
 }
 
-__device__ inline void Sha256SingleBlock32(const uint8_t in[32], uint8_t out[32])
-{
-    uint32_t w[16] = {};
-    SetShaBytes(w, 0U, in, 32U);
-    SetShaByte(w, 32U, 0x80U);
-    w[15] = 32U * 8U;
-
-    uint32_t state[8];
-    Sha256Init(state);
-    Sha256Compress(state, w);
-    Sha256StateToBytes(state, out);
-}
-
-__device__ inline void Sha256dElementWords(const Element* words, uint32_t word_count, uint8_t out[32])
-{
-    uint32_t state[8];
-    Sha256Init(state);
-
-    const uint32_t full_blocks = word_count / 16U;
-    for (uint32_t block = 0; block < full_blocks; ++block) {
-        uint32_t w[16];
-        const Element* block_words = words + static_cast<size_t>(block) * 16U;
-        #pragma unroll
-        for (uint32_t i = 0; i < 16U; ++i) {
-            w[i] = Bswap32(block_words[i]);
-        }
-        Sha256Compress(state, w);
-    }
-
-    const uint32_t rem_words = word_count & 15U;
-    uint32_t tail[16] = {};
-    const Element* tail_words = words + static_cast<size_t>(full_blocks) * 16U;
-    for (uint32_t i = 0; i < rem_words; ++i) {
-        tail[i] = Bswap32(tail_words[i]);
-    }
-
-    const uint32_t rem_bytes = rem_words * 4U;
-    SetShaByte(tail, rem_bytes, 0x80U);
-    const uint64_t bit_length = static_cast<uint64_t>(word_count) * 32U;
-    if (rem_bytes <= 55U) {
-        SetShaBE64(tail, 56U, bit_length);
-        Sha256Compress(state, tail);
-    } else {
-        Sha256Compress(state, tail);
-        uint32_t length_block[16] = {};
-        SetShaBE64(length_block, 56U, bit_length);
-        Sha256Compress(state, length_block);
-    }
-
-    uint8_t first[32];
-    Sha256StateToBytes(state, first);
-    Sha256SingleBlock32(first, out);
-}
-
-__device__ inline void ProductDigestFromCompressedWords(const Element* words,
-                                                       uint32_t word_count,
-                                                       const DeviceSeedBytes& sigma,
-                                                       uint32_t n,
-                                                       uint32_t b,
-                                                       DeviceDigestBytes& out)
-{
-    uint8_t c_prime_hash[32];
-    Sha256dElementWords(words, word_count, c_prime_hash);
-
-    constexpr uint8_t PRODUCT_DIGEST_TAG[24] = {
-        'm', 'a', 't', 'm', 'u', 'l', '-', 'p',
-        'r', 'o', 'd', 'u', 'c', 't', '-', 'd',
-        'i', 'g', 'e', 's', 't', '-', 'v', '3'
-    };
-
-    uint32_t state[8];
-    Sha256Init(state);
-
-    uint32_t block0[16] = {};
-    SetShaBytes(block0, 0U, PRODUCT_DIGEST_TAG, 24U);
-    SetShaBytes(block0, 24U, sigma.data, 32U);
-    SetShaBytes(block0, 56U, c_prime_hash, 8U);
-    Sha256Compress(state, block0);
-
-    uint32_t block1[16] = {};
-    SetShaBytes(block1, 0U, c_prime_hash + 8U, 24U);
-    SetShaLE32(block1, 24U, n);
-    SetShaLE32(block1, 28U, b);
-    SetShaByte(block1, 32U, 0x80U);
-    SetShaBE64(block1, 56U, 96U * 8U);
-    Sha256Compress(state, block1);
-
-    uint8_t first[32];
-    Sha256StateToBytes(state, first);
-    Sha256SingleBlock32(first, out.data);
-}
-
-__device__ inline uint32_t CandidateFromSeedAndIndex(const DeviceSeedBytes& seed,
-                                                     uint32_t index,
-                                                     bool with_retry,
-                                                     uint32_t retry)
-{
-    uint32_t w[16] = {};
-    for (uint32_t i = 0; i < 32; ++i) {
-        SetShaByte(w, i, seed.data[31U - i]);
-    }
-
-    SetShaByte(w, 32U, index & 0xffU);
-    SetShaByte(w, 33U, (index >> 8U) & 0xffU);
-    SetShaByte(w, 34U, (index >> 16U) & 0xffU);
-    SetShaByte(w, 35U, (index >> 24U) & 0xffU);
-
-    uint32_t message_len = 36U;
-    if (with_retry) {
-        SetShaByte(w, 36U, retry & 0xffU);
-        SetShaByte(w, 37U, (retry >> 8U) & 0xffU);
-        SetShaByte(w, 38U, (retry >> 16U) & 0xffU);
-        SetShaByte(w, 39U, (retry >> 24U) & 0xffU);
-        message_len = 40U;
-    }
-
-    SetShaByte(w, message_len, 0x80U);
-    w[15] = message_len * 8U;
-
-    uint32_t state[8];
-    Sha256Init(state);
-    Sha256Compress(state, w);
-    return Bswap32(state[0]) & MODULUS;
-}
-
-__device__ inline uint32_t FallbackCandidate(const DeviceSeedBytes& seed, uint32_t index)
-{
-    uint32_t w[16] = {};
-    for (uint32_t i = 0; i < 32; ++i) {
-        SetShaByte(w, i, seed.data[31U - i]);
-    }
-
-    SetShaByte(w, 32U, index & 0xffU);
-    SetShaByte(w, 33U, (index >> 8U) & 0xffU);
-    SetShaByte(w, 34U, (index >> 16U) & 0xffU);
-    SetShaByte(w, 35U, (index >> 24U) & 0xffU);
-
-    constexpr uint8_t fallback_tag[15] = {
-        'o', 'r', 'a', 'c', 'l', 'e', '-', 'f', 'a', 'l', 'l', 'b', 'a', 'c', 'k'
-    };
-    for (uint32_t i = 0; i < 15; ++i) {
-        SetShaByte(w, 36U + i, fallback_tag[i]);
-    }
-
-    SetShaByte(w, 51U, 0x80U);
-    w[15] = 51U * 8U;
-
-    uint32_t state[8];
-    Sha256Init(state);
-    Sha256Compress(state, w);
-    return Bswap32(state[0]) % MODULUS;
-}
-
-__device__ inline uint32_t FromOracle(const DeviceSeedBytes& seed, uint32_t index)
-{
-    for (uint32_t retry = 0; retry < 256; ++retry) {
-        const uint32_t candidate = retry == 0
-            ? CandidateFromSeedAndIndex(seed, index, false, 0U)
-            : CandidateFromSeedAndIndex(seed, index, true, retry);
-        if (candidate < MODULUS) {
-            return candidate;
-        }
-    }
-    return FallbackCandidate(seed, index);
-}
-
-// --- Seed-midstate matrix generation (2-kernel form) ---
-// Every element of a base matrix hashes seed||index with the SAME 32-byte seed
-// in w[0..7]; SHA-256 rounds 0-7 consume only those words, so the post-round-7
-// state is identical across all 2^18 elements. PrecomputeSeedPairMidstatesKernel
-// computes it once per A/B seed pair (one thread each) into two 16-word records
-// (8 packed seed words + 8 state words); the generation kernels load those as
-// scalars and resume each element's hash at round 8 - 8 of 64 rounds saved per
-// element, with no per-block barrier (which is why a precompute kernel beats a
-// shared-memory hoist here). Byte-identical to FromOracle's retry==0 result;
-// the ~2^-31 retry/fallback case defers to the full FromOracle path.
+// ---------------------------------------------------------------------------
+// Oracle v2 (QTC O5), consensus reference matmul/field.cpp:
+//   preimage  = seed_canonical(32) || LE32(block) [|| LE32(retry) when retry > 0]
+//   lane k    = ReadLE32(SHA256(preimage) + 4k) & MODULUS, rejected (retry++,
+//               SAME lane) when == MODULUS; after 256 retries the fallback
+//               SHA256(seed || LE32(block) || "oracle-fallback") lane % MODULUS.
+//   element i = block i >> 3, lane i & 7.
+// The canonical seed bytes (seed.data() reversed) occupy message words
+// w[0..7]; ReadLE32 of a state word's bytes is Bswap32(state[k]).
+// ---------------------------------------------------------------------------
 
 __device__ inline void PackSeedWords(const DeviceSeedBytes& seed, uint32_t seed_w[8])
 {
@@ -1120,6 +936,80 @@ __device__ inline void PackSeedWords(const DeviceSeedBytes& seed, uint32_t seed_
         SetShaByte(seed_w, i, seed.data[31U - i]);
     }
 }
+
+__device__ inline void OracleBlockState(const uint32_t seed_w[8], uint32_t block, uint32_t retry, uint32_t state[8])
+{
+    uint32_t w[16];
+    #pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+        w[i] = seed_w[i];
+    }
+    #pragma unroll
+    for (uint32_t i = 8; i < 16; ++i) {
+        w[i] = 0U;
+    }
+    SetShaLE32(w, 32U, block);
+    uint32_t message_len = 36U;
+    if (retry > 0) {
+        SetShaLE32(w, 36U, retry);
+        message_len = 40U;
+    }
+    SetShaByte(w, message_len, 0x80U);
+    w[15] = message_len * 8U;
+
+    Sha256Init(state);
+    Sha256Compress(state, w);
+}
+
+__device__ inline Element OracleFallbackLane(const uint32_t seed_w[8], uint32_t block, uint32_t lane)
+{
+    uint32_t w[16];
+    #pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+        w[i] = seed_w[i];
+    }
+    #pragma unroll
+    for (uint32_t i = 8; i < 16; ++i) {
+        w[i] = 0U;
+    }
+    SetShaLE32(w, 32U, block);
+    constexpr uint8_t fallback_tag[15] = {
+        'o', 'r', 'a', 'c', 'l', 'e', '-', 'f', 'a', 'l', 'l', 'b', 'a', 'c', 'k'
+    };
+    for (uint32_t i = 0; i < 15; ++i) {
+        SetShaByte(w, 36U + i, fallback_tag[i]);
+    }
+    SetShaByte(w, 51U, 0x80U);
+    w[15] = 51U * 8U;
+
+    uint32_t state[8];
+    Sha256Init(state);
+    Sha256Compress(state, w);
+    return Bswap32(state[lane]) % MODULUS;
+}
+
+__device__ inline Element OracleLaneWithRetries(const uint32_t seed_w[8], uint32_t block, uint32_t lane, uint32_t first_retry)
+{
+    for (uint32_t retry = first_retry; retry < 256; ++retry) {
+        uint32_t state[8];
+        OracleBlockState(seed_w, block, retry, state);
+        const uint32_t candidate = Bswap32(state[lane]) & MODULUS;
+        if (candidate < MODULUS) {
+            return candidate;
+        }
+    }
+    return OracleFallbackLane(seed_w, block, lane);
+}
+
+// --- Seed-midstate matrix generation ---
+// Every oracle block of a base matrix hashes seed||LE32(block) with the SAME
+// 32-byte seed in w[0..7]; SHA-256 rounds 0-7 consume only those words, so the
+// post-round-7 state is identical across all blocks. PrecomputeSeedPairMidstates
+// computes it once per A/B seed (one thread each) into a 16-word record (8
+// packed seed words + 8 state words); the generation kernel resumes each
+// block's retry-0 hash at round 8. Byte-identical to OracleBlockState(retry=0);
+// the ~2^-31-per-lane rejection defers to the full retry chain, which reads the
+// seed words from the same record.
 
 __device__ inline void WriteSeedMidstate(const DeviceSeedBytes& seed, uint32_t* o)
 {
@@ -1152,9 +1042,8 @@ __global__ void PrecomputeSeedPairMidstatesKernel(const DeviceSeedBytes* seeds_a
     WriteSeedMidstate(seeds_b[i], midstates + static_cast<size_t>(seed_count + i) * 16U);
 }
 
-// retry==0 candidate resuming from a precomputed midstate (loaded as scalars so
-// the window and state stay in registers - no local-memory array parameters).
-__device__ inline uint32_t CandidateFromMidstateScalars(const uint32_t* mb, uint32_t index)
+// Retry-0 oracle block state resuming from a precomputed midstate record.
+__device__ inline void OracleBlockStateFromMidstate(const uint32_t* mb, uint32_t block, uint32_t state[8])
 {
     uint32_t w[16];
     w[0] = mb[0]; w[1] = mb[1]; w[2] = mb[2]; w[3] = mb[3];
@@ -1163,10 +1052,7 @@ __device__ inline uint32_t CandidateFromMidstateScalars(const uint32_t* mb, uint
     for (uint32_t i = 8; i < 16; ++i) {
         w[i] = 0U;
     }
-    SetShaByte(w, 32U, index & 0xffU);
-    SetShaByte(w, 33U, (index >> 8U) & 0xffU);
-    SetShaByte(w, 34U, (index >> 16U) & 0xffU);
-    SetShaByte(w, 35U, (index >> 24U) & 0xffU);
+    SetShaLE32(w, 32U, block);
     SetShaByte(w, 36U, 0x80U);
     w[15] = 36U * 8U;
 
@@ -1185,252 +1071,113 @@ __device__ inline uint32_t CandidateFromMidstateScalars(const uint32_t* mb, uint
         const uint32_t t2 = ShaBSig0(a) + ShaMaj(a, b, c);
         h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
     }
-    return Bswap32(0x6a09e667U + a) & MODULUS;
+    state[0] = 0x6a09e667U + a;
+    state[1] = 0xbb67ae85U + b;
+    state[2] = 0x3c6ef372U + c;
+    state[3] = 0xa54ff53aU + d;
+    state[4] = 0x510e527fU + e;
+    state[5] = 0x9b05688cU + f;
+    state[6] = 0x1f83d9abU + g;
+    state[7] = 0x5be0cd19U + h;
 }
 
-__device__ __forceinline__ Element PerturbedElementFromSeedMidstatePackedPointer(
-    const DeviceSeedBytes& seed,
-    const uint32_t* midstate,
-    const Element* packed_inputs,
-    uint32_t noise_left_offset_words,
-    uint32_t noise_right_offset_words,
-    uint32_t n,
-    uint32_t r,
-    uint32_t row,
-    uint32_t col,
-    uint32_t local_index)
+// Eight consecutive base-matrix elements [8*block, 8*block+8) from a midstate.
+__device__ inline void BaseBlockFromMidstate(const uint32_t* mb, uint32_t block, Element out[ORACLE_LANES])
 {
-    const uint32_t candidate = CandidateFromMidstateScalars(midstate, local_index);
-    const Element base = candidate < MODULUS ? candidate : FromOracle(seed, local_index);
-    const Element* noise_left = packed_inputs + noise_left_offset_words;
-    const Element* noise_right = packed_inputs + noise_right_offset_words;
-
-    uint64_t acc{0};
-    uint32_t pending{0};
-    for (uint32_t k = 0; k < r; ++k) {
-        acc += static_cast<uint64_t>(noise_left[row * r + k]) * noise_right[k * n + col];
-        if (++pending == REDUCE_INTERVAL) {
-            acc = Reduce64(acc);
-            pending = 0;
-        }
+    uint32_t state[8];
+    OracleBlockStateFromMidstate(mb, block, state);
+    #pragma unroll
+    for (uint32_t lane = 0; lane < ORACLE_LANES; ++lane) {
+        const uint32_t candidate = Bswap32(state[lane]) & MODULUS;
+        out[lane] = candidate < MODULUS
+            ? candidate
+            : OracleLaneWithRetries(mb, block, lane, /*first_retry=*/1U);
     }
-
-    return FieldAdd(base, Reduce64(acc));
 }
 
-template <uint32_t MATRIX_N>
-__device__ __forceinline__ Element PerturbedElementFromSeedMidstatePackedPointerRank8(
-    const DeviceSeedBytes& seed,
-    const uint32_t* midstate,
-    const Element* packed_inputs,
-    uint32_t noise_left_offset_words,
-    uint32_t noise_right_offset_words,
-    uint32_t row,
-    uint32_t col,
-    uint32_t local_index)
-{
-    const uint32_t candidate = CandidateFromMidstateScalars(midstate, local_index);
-    const Element base = candidate < MODULUS ? candidate : FromOracle(seed, local_index);
-    const Element* noise_left = packed_inputs + noise_left_offset_words;
-    const Element* noise_right = packed_inputs + noise_right_offset_words;
+// ---------------------------------------------------------------------------
+// Perturbed matrix generation: A' = A + E_L*E_R, B' = B + F_L*F_R.
+// ---------------------------------------------------------------------------
 
-    uint64_t acc =
-        static_cast<uint64_t>(noise_left[row * 8U]) * noise_right[col] +
-        static_cast<uint64_t>(noise_left[row * 8U + 1U]) * noise_right[MATRIX_N + col] +
-        static_cast<uint64_t>(noise_left[row * 8U + 2U]) * noise_right[2U * MATRIX_N + col] +
-        static_cast<uint64_t>(noise_left[row * 8U + 3U]) * noise_right[3U * MATRIX_N + col];
-    acc = Reduce64(acc);
-    acc +=
-        static_cast<uint64_t>(noise_left[row * 8U + 4U]) * noise_right[4U * MATRIX_N + col] +
-        static_cast<uint64_t>(noise_left[row * 8U + 5U]) * noise_right[5U * MATRIX_N + col] +
-        static_cast<uint64_t>(noise_left[row * 8U + 6U]) * noise_right[6U * MATRIX_N + col] +
-        static_cast<uint64_t>(noise_left[row * 8U + 7U]) * noise_right[7U * MATRIX_N + col];
-
-    return FieldAdd(base, Reduce64(acc));
-}
-
-__global__ void GeneratePerturbedMatrixFromSeedMidstatePackedPointersKernel(
-    const DeviceSeedBytes* seeds,
-    const uint32_t* midstates,
-    const Element* const* packed_input_ptrs,
-    uint32_t noise_left_offset_words,
-    uint32_t noise_right_offset_words,
-    uint32_t n,
-    uint32_t r,
-    size_t total_matrix_elements,
-    uint32_t matrix_elements,
-    Element* output_batch)
-{
-    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (gid >= total_matrix_elements) {
-        return;
-    }
-    const uint32_t batch_index = static_cast<uint32_t>(gid / matrix_elements);
-    const uint32_t local_index = static_cast<uint32_t>(gid % matrix_elements);
-    const uint32_t row = local_index / n;
-    const uint32_t col = local_index % n;
-
-    output_batch[gid] = PerturbedElementFromSeedMidstatePackedPointer(
-        seeds[batch_index],
-        midstates + static_cast<size_t>(batch_index) * 16U,
-        packed_input_ptrs[batch_index],
-        noise_left_offset_words,
-        noise_right_offset_words,
-        n,
-        r,
-        row,
-        col,
-        local_index);
-}
-
-__global__ void GeneratePerturbedMatrixPairFromSeedMidstatePackedPointersKernel(
-    const DeviceSeedBytes* seeds_a,
-    const DeviceSeedBytes* seeds_b,
-    const uint32_t* midstates_a,
-    const uint32_t* midstates_b,
-    const Element* const* packed_input_ptrs,
+// Variable-base path: one thread per 8-element oracle block of BOTH matrices.
+// Requires n % 8 == 0 so the eight lanes share one row.
+__global__ void GeneratePerturbedMatrixPairFromSeedMidstateKernel(
+    const uint32_t* __restrict__ midstates_a,
+    const uint32_t* __restrict__ midstates_b,
+    const Element* const* __restrict__ packed_input_ptrs,
     uint32_t noise_e_left_offset_words,
     uint32_t noise_e_right_offset_words,
     uint32_t noise_f_left_offset_words,
     uint32_t noise_f_right_offset_words,
     uint32_t n,
     uint32_t r,
-    size_t total_matrix_elements,
-    uint32_t matrix_elements,
-    Element* output_a_batch,
-    Element* output_b_batch)
+    uint32_t blocks_per_matrix,
+    size_t total_blocks,
+    Element* __restrict__ output_a_batch,
+    Element* __restrict__ output_b_batch)
 {
     const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (gid >= total_matrix_elements) {
+    if (gid >= total_blocks) {
         return;
     }
-    const uint32_t batch_index = static_cast<uint32_t>(gid / matrix_elements);
-    const uint32_t local_index = static_cast<uint32_t>(gid % matrix_elements);
+    const uint32_t batch_index = static_cast<uint32_t>(gid / blocks_per_matrix);
+    const uint32_t block = static_cast<uint32_t>(gid % blocks_per_matrix);
+    const uint32_t index0 = block * ORACLE_LANES;
+    const uint32_t row = index0 / n;
+    const uint32_t col0 = index0 % n;
 
-    const uint32_t candidate_a = CandidateFromMidstateScalars(
-        midstates_a + static_cast<size_t>(batch_index) * 16U,
-        local_index);
-    const uint32_t candidate_b = CandidateFromMidstateScalars(
-        midstates_b + static_cast<size_t>(batch_index) * 16U,
-        local_index);
-    const Element base_a = candidate_a < MODULUS
-        ? candidate_a
-        : FromOracle(seeds_a[batch_index], local_index);
-    const Element base_b = candidate_b < MODULUS
-        ? candidate_b
-        : FromOracle(seeds_b[batch_index], local_index);
+    Element base_a[ORACLE_LANES];
+    Element base_b[ORACLE_LANES];
+    BaseBlockFromMidstate(midstates_a + static_cast<size_t>(batch_index) * 16U, block, base_a);
+    BaseBlockFromMidstate(midstates_b + static_cast<size_t>(batch_index) * 16U, block, base_b);
 
-    const uint32_t row = local_index / n;
-    const uint32_t col = local_index % n;
     const Element* packed_inputs = packed_input_ptrs[batch_index];
     const Element* noise_e_left = packed_inputs + noise_e_left_offset_words;
     const Element* noise_e_right = packed_inputs + noise_e_right_offset_words;
     const Element* noise_f_left = packed_inputs + noise_f_left_offset_words;
     const Element* noise_f_right = packed_inputs + noise_f_right_offset_words;
 
-    uint64_t acc_a{0};
-    uint64_t acc_b{0};
+    uint64_t acc_a[ORACLE_LANES] = {};
+    uint64_t acc_b[ORACLE_LANES] = {};
     uint32_t pending{0};
     for (uint32_t k = 0; k < r; ++k) {
-        acc_a += static_cast<uint64_t>(noise_e_left[row * r + k]) * noise_e_right[k * n + col];
-        acc_b += static_cast<uint64_t>(noise_f_left[row * r + k]) * noise_f_right[k * n + col];
+        const uint64_t el = noise_e_left[row * r + k];
+        const uint64_t fl = noise_f_left[row * r + k];
+        const Element* er = noise_e_right + static_cast<size_t>(k) * n + col0;
+        const Element* fr = noise_f_right + static_cast<size_t>(k) * n + col0;
+        #pragma unroll
+        for (uint32_t lane = 0; lane < ORACLE_LANES; ++lane) {
+            acc_a[lane] += el * er[lane];
+            acc_b[lane] += fl * fr[lane];
+        }
         if (++pending == REDUCE_INTERVAL) {
-            acc_a = Reduce64(acc_a);
-            acc_b = Reduce64(acc_b);
-            pending = 0;
-        }
-    }
-
-    output_a_batch[gid] = FieldAdd(base_a, Reduce64(acc_a));
-    output_b_batch[gid] = FieldAdd(base_b, Reduce64(acc_b));
-}
-
-__device__ __forceinline__ void ReducePartialsInPlace(Element* partials, uint32_t tid)
-{
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-    for (uint32_t stride = blockDim.x / 2; stride > 32; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] = FieldAdd(partials[tid], partials[tid + stride]);
-        }
-        __syncthreads();
-    }
-
-    if (tid < 32) {
-        const uint32_t warp_lanes = blockDim.x < 32 ? blockDim.x : 32U;
-        const uint32_t lane = tid & 31U;
-        Element value = partials[tid];
-
-        if (blockDim.x >= 64) {
-            value = FieldAdd(value, partials[tid + 32]);
-        }
-
-        const unsigned warp_mask = __activemask();
-        for (uint32_t offset = warp_lanes / 2; offset > 0; offset >>= 1) {
-            const Element other = __shfl_down_sync(warp_mask, value, offset);
-            if (lane + offset < warp_lanes) {
-                value = FieldAdd(value, other);
+            #pragma unroll
+            for (uint32_t lane = 0; lane < ORACLE_LANES; ++lane) {
+                acc_a[lane] = Reduce64(acc_a[lane]);
+                acc_b[lane] = Reduce64(acc_b[lane]);
             }
-        }
-
-        if (tid == 0) {
-            partials[0] = value;
-        }
-    }
-#else
-    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] = FieldAdd(partials[tid], partials[tid + stride]);
-        }
-        __syncthreads();
-    }
-#endif
-}
-
-__global__ void BuildPerturbedMatrixKernel(const Element* base_matrix,
-                                           const Element* noise_left_batch,
-                                           const Element* noise_right_batch,
-                                           uint32_t n,
-                                           uint32_t r,
-                                           size_t total_matrix_elements,
-                                           uint32_t matrix_elements,
-                                           uint32_t noise_left_elements,
-                                           uint32_t noise_right_elements,
-                                           Element* output_batch)
-{
-    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (gid >= total_matrix_elements) {
-        return;
-    }
-
-    const uint32_t batch_index = static_cast<uint32_t>(gid / matrix_elements);
-    const uint32_t local_index = static_cast<uint32_t>(gid % matrix_elements);
-    const uint32_t row = local_index / n;
-    const uint32_t col = local_index % n;
-    const Element* noise_left = noise_left_batch + static_cast<size_t>(batch_index) * noise_left_elements;
-    const Element* noise_right = noise_right_batch + static_cast<size_t>(batch_index) * noise_right_elements;
-
-    uint64_t acc{0};
-    uint32_t pending{0};
-    for (uint32_t k = 0; k < r; ++k) {
-        acc += static_cast<uint64_t>(noise_left[row * r + k]) * noise_right[k * n + col];
-        if (++pending == REDUCE_INTERVAL) {
-            acc = Reduce64(acc);
             pending = 0;
         }
     }
 
-    output_batch[gid] = FieldAdd(base_matrix[local_index], Reduce64(acc));
+    const size_t out_offset = static_cast<size_t>(batch_index) * blocks_per_matrix * ORACLE_LANES + index0;
+    #pragma unroll
+    for (uint32_t lane = 0; lane < ORACLE_LANES; ++lane) {
+        output_a_batch[out_offset + lane] = FieldAdd(base_a[lane], Reduce64(acc_a[lane]));
+        output_b_batch[out_offset + lane] = FieldAdd(base_b[lane], Reduce64(acc_b[lane]));
+    }
 }
 
-__global__ void BuildPerturbedMatrixPackedPointersKernel(const Element* base_matrix,
-                                                         const Element* const* packed_input_ptrs,
+// Cached-base path: one thread per element, base matrix shared by the batch.
+__global__ void BuildPerturbedMatrixPackedPointersKernel(const Element* __restrict__ base_matrix,
+                                                         const Element* const* __restrict__ packed_input_ptrs,
                                                          uint32_t noise_left_offset_words,
                                                          uint32_t noise_right_offset_words,
                                                          uint32_t n,
                                                          uint32_t r,
                                                          size_t total_matrix_elements,
                                                          uint32_t matrix_elements,
-                                                         Element* output_batch)
+                                                         Element* __restrict__ output_batch)
 {
     const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (gid >= total_matrix_elements) {
@@ -1458,946 +1205,304 @@ __global__ void BuildPerturbedMatrixPackedPointersKernel(const Element* base_mat
     output_batch[gid] = FieldAdd(base_matrix[local_index], Reduce64(acc));
 }
 
-template <bool PrefixMode>
-__global__ void ComputeCompressedWordsFusedKernel(const Element* __restrict__ matrix_a_batch,
-                                                  const Element* __restrict__ matrix_b_batch,
-                                                  const Element* __restrict__ compress_batch,
-                                                  uint32_t n,
-                                                  uint32_t block_size,
-                                                  uint32_t blocks_per_axis,
-                                                  uint32_t pair_count_per_request,
-                                                  uint32_t words_per_request,
-                                                  uint32_t matrix_elements,
-                                                  uint32_t compress_elements,
-                                                  Element* __restrict__ output)
-{
-    __shared__ Element partials[MAX_BLOCK_THREADS];
+// ---------------------------------------------------------------------------
+// C' = A'B' over GF(2^31-1). Products are < 2^62, so up to four accumulate in a
+// uint64 before Reduce64 (exact modular reduction: the summation order does not
+// affect the field element).
+// ---------------------------------------------------------------------------
 
-    const uint32_t pair_index = blockIdx.x;
-    const uint32_t batch_index = pair_index / pair_count_per_request;
-    const uint32_t local_pair_index = pair_index % pair_count_per_request;
-    const uint32_t j = local_pair_index % blocks_per_axis;
-    const uint32_t i = local_pair_index / blocks_per_axis;
+__global__ __launch_bounds__(GEMM_THREADS)
+void FieldGemmTiledKernel(const Element* __restrict__ a_batch,
+                          const Element* __restrict__ b_batch,
+                          uint32_t n,
+                          uint32_t matrix_elements,
+                          Element* __restrict__ c_batch)
+{
+    __shared__ Element as[GEMM_BM][GEMM_BK + 1U];
+    __shared__ __align__(16) Element bs[GEMM_BK][GEMM_BN];
+
+    const uint32_t batch_index = blockIdx.z;
+    const uint32_t row0 = blockIdx.y * GEMM_BM;
+    const uint32_t col0 = blockIdx.x * GEMM_BN;
+    const Element* A = a_batch + static_cast<size_t>(batch_index) * matrix_elements;
+    const Element* B = b_batch + static_cast<size_t>(batch_index) * matrix_elements;
+    Element* C = c_batch + static_cast<size_t>(batch_index) * matrix_elements;
+
     const uint32_t tid = threadIdx.x;
-    const uint32_t active_threads = block_size * block_size;
-    const Element* matrix_a = matrix_a_batch + static_cast<size_t>(batch_index) * matrix_elements;
-    const Element* matrix_b = matrix_b_batch + static_cast<size_t>(batch_index) * matrix_elements;
-    const Element* compress_vec = compress_batch + static_cast<size_t>(batch_index) * compress_elements;
-    const uint32_t output_offset = batch_index * words_per_request +
-        (PrefixMode ? local_pair_index * blocks_per_axis : local_pair_index);
-    const bool active = tid < active_threads;
-    const uint32_t x = active ? (tid / block_size) : 0;
-    const uint32_t y = active ? (tid % block_size) : 0;
-    const uint32_t row = i * block_size + x;
-    const uint32_t col = j * block_size + y;
-    const size_t row_offset = static_cast<size_t>(row) * n;
-    const Element compress_coeff = active ? compress_vec[tid] : 0;
+    const uint32_t tx = tid & 15U;
+    const uint32_t ty = tid >> 4U;
 
-    Element running_total{0};
-    if constexpr (!PrefixMode) {
-        // PRODUCT_FINAL_BLOCKS emits ONE word per block pair: the compress-
-        // weighted sum over the whole block product. Mod-field arithmetic is
-        // distributive, so fold the full length-n dot product per thread in
-        // registers and reduce across the block exactly once - instead of one
-        // shared-memory tree reduction (plus barriers) per ell iteration.
-        // Same memory-access order, same Reduce64 cadence, identical canonical
-        // mod-M31 output word.
-        if (active) {
-            uint64_t acc{0};
-            uint32_t pending{0};
-            for (uint32_t m = 0; m < n; ++m) {
-                acc += static_cast<uint64_t>(matrix_a[row_offset + m]) *
-                    matrix_b[static_cast<size_t>(m) * n + col];
-                if (++pending == REDUCE_INTERVAL) {
-                    acc = Reduce64(acc);
-                    pending = 0;
-                }
-            }
-            running_total = FieldMul(Reduce64(acc), compress_coeff);
-        }
-        partials[tid] = running_total;
-        __syncthreads();
-
-        ReducePartialsInPlace(partials, tid);
-
-        if (tid == 0) {
-            output[output_offset] = partials[0];
-        }
-        return;
-    }
-
-    for (uint32_t ell = 0; ell < blocks_per_axis; ++ell) {
-        Element partial{0};
-        if (active) {
-            const uint32_t middle_base = ell * block_size;
-
-            uint64_t acc{0};
-            uint32_t pending{0};
-            for (uint32_t k = 0; k < block_size; ++k) {
-                acc += static_cast<uint64_t>(matrix_a[row_offset + (middle_base + k)]) *
-                    matrix_b[static_cast<size_t>(middle_base + k) * n + col];
-                if (++pending == REDUCE_INTERVAL) {
-                    acc = Reduce64(acc);
-                    pending = 0;
-                }
-            }
-
-            partial = FieldMul(Reduce64(acc), compress_coeff);
-        }
-
-        partials[tid] = partial;
-        __syncthreads();
-
-        ReducePartialsInPlace(partials, tid);
-
-        if (tid == 0) {
-            running_total = FieldAdd(running_total, partials[0]);
-            if constexpr (PrefixMode) {
-                output[output_offset + ell] = running_total;
-            }
-        }
-        __syncthreads();
-    }
-
-    if constexpr (!PrefixMode) {
-        if (tid == 0) {
-            output[output_offset] = running_total;
-        }
-    }
-}
-
-template <bool PrefixMode>
-__global__ void ComputeCompressedWordsFusedPackedPointersKernel(
-    const Element* __restrict__ matrix_a_batch,
-    const Element* __restrict__ matrix_b_batch,
-    const Element* const* __restrict__ packed_input_ptrs,
-    uint32_t n,
-    uint32_t block_size,
-    uint32_t blocks_per_axis,
-    uint32_t pair_count_per_request,
-    uint32_t words_per_request,
-    uint32_t matrix_elements,
-    uint32_t compress_offset_words,
-    Element* __restrict__ output)
-{
-    __shared__ Element partials[MAX_BLOCK_THREADS];
-
-    const uint32_t pair_index = blockIdx.x;
-    const uint32_t batch_index = pair_index / pair_count_per_request;
-    const uint32_t local_pair_index = pair_index % pair_count_per_request;
-    const uint32_t j = local_pair_index % blocks_per_axis;
-    const uint32_t i = local_pair_index / blocks_per_axis;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t active_threads = block_size * block_size;
-    const Element* matrix_a = matrix_a_batch + static_cast<size_t>(batch_index) * matrix_elements;
-    const Element* matrix_b = matrix_b_batch + static_cast<size_t>(batch_index) * matrix_elements;
-    const Element* compress_vec = packed_input_ptrs[batch_index] + compress_offset_words;
-    const uint32_t output_offset = batch_index * words_per_request +
-        (PrefixMode ? local_pair_index * blocks_per_axis : local_pair_index);
-    const bool active = tid < active_threads;
-    const uint32_t x = active ? (tid / block_size) : 0;
-    const uint32_t y = active ? (tid % block_size) : 0;
-    const uint32_t row = i * block_size + x;
-    const uint32_t col = j * block_size + y;
-    const size_t row_offset = static_cast<size_t>(row) * n;
-    const Element compress_coeff = active ? compress_vec[tid] : 0;
-
-    Element running_total{0};
-    if constexpr (!PrefixMode) {
-        // PRODUCT_FINAL_BLOCKS emits ONE word per block pair: the compress-
-        // weighted sum over the whole block product. Mod-field arithmetic is
-        // distributive, so fold the full length-n dot product per thread in
-        // registers and reduce across the block exactly once - instead of one
-        // shared-memory tree reduction (plus barriers) per ell iteration.
-        // Same memory-access order, same Reduce64 cadence, identical canonical
-        // mod-M31 output word.
-        if (active) {
-            uint64_t acc{0};
-            uint32_t pending{0};
-            for (uint32_t m = 0; m < n; ++m) {
-                acc += static_cast<uint64_t>(matrix_a[row_offset + m]) *
-                    matrix_b[static_cast<size_t>(m) * n + col];
-                if (++pending == REDUCE_INTERVAL) {
-                    acc = Reduce64(acc);
-                    pending = 0;
-                }
-            }
-            running_total = FieldMul(Reduce64(acc), compress_coeff);
-        }
-        partials[tid] = running_total;
-        __syncthreads();
-
-        ReducePartialsInPlace(partials, tid);
-
-        if (tid == 0) {
-            output[output_offset] = partials[0];
-        }
-        return;
-    }
-
-    for (uint32_t ell = 0; ell < blocks_per_axis; ++ell) {
-        Element partial{0};
-        if (active) {
-            const uint32_t middle_base = ell * block_size;
-
-            uint64_t acc{0};
-            uint32_t pending{0};
-            for (uint32_t k = 0; k < block_size; ++k) {
-                acc += static_cast<uint64_t>(matrix_a[row_offset + (middle_base + k)]) *
-                    matrix_b[static_cast<size_t>(middle_base + k) * n + col];
-                if (++pending == REDUCE_INTERVAL) {
-                    acc = Reduce64(acc);
-                    pending = 0;
-                }
-            }
-
-            partial = FieldMul(Reduce64(acc), compress_coeff);
-        }
-
-        partials[tid] = partial;
-        __syncthreads();
-
-        ReducePartialsInPlace(partials, tid);
-
-        if (tid == 0) {
-            running_total = FieldAdd(running_total, partials[0]);
-            if constexpr (PrefixMode) {
-                output[output_offset + ell] = running_total;
-            }
-        }
-        __syncthreads();
-    }
-
-    if constexpr (!PrefixMode) {
-        if (tid == 0) {
-            output[output_offset] = running_total;
-        }
-    }
-}
-
-// ---- Factored compression (PRODUCT_FINAL_BLOCKS only) ----
-// word(i,j) = sum_{x,y} W[x*bs+y] * (A'B')[i*bs+x][j*bs+y]. The compress
-// weights distribute over the block product (mod-field ring arithmetic is
-// exact, so the reassociation is byte-identical):
-//   D[j][x][m] = sum_y W[x*bs+y] * B'[m][j*bs+y]     (bs * n * bpa words, once)
-//   word(i,j)  = sum_x sum_m A'[i*bs+x][m] * D[j][x][m]
-// cutting per-request MACs from n^3 (full block product) to
-// bs^2*n*bpa + pair_count*bs*n - ~10.6x fewer at n=512, b=16.
-
-__global__ void BuildFactoredRhsKernel(const Element* __restrict__ matrix_b_batch,
-                                       const Element* __restrict__ compress_batch,
-                                       uint32_t n,
-                                       uint32_t block_size,
-                                       size_t total_rhs_elements,
-                                       uint32_t rhs_elements,
-                                       uint32_t matrix_elements,
-                                       uint32_t compress_elements,
-                                       Element* __restrict__ rhs_batch)
-{
-    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (gid >= total_rhs_elements) {
-        return;
-    }
-    const uint32_t batch_index = static_cast<uint32_t>(gid / rhs_elements);
-    const uint32_t local_index = static_cast<uint32_t>(gid % rhs_elements);
-    // Layout [j][x][m], m fastest - keeps the consumer's A' and D reads coalesced.
-    const uint32_t m = local_index % n;
-    const uint32_t jx = local_index / n;
-    const uint32_t x = jx % block_size;
-    const uint32_t j = jx / block_size;
-    const Element* b_row = matrix_b_batch + static_cast<size_t>(batch_index) * matrix_elements +
-        static_cast<size_t>(m) * n + j * block_size;
-    const Element* w_row = compress_batch + static_cast<size_t>(batch_index) * compress_elements +
-        x * block_size;
-    uint64_t acc{0};
+    uint64_t acc[4][4] = {};
     uint32_t pending{0};
-    for (uint32_t y = 0; y < block_size; ++y) {
-        acc += static_cast<uint64_t>(w_row[y]) * b_row[y];
-        if (++pending == REDUCE_INTERVAL) {
-            acc = Reduce64(acc);
-            pending = 0;
-        }
-    }
-    rhs_batch[gid] = Reduce64(acc);
-}
 
-__global__ void BuildFactoredRhsPackedPointersKernel(const Element* __restrict__ matrix_b_batch,
-                                                     const Element* const* __restrict__ packed_input_ptrs,
-                                                     uint32_t compress_offset_words,
-                                                     uint32_t n,
-                                                     uint32_t block_size,
-                                                     size_t total_rhs_elements,
-                                                     uint32_t rhs_elements,
-                                                     uint32_t matrix_elements,
-                                                     Element* __restrict__ rhs_batch)
-{
-    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (gid >= total_rhs_elements) {
-        return;
-    }
-    const uint32_t batch_index = static_cast<uint32_t>(gid / rhs_elements);
-    const uint32_t local_index = static_cast<uint32_t>(gid % rhs_elements);
-    const uint32_t m = local_index % n;
-    const uint32_t jx = local_index / n;
-    const uint32_t x = jx % block_size;
-    const uint32_t j = jx / block_size;
-    const Element* b_row = matrix_b_batch + static_cast<size_t>(batch_index) * matrix_elements +
-        static_cast<size_t>(m) * n + j * block_size;
-    const Element* w_row = packed_input_ptrs[batch_index] + compress_offset_words + x * block_size;
-    uint64_t acc{0};
-    uint32_t pending{0};
-    for (uint32_t y = 0; y < block_size; ++y) {
-        acc += static_cast<uint64_t>(w_row[y]) * b_row[y];
-        if (++pending == REDUCE_INTERVAL) {
-            acc = Reduce64(acc);
-            pending = 0;
-        }
-    }
-    rhs_batch[gid] = Reduce64(acc);
-}
-
-template <uint32_t BLOCK_SIZE>
-__global__ void BuildFactoredRhsFromSeedMidstatePackedPointersKernel(
-    const DeviceSeedBytes* __restrict__ seeds_b,
-    const uint32_t* __restrict__ midstates_b,
-    const Element* const* __restrict__ packed_input_ptrs,
-    uint32_t noise_f_left_offset_words,
-    uint32_t noise_f_right_offset_words,
-    uint32_t compress_offset_words,
-    uint32_t n,
-    uint32_t r,
-    size_t total_jm_elements,
-    uint32_t jm_elements,
-    uint32_t rhs_elements,
-    Element* __restrict__ rhs_batch)
-{
-    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (gid >= total_jm_elements) {
-        return;
-    }
-    const uint32_t batch_index = static_cast<uint32_t>(gid / jm_elements);
-    const uint32_t local_index = static_cast<uint32_t>(gid % jm_elements);
-    const uint32_t m = local_index % n;
-    const uint32_t j = local_index / n;
-    const Element* packed_inputs = packed_input_ptrs[batch_index];
-    const Element* compress_vec = packed_inputs + compress_offset_words;
-    const uint32_t* midstate_b = midstates_b + static_cast<size_t>(batch_index) * 16U;
-
-    uint64_t acc[BLOCK_SIZE] = {};
-    uint32_t pending{0};
-    #pragma unroll
-    for (uint32_t y = 0; y < BLOCK_SIZE; ++y) {
-        const uint32_t col = j * BLOCK_SIZE + y;
-        const uint32_t matrix_index = m * n + col;
-        const Element b_value = PerturbedElementFromSeedMidstatePackedPointer(
-            seeds_b[batch_index],
-            midstate_b,
-            packed_inputs,
-            noise_f_left_offset_words,
-            noise_f_right_offset_words,
-            n,
-            r,
-            m,
-            col,
-            matrix_index);
+    for (uint32_t k0 = 0; k0 < n; k0 += GEMM_BK) {
         #pragma unroll
-        for (uint32_t x = 0; x < BLOCK_SIZE; ++x) {
-            acc[x] += static_cast<uint64_t>(compress_vec[x * BLOCK_SIZE + y]) * b_value;
+        for (uint32_t i = 0; i < 4U; ++i) {
+            const uint32_t idx = tid + i * GEMM_THREADS;
+            const uint32_t r = idx >> 4U;
+            const uint32_t kk = idx & 15U;
+            as[r][kk] = A[static_cast<size_t>(row0 + r) * n + k0 + kk];
         }
-        if (++pending == REDUCE_INTERVAL) {
-            #pragma unroll
-            for (uint32_t x = 0; x < BLOCK_SIZE; ++x) {
-                acc[x] = Reduce64(acc[x]);
-            }
-            pending = 0;
-        }
-    }
-
-    Element* rhs = rhs_batch + static_cast<size_t>(batch_index) * rhs_elements;
-    #pragma unroll
-    for (uint32_t x = 0; x < BLOCK_SIZE; ++x) {
-        rhs[(j * BLOCK_SIZE + x) * n + m] = Reduce64(acc[x]);
-    }
-}
-
-template <uint32_t BLOCK_SIZE, uint32_t MATRIX_N, uint32_t RANK>
-__global__ void BuildRhsLowRankRightTransformPackedPointersKernel(
-    const Element* const* __restrict__ packed_input_ptrs,
-    uint32_t noise_f_right_offset_words,
-    uint32_t compress_offset_words,
-    uint32_t transform_elements,
-    size_t total_transform_elements,
-    Element* __restrict__ transform_batch)
-{
-    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (gid >= total_transform_elements) {
-        return;
-    }
-    const uint32_t batch_index = static_cast<uint32_t>(gid / transform_elements);
-    const uint32_t local_index = static_cast<uint32_t>(gid % transform_elements);
-    const uint32_t k = local_index % RANK;
-    const uint32_t x = (local_index / RANK) % BLOCK_SIZE;
-    const uint32_t j = local_index / (RANK * BLOCK_SIZE);
-    const Element* packed_inputs = packed_input_ptrs[batch_index];
-    const Element* noise_f_right = packed_inputs + noise_f_right_offset_words;
-    const Element* compress_vec = packed_inputs + compress_offset_words;
-
-    uint64_t acc{0};
-    uint32_t pending{0};
-    #pragma unroll
-    for (uint32_t y = 0; y < BLOCK_SIZE; ++y) {
-        const uint32_t col = j * BLOCK_SIZE + y;
-        acc += static_cast<uint64_t>(compress_vec[x * BLOCK_SIZE + y]) *
-            noise_f_right[k * MATRIX_N + col];
-        if (++pending == REDUCE_INTERVAL) {
-            acc = Reduce64(acc);
-            pending = 0;
-        }
-    }
-
-    transform_batch[gid] = Reduce64(acc);
-}
-
-template <uint32_t BLOCK_SIZE, uint32_t MATRIX_N, uint32_t RANK>
-__global__ void BuildFactoredRhsSplitBLowRankFromSeedMidstatePackedPointersKernel(
-    const DeviceSeedBytes* __restrict__ seeds_b,
-    const uint32_t* __restrict__ midstates_b,
-    const Element* const* __restrict__ packed_input_ptrs,
-    const Element* __restrict__ transform_batch,
-    uint32_t noise_f_left_offset_words,
-    uint32_t compress_offset_words,
-    size_t total_jm_elements,
-    uint32_t jm_elements,
-    uint32_t rhs_elements,
-    uint32_t transform_elements,
-    Element* __restrict__ rhs_batch)
-{
-    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (gid >= total_jm_elements) {
-        return;
-    }
-    const uint32_t batch_index = static_cast<uint32_t>(gid / jm_elements);
-    const uint32_t local_index = static_cast<uint32_t>(gid % jm_elements);
-    const uint32_t m = local_index % MATRIX_N;
-    const uint32_t j = local_index / MATRIX_N;
-    const Element* packed_inputs = packed_input_ptrs[batch_index];
-    const Element* noise_f_left = packed_inputs + noise_f_left_offset_words;
-    const Element* compress_vec = packed_inputs + compress_offset_words;
-    const Element* transform = transform_batch + static_cast<size_t>(batch_index) * transform_elements +
-        static_cast<size_t>(j) * BLOCK_SIZE * RANK;
-    const uint32_t* midstate_b = midstates_b + static_cast<size_t>(batch_index) * 16U;
-
-    Element f_left[RANK];
-    #pragma unroll
-    for (uint32_t k = 0; k < RANK; ++k) {
-        f_left[k] = noise_f_left[m * RANK + k];
-    }
-
-    uint64_t base_acc[BLOCK_SIZE] = {};
-    uint32_t pending{0};
-    #pragma unroll
-    for (uint32_t y = 0; y < BLOCK_SIZE; ++y) {
-        const uint32_t col = j * BLOCK_SIZE + y;
-        const uint32_t matrix_index = m * MATRIX_N + col;
-        const uint32_t candidate = CandidateFromMidstateScalars(midstate_b, matrix_index);
-        const Element base_value = candidate < MODULUS
-            ? candidate
-            : FromOracle(seeds_b[batch_index], matrix_index);
         #pragma unroll
-        for (uint32_t x = 0; x < BLOCK_SIZE; ++x) {
-            base_acc[x] += static_cast<uint64_t>(compress_vec[x * BLOCK_SIZE + y]) * base_value;
+        for (uint32_t i = 0; i < 4U; ++i) {
+            const uint32_t idx = tid + i * GEMM_THREADS;
+            const uint32_t kk = idx >> 6U;
+            const uint32_t c = idx & 63U;
+            bs[kk][c] = B[static_cast<size_t>(k0 + kk) * n + col0 + c];
         }
-        if (++pending == REDUCE_INTERVAL) {
-            #pragma unroll
-            for (uint32_t x = 0; x < BLOCK_SIZE; ++x) {
-                base_acc[x] = Reduce64(base_acc[x]);
-            }
-            pending = 0;
-        }
-    }
+        __syncthreads();
 
-    Element* rhs = rhs_batch + static_cast<size_t>(batch_index) * rhs_elements;
-    #pragma unroll
-    for (uint32_t x = 0; x < BLOCK_SIZE; ++x) {
-        uint64_t low_rank_acc{0};
-        uint32_t low_rank_pending{0};
         #pragma unroll
-        for (uint32_t k = 0; k < RANK; ++k) {
-            low_rank_acc += static_cast<uint64_t>(f_left[k]) * transform[x * RANK + k];
-            if (++low_rank_pending == REDUCE_INTERVAL) {
-                low_rank_acc = Reduce64(low_rank_acc);
-                low_rank_pending = 0;
-            }
-        }
-        rhs[(j * BLOCK_SIZE + x) * MATRIX_N + m] =
-            FieldAdd(Reduce64(base_acc[x]), Reduce64(low_rank_acc));
-    }
-}
-
-__global__ void ComputeFactoredWordsKernel(const Element* __restrict__ matrix_a_batch,
-                                           const Element* __restrict__ rhs_batch,
-                                           uint32_t n,
-                                           uint32_t block_size,
-                                           uint32_t blocks_per_axis,
-                                           uint32_t pair_count_per_request,
-                                           uint32_t words_per_request,
-                                           uint32_t matrix_elements,
-                                           uint32_t rhs_elements,
-                                           uint32_t total_tile_count,
-                                           Element* __restrict__ output)
-{
-    // One warp per 2x2 tile of output words (i0..i0+1) x (j0..j0+1): the A rows
-    // feed both j-words and the D rows feed both i-words, so the 2x2 shape
-    // halves L2 traffic vs warp-per-word (4 MACs per 4 loads instead of 1 per 2).
-    // Lanes split the middle dimension m (stride 32; n % 32 == 0 and
-    // blocks_per_axis % 2 == 0 are guarded at dispatch), x loops serially, then
-    // four warp shuffle reductions. No shared memory, no block barriers.
-    const uint32_t lane = threadIdx.x & 31U;
-    const uint32_t tile_index = blockIdx.x * (blockDim.x >> 5U) + (threadIdx.x >> 5U);
-    if (tile_index >= total_tile_count) {
-        return;
-    }
-    const uint32_t tiles_per_axis = blocks_per_axis >> 1U;
-    const uint32_t tiles_per_request = tiles_per_axis * tiles_per_axis;
-    const uint32_t batch_index = tile_index / tiles_per_request;
-    const uint32_t local_tile_index = tile_index % tiles_per_request;
-    const uint32_t j0 = (local_tile_index % tiles_per_axis) * 2U;
-    const uint32_t i0 = (local_tile_index / tiles_per_axis) * 2U;
-    const Element* matrix_a = matrix_a_batch + static_cast<size_t>(batch_index) * matrix_elements;
-    const Element* rhs = rhs_batch + static_cast<size_t>(batch_index) * rhs_elements;
-    uint64_t acc00{0};
-    uint64_t acc01{0};
-    uint64_t acc10{0};
-    uint64_t acc11{0};
-    uint32_t pending{0};
-    for (uint32_t x = 0; x < block_size; ++x) {
-        const Element* a_row0 = matrix_a + static_cast<size_t>(i0 * block_size + x) * n;
-        const Element* a_row1 = a_row0 + static_cast<size_t>(block_size) * n;
-        const Element* d_row0 = rhs + static_cast<size_t>(j0 * block_size + x) * n;
-        const Element* d_row1 = d_row0 + static_cast<size_t>(block_size) * n;
-        for (uint32_t m = lane; m < n; m += 32U) {
-            const uint64_t a0 = a_row0[m];
-            const uint64_t a1 = a_row1[m];
-            const uint64_t d0 = d_row0[m];
-            const uint64_t d1 = d_row1[m];
-            acc00 += a0 * d0;
-            acc01 += a0 * d1;
-            acc10 += a1 * d0;
-            acc11 += a1 * d1;
+        for (uint32_t kk = 0; kk < GEMM_BK; ++kk) {
+            const uint64_t a0 = as[ty * 4U][kk];
+            const uint64_t a1 = as[ty * 4U + 1U][kk];
+            const uint64_t a2 = as[ty * 4U + 2U][kk];
+            const uint64_t a3 = as[ty * 4U + 3U][kk];
+            const uint4 bv = *reinterpret_cast<const uint4*>(&bs[kk][tx * 4U]);
+            const uint64_t b0 = bv.x;
+            const uint64_t b1 = bv.y;
+            const uint64_t b2 = bv.z;
+            const uint64_t b3 = bv.w;
+            acc[0][0] += a0 * b0; acc[0][1] += a0 * b1; acc[0][2] += a0 * b2; acc[0][3] += a0 * b3;
+            acc[1][0] += a1 * b0; acc[1][1] += a1 * b1; acc[1][2] += a1 * b2; acc[1][3] += a1 * b3;
+            acc[2][0] += a2 * b0; acc[2][1] += a2 * b1; acc[2][2] += a2 * b2; acc[2][3] += a2 * b3;
+            acc[3][0] += a3 * b0; acc[3][1] += a3 * b1; acc[3][2] += a3 * b2; acc[3][3] += a3 * b3;
             if (++pending == REDUCE_INTERVAL) {
-                acc00 = Reduce64(acc00);
-                acc01 = Reduce64(acc01);
-                acc10 = Reduce64(acc10);
-                acc11 = Reduce64(acc11);
-                pending = 0;
-            }
-        }
-    }
-    Element value00 = Reduce64(acc00);
-    Element value01 = Reduce64(acc01);
-    Element value10 = Reduce64(acc10);
-    Element value11 = Reduce64(acc11);
-    for (uint32_t offset = 16U; offset > 0U; offset >>= 1U) {
-        value00 = FieldAdd(value00, __shfl_down_sync(0xffffffffU, value00, offset));
-        value01 = FieldAdd(value01, __shfl_down_sync(0xffffffffU, value01, offset));
-        value10 = FieldAdd(value10, __shfl_down_sync(0xffffffffU, value10, offset));
-        value11 = FieldAdd(value11, __shfl_down_sync(0xffffffffU, value11, offset));
-    }
-    if (lane == 0) {
-        const uint32_t base = batch_index * words_per_request;
-        output[base + i0 * blocks_per_axis + j0] = value00;
-        output[base + i0 * blocks_per_axis + j0 + 1U] = value01;
-        output[base + (i0 + 1U) * blocks_per_axis + j0] = value10;
-        output[base + (i0 + 1U) * blocks_per_axis + j0 + 1U] = value11;
-    }
-}
-
-template <uint32_t BLOCK_SIZE, uint32_t MATRIX_N, uint32_t RANK>
-__global__ __launch_bounds__(WORKSPACE_THREADS, 3)
-void ComputeFactoredWordsStreamARowBlockKernel(
-    const DeviceSeedBytes* __restrict__ seeds_a,
-    const uint32_t* __restrict__ midstates_a,
-    const Element* const* __restrict__ packed_input_ptrs,
-    const Element* __restrict__ rhs_batch,
-    uint32_t noise_e_left_offset_words,
-    uint32_t noise_e_right_offset_words,
-    uint32_t rhs_elements,
-    uint32_t words_per_request,
-    Element* __restrict__ output)
-{
-    static_assert(MATRIX_N % BLOCK_SIZE == 0U);
-    constexpr uint32_t BLOCKS_PER_AXIS = MATRIX_N / BLOCK_SIZE;
-    constexpr uint32_t WARPS_PER_BLOCK = WORKSPACE_THREADS / 32U;
-    __shared__ Element a_block[BLOCK_SIZE * MATRIX_N];
-
-    const uint32_t batch_index = blockIdx.x / BLOCKS_PER_AXIS;
-    const uint32_t i = blockIdx.x % BLOCKS_PER_AXIS;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31U;
-    const uint32_t warp = tid >> 5U;
-
-    const DeviceSeedBytes& seed_a = seeds_a[batch_index];
-    const uint32_t* midstate_a = midstates_a + static_cast<size_t>(batch_index) * 16U;
-    const Element* packed_inputs = packed_input_ptrs[batch_index];
-    const Element* rhs = rhs_batch + static_cast<size_t>(batch_index) * rhs_elements;
-
-    for (uint32_t idx = tid; idx < BLOCK_SIZE * MATRIX_N; idx += blockDim.x) {
-        const uint32_t x = idx / MATRIX_N;
-        const uint32_t m = idx % MATRIX_N;
-        const uint32_t row = i * BLOCK_SIZE + x;
-        if constexpr (RANK == 8U) {
-            a_block[idx] = PerturbedElementFromSeedMidstatePackedPointerRank8<MATRIX_N>(
-                seed_a,
-                midstate_a,
-                packed_inputs,
-                noise_e_left_offset_words,
-                noise_e_right_offset_words,
-                row,
-                m,
-                row * MATRIX_N + m);
-        } else {
-            a_block[idx] = PerturbedElementFromSeedMidstatePackedPointer(
-                seed_a,
-                midstate_a,
-                packed_inputs,
-                noise_e_left_offset_words,
-                noise_e_right_offset_words,
-                MATRIX_N,
-                RANK,
-                row,
-                m,
-                row * MATRIX_N + m);
-        }
-    }
-    __syncthreads();
-
-    constexpr uint32_t J_PAIRS = BLOCKS_PER_AXIS / 2U;
-    for (uint32_t j_pair_base = 0; j_pair_base < J_PAIRS; j_pair_base += WARPS_PER_BLOCK) {
-        const uint32_t j_pair = j_pair_base + warp;
-        if (j_pair >= J_PAIRS) {
-            continue;
-        }
-        const uint32_t j0 = j_pair * 2U;
-        const uint32_t j1 = j0 + 1U;
-        uint64_t acc0{0};
-        uint64_t acc1{0};
-        uint32_t pending{0};
-        for (uint32_t idx = lane; idx < BLOCK_SIZE * MATRIX_N; idx += 32U) {
-            const uint32_t x = idx / MATRIX_N;
-            const uint32_t m = idx % MATRIX_N;
-            const Element a = a_block[idx];
-            const Element d0 = rhs[static_cast<size_t>(j0 * BLOCK_SIZE + x) * MATRIX_N + m];
-            const Element d1 = rhs[static_cast<size_t>(j1 * BLOCK_SIZE + x) * MATRIX_N + m];
-            acc0 += static_cast<uint64_t>(a) * d0;
-            acc1 += static_cast<uint64_t>(a) * d1;
-            if (++pending == REDUCE_INTERVAL) {
-                acc0 = Reduce64(acc0);
-                acc1 = Reduce64(acc1);
-                pending = 0;
-            }
-        }
-        Element value0 = Reduce64(acc0);
-        Element value1 = Reduce64(acc1);
-        for (uint32_t offset = 16U; offset > 0U; offset >>= 1U) {
-            value0 = FieldAdd(value0, __shfl_down_sync(0xffffffffU, value0, offset));
-            value1 = FieldAdd(value1, __shfl_down_sync(0xffffffffU, value1, offset));
-        }
-        if (lane == 0) {
-            const uint32_t base = batch_index * words_per_request + i * BLOCKS_PER_AXIS;
-            output[base + j0] = value0;
-            output[base + j1] = value1;
-        }
-    }
-}
-
-template <uint32_t BLOCK_SIZE, uint32_t MATRIX_N, uint32_t RANK>
-__global__ __launch_bounds__(WORKSPACE_THREADS, 1)
-void ComputeFactoredWordsStreamARowPairKernel(
-    const DeviceSeedBytes* __restrict__ seeds_a,
-    const uint32_t* __restrict__ midstates_a,
-    const Element* const* __restrict__ packed_input_ptrs,
-    const Element* __restrict__ rhs_batch,
-    uint32_t noise_e_left_offset_words,
-    uint32_t noise_e_right_offset_words,
-    uint32_t rhs_elements,
-    uint32_t words_per_request,
-    Element* __restrict__ output)
-{
-    static_assert(MATRIX_N % BLOCK_SIZE == 0U);
-    constexpr uint32_t BLOCKS_PER_AXIS = MATRIX_N / BLOCK_SIZE;
-    constexpr uint32_t ROW_PAIRS_PER_REQUEST = BLOCKS_PER_AXIS / 2U;
-    constexpr uint32_t WARPS_PER_BLOCK = WORKSPACE_THREADS / 32U;
-    extern __shared__ Element a_pair[];
-
-    const uint32_t batch_index = blockIdx.x / ROW_PAIRS_PER_REQUEST;
-    const uint32_t i_pair = blockIdx.x % ROW_PAIRS_PER_REQUEST;
-    const uint32_t i0 = i_pair * 2U;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31U;
-    const uint32_t warp = tid >> 5U;
-
-    const DeviceSeedBytes& seed_a = seeds_a[batch_index];
-    const uint32_t* midstate_a = midstates_a + static_cast<size_t>(batch_index) * 16U;
-    const Element* packed_inputs = packed_input_ptrs[batch_index];
-    const Element* rhs = rhs_batch + static_cast<size_t>(batch_index) * rhs_elements;
-
-    for (uint32_t idx = tid; idx < 2U * BLOCK_SIZE * MATRIX_N; idx += blockDim.x) {
-        const uint32_t x = idx / MATRIX_N;
-        const uint32_t m = idx % MATRIX_N;
-        const uint32_t row = i0 * BLOCK_SIZE + x;
-        a_pair[idx] = PerturbedElementFromSeedMidstatePackedPointer(
-            seed_a,
-            midstate_a,
-            packed_inputs,
-            noise_e_left_offset_words,
-            noise_e_right_offset_words,
-            MATRIX_N,
-            RANK,
-            row,
-            m,
-            row * MATRIX_N + m);
-    }
-    __syncthreads();
-
-    constexpr uint32_t J_PAIRS = BLOCKS_PER_AXIS / 2U;
-    for (uint32_t j_pair_base = 0; j_pair_base < J_PAIRS; j_pair_base += WARPS_PER_BLOCK) {
-        const uint32_t j_pair = j_pair_base + warp;
-        if (j_pair >= J_PAIRS) {
-            continue;
-        }
-        const uint32_t j0 = j_pair * 2U;
-        const uint32_t j1 = j0 + 1U;
-        uint64_t acc00{0};
-        uint64_t acc01{0};
-        uint64_t acc10{0};
-        uint64_t acc11{0};
-        uint32_t pending{0};
-        for (uint32_t x = 0; x < BLOCK_SIZE; ++x) {
-            const Element* row0 = a_pair + static_cast<size_t>(x) * MATRIX_N;
-            const Element* row1 = row0 + static_cast<size_t>(BLOCK_SIZE) * MATRIX_N;
-            const Element* d0 = rhs + static_cast<size_t>(j0 * BLOCK_SIZE + x) * MATRIX_N;
-            const Element* d1 = rhs + static_cast<size_t>(j1 * BLOCK_SIZE + x) * MATRIX_N;
-            for (uint32_t m = lane; m < MATRIX_N; m += 32U) {
-                const Element a0 = row0[m];
-                const Element a1 = row1[m];
-                const Element b0 = d0[m];
-                const Element b1 = d1[m];
-                acc00 += static_cast<uint64_t>(a0) * b0;
-                acc01 += static_cast<uint64_t>(a0) * b1;
-                acc10 += static_cast<uint64_t>(a1) * b0;
-                acc11 += static_cast<uint64_t>(a1) * b1;
-                if (++pending == REDUCE_INTERVAL) {
-                    acc00 = Reduce64(acc00);
-                    acc01 = Reduce64(acc01);
-                    acc10 = Reduce64(acc10);
-                    acc11 = Reduce64(acc11);
-                    pending = 0;
-                }
-            }
-        }
-        Element value00 = Reduce64(acc00);
-        Element value01 = Reduce64(acc01);
-        Element value10 = Reduce64(acc10);
-        Element value11 = Reduce64(acc11);
-        for (uint32_t offset = 16U; offset > 0U; offset >>= 1U) {
-            value00 = FieldAdd(value00, __shfl_down_sync(0xffffffffU, value00, offset));
-            value01 = FieldAdd(value01, __shfl_down_sync(0xffffffffU, value01, offset));
-            value10 = FieldAdd(value10, __shfl_down_sync(0xffffffffU, value10, offset));
-            value11 = FieldAdd(value11, __shfl_down_sync(0xffffffffU, value11, offset));
-        }
-        if (lane == 0) {
-            const uint32_t base = batch_index * words_per_request;
-            output[base + i0 * BLOCKS_PER_AXIS + j0] = value00;
-            output[base + i0 * BLOCKS_PER_AXIS + j1] = value01;
-            output[base + (i0 + 1U) * BLOCKS_PER_AXIS + j0] = value10;
-            output[base + (i0 + 1U) * BLOCKS_PER_AXIS + j1] = value11;
-        }
-    }
-}
-
-template <uint32_t BLOCK_SIZE, uint32_t MATRIX_N, uint32_t RANK, uint32_t SLAB_M>
-__global__ __launch_bounds__(SLABBED_RHS_THREADS, 1)
-void ComputeFactoredWordsSplitBLowRankSlabbedKernel(
-    const Element* __restrict__ matrix_a_batch,
-    const DeviceSeedBytes* __restrict__ seeds_b,
-    const uint32_t* __restrict__ midstates_b,
-    const Element* const* __restrict__ packed_input_ptrs,
-    const Element* __restrict__ transform_batch,
-    uint32_t noise_f_left_offset_words,
-    uint32_t compress_offset_words,
-    uint32_t transform_elements,
-    uint32_t matrix_elements,
-    uint32_t words_per_request,
-    Element* __restrict__ output)
-{
-    static_assert(MATRIX_N % BLOCK_SIZE == 0U);
-    static_assert((MATRIX_N / BLOCK_SIZE) % 2U == 0U);
-    static_assert(SLAB_M % 32U == 0U);
-    static_assert(MATRIX_N % SLAB_M == 0U);
-
-    constexpr uint32_t BLOCKS_PER_AXIS = MATRIX_N / BLOCK_SIZE;
-    constexpr uint32_t TILES_PER_AXIS = BLOCKS_PER_AXIS / 2U;
-    __shared__ Element rhs_slab[2U * BLOCK_SIZE * SLAB_M];
-
-    const uint32_t batch_index = blockIdx.x / TILES_PER_AXIS;
-    const uint32_t j_pair = blockIdx.x % TILES_PER_AXIS;
-    const uint32_t j0 = j_pair * 2U;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31U;
-    const uint32_t warp = tid >> 5U;
-    const uint32_t i0 = warp * 2U;
-
-    const Element* matrix_a = matrix_a_batch + static_cast<size_t>(batch_index) * matrix_elements;
-    const Element* packed_inputs = packed_input_ptrs[batch_index];
-    const Element* noise_f_left = packed_inputs + noise_f_left_offset_words;
-    const Element* compress_vec = packed_inputs + compress_offset_words;
-    const uint32_t* midstate_b = midstates_b + static_cast<size_t>(batch_index) * 16U;
-    const Element* transform_pair = transform_batch + static_cast<size_t>(batch_index) * transform_elements +
-        static_cast<size_t>(j0) * BLOCK_SIZE * RANK;
-
-    uint64_t acc00{0};
-    uint64_t acc01{0};
-    uint64_t acc10{0};
-    uint64_t acc11{0};
-    uint32_t pending{0};
-
-    for (uint32_t slab_base = 0; slab_base < MATRIX_N; slab_base += SLAB_M) {
-        if (tid < 2U * SLAB_M) {
-            const uint32_t rel_j = tid / SLAB_M;
-            const uint32_t local_m = tid % SLAB_M;
-            const uint32_t m = slab_base + local_m;
-            const uint32_t j = j0 + rel_j;
-            const Element* transform = transform_pair + static_cast<size_t>(rel_j) * BLOCK_SIZE * RANK;
-
-            Element f_left[RANK];
-            #pragma unroll
-            for (uint32_t k = 0; k < RANK; ++k) {
-                f_left[k] = noise_f_left[m * RANK + k];
-            }
-
-            uint64_t base_acc[BLOCK_SIZE] = {};
-            uint32_t base_pending{0};
-            #pragma unroll
-            for (uint32_t y = 0; y < BLOCK_SIZE; ++y) {
-                const uint32_t col = j * BLOCK_SIZE + y;
-                const uint32_t matrix_index = m * MATRIX_N + col;
-                const uint32_t candidate = CandidateFromMidstateScalars(midstate_b, matrix_index);
-                const Element base_value = candidate < MODULUS
-                    ? candidate
-                    : FromOracle(seeds_b[batch_index], matrix_index);
                 #pragma unroll
-                for (uint32_t x = 0; x < BLOCK_SIZE; ++x) {
-                    base_acc[x] += static_cast<uint64_t>(compress_vec[x * BLOCK_SIZE + y]) * base_value;
-                }
-                if (++base_pending == REDUCE_INTERVAL) {
+                for (uint32_t i = 0; i < 4U; ++i) {
                     #pragma unroll
-                    for (uint32_t x = 0; x < BLOCK_SIZE; ++x) {
-                        base_acc[x] = Reduce64(base_acc[x]);
-                    }
-                    base_pending = 0;
-                }
-            }
-
-            #pragma unroll
-            for (uint32_t x = 0; x < BLOCK_SIZE; ++x) {
-                uint64_t low_rank_acc{0};
-                uint32_t low_rank_pending{0};
-                #pragma unroll
-                for (uint32_t k = 0; k < RANK; ++k) {
-                    low_rank_acc += static_cast<uint64_t>(f_left[k]) * transform[x * RANK + k];
-                    if (++low_rank_pending == REDUCE_INTERVAL) {
-                        low_rank_acc = Reduce64(low_rank_acc);
-                        low_rank_pending = 0;
+                    for (uint32_t j = 0; j < 4U; ++j) {
+                        acc[i][j] = Reduce64(acc[i][j]);
                     }
                 }
-                rhs_slab[(rel_j * BLOCK_SIZE + x) * SLAB_M + local_m] =
-                    FieldAdd(Reduce64(base_acc[x]), Reduce64(low_rank_acc));
+                pending = 0;
             }
         }
         __syncthreads();
+    }
 
+    #pragma unroll
+    for (uint32_t i = 0; i < 4U; ++i) {
+        Element* c_row = C + static_cast<size_t>(row0 + ty * 4U + i) * n + col0 + tx * 4U;
         #pragma unroll
-        for (uint32_t x = 0; x < BLOCK_SIZE; ++x) {
-            const Element* a_row0 = matrix_a + static_cast<size_t>(i0 * BLOCK_SIZE + x) * MATRIX_N;
-            const Element* a_row1 = a_row0 + static_cast<size_t>(BLOCK_SIZE) * MATRIX_N;
-            const Element* d_row0 = rhs_slab + static_cast<size_t>(x) * SLAB_M;
-            const Element* d_row1 = d_row0 + static_cast<size_t>(BLOCK_SIZE) * SLAB_M;
-            for (uint32_t local_m = lane; local_m < SLAB_M; local_m += 32U) {
-                const uint32_t m = slab_base + local_m;
-                const uint64_t a0 = a_row0[m];
-                const uint64_t a1 = a_row1[m];
-                const uint64_t d0 = d_row0[local_m];
-                const uint64_t d1 = d_row1[local_m];
-                acc00 += a0 * d0;
-                acc01 += a0 * d1;
-                acc10 += a1 * d0;
-                acc11 += a1 * d1;
-                if (++pending == REDUCE_INTERVAL) {
-                    acc00 = Reduce64(acc00);
-                    acc01 = Reduce64(acc01);
-                    acc10 = Reduce64(acc10);
-                    acc11 = Reduce64(acc11);
-                    pending = 0;
-                }
-            }
+        for (uint32_t j = 0; j < 4U; ++j) {
+            c_row[j] = Reduce64(acc[i][j]);
         }
-        __syncthreads();
-    }
-
-    Element value00 = Reduce64(acc00);
-    Element value01 = Reduce64(acc01);
-    Element value10 = Reduce64(acc10);
-    Element value11 = Reduce64(acc11);
-    for (uint32_t offset = 16U; offset > 0U; offset >>= 1U) {
-        value00 = FieldAdd(value00, __shfl_down_sync(0xffffffffU, value00, offset));
-        value01 = FieldAdd(value01, __shfl_down_sync(0xffffffffU, value01, offset));
-        value10 = FieldAdd(value10, __shfl_down_sync(0xffffffffU, value10, offset));
-        value11 = FieldAdd(value11, __shfl_down_sync(0xffffffffU, value11, offset));
-    }
-    if (lane == 0) {
-        const uint32_t base = batch_index * words_per_request;
-        output[base + i0 * BLOCKS_PER_AXIS + j0] = value00;
-        output[base + i0 * BLOCKS_PER_AXIS + j0 + 1U] = value01;
-        output[base + (i0 + 1U) * BLOCKS_PER_AXIS + j0] = value10;
-        output[base + (i0 + 1U) * BLOCKS_PER_AXIS + j0 + 1U] = value11;
     }
 }
 
-__global__ void ComputeProductDigestsKernel(const Element* __restrict__ words,
-                                            const DeviceSeedBytes* __restrict__ sigmas,
-                                            uint32_t words_per_request,
-                                            uint32_t batch_size,
-                                            uint32_t n,
-                                            uint32_t b,
-                                            DeviceDigestBytes* __restrict__ digests)
+// Generic fallback for shapes not divisible by the 64-wide tile (small n).
+__global__ void FieldGemmSimpleKernel(const Element* __restrict__ a_batch,
+                                      const Element* __restrict__ b_batch,
+                                      uint32_t n,
+                                      uint32_t matrix_elements,
+                                      size_t total_elements,
+                                      Element* __restrict__ c_batch)
+{
+    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gid >= total_elements) {
+        return;
+    }
+    const uint32_t batch_index = static_cast<uint32_t>(gid / matrix_elements);
+    const uint32_t local_index = static_cast<uint32_t>(gid % matrix_elements);
+    const uint32_t row = local_index / n;
+    const uint32_t col = local_index % n;
+    const Element* A = a_batch + static_cast<size_t>(batch_index) * matrix_elements + static_cast<size_t>(row) * n;
+    const Element* B = b_batch + static_cast<size_t>(batch_index) * matrix_elements + col;
+
+    uint64_t acc{0};
+    uint32_t pending{0};
+    for (uint32_t k = 0; k < n; ++k) {
+        acc += static_cast<uint64_t>(A[k]) * B[static_cast<size_t>(k) * n];
+        if (++pending == REDUCE_INTERVAL) {
+            acc = Reduce64(acc);
+            pending = 0;
+        }
+    }
+    c_batch[gid] = Reduce64(acc);
+}
+
+// ---------------------------------------------------------------------------
+// Tile hashing (transcript::HashProductTile): one thread per b x b tile,
+// single SHA-256 over the tile's b*b elements as LE32 bytes in row-major order.
+// ---------------------------------------------------------------------------
+
+__global__ void HashProductTilesKernel(const Element* __restrict__ c_batch,
+                                       uint32_t n,
+                                       uint32_t b,
+                                       uint32_t blocks_per_axis,
+                                       uint32_t tiles_per_request,
+                                       uint32_t matrix_elements,
+                                       uint32_t total_tiles,
+                                       DeviceDigestBytes* __restrict__ out)
+{
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= total_tiles) {
+        return;
+    }
+    const uint32_t batch_index = gid / tiles_per_request;
+    const uint32_t local_tile = gid % tiles_per_request;
+    const uint32_t ti = local_tile / blocks_per_axis;
+    const uint32_t tj = local_tile % blocks_per_axis;
+    const Element* tile = c_batch + static_cast<size_t>(batch_index) * matrix_elements +
+        static_cast<size_t>(ti) * b * n + static_cast<size_t>(tj) * b;
+
+    uint32_t state[8];
+    Sha256Init(state);
+    uint32_t w[16];
+    uint32_t wi = 0;
+    for (uint32_t x = 0; x < b; ++x) {
+        const Element* row = tile + static_cast<size_t>(x) * n;
+        for (uint32_t y = 0; y < b; ++y) {
+            // LE32 element bytes read as a big-endian SHA word.
+            w[wi++] = Bswap32(row[y]);
+            if (wi == 16U) {
+                Sha256Compress(state, w);
+                wi = 0;
+            }
+        }
+    }
+
+    const uint64_t bit_length = static_cast<uint64_t>(b) * b * 32U;
+    w[wi] = 0x80000000U;
+    for (uint32_t i = wi + 1U; i < 16U; ++i) {
+        w[i] = 0U;
+    }
+    if (wi <= 13U) {
+        w[14] = static_cast<uint32_t>(bit_length >> 32U);
+        w[15] = static_cast<uint32_t>(bit_length);
+        Sha256Compress(state, w);
+    } else {
+        Sha256Compress(state, w);
+        #pragma unroll
+        for (uint32_t i = 0; i < 16U; ++i) {
+            w[i] = 0U;
+        }
+        w[14] = static_cast<uint32_t>(bit_length >> 32U);
+        w[15] = static_cast<uint32_t>(bit_length);
+        Sha256Compress(state, w);
+    }
+    Sha256StateToBytes(state, out[gid].data);
+}
+
+__device__ inline void SetShaBytes(uint32_t w[16], uint32_t offset, const uint8_t* data, uint32_t size)
+{
+    for (uint32_t i = 0; i < size; ++i) {
+        SetShaByte(w, offset + i, data[i]);
+    }
+}
+
+__device__ inline void Sha256SingleBlock32(const uint8_t in[32], uint8_t out[32])
+{
+    uint32_t w[16] = {};
+    SetShaBytes(w, 0U, in, 32U);
+    SetShaByte(w, 32U, 0x80U);
+    w[15] = 32U * 8U;
+
+    uint32_t state[8];
+    Sha256Init(state);
+    Sha256Compress(state, w);
+    Sha256StateToBytes(state, out);
+}
+
+// ---------------------------------------------------------------------------
+// Digest finish on the device (transcript::HashProductTileHashes +
+// FinalizeProductCommittedDigestFromHash): one thread per request.
+//   root   = SHA256(tile_hash[0] || ... || tile_hash[N^2-1])   (row-major)
+//   digest = SHA256d("matmul-product-digest-v4" || sigma || root || LE32(n) || LE32(b))
+// Only the 32-byte digest travels back to the host.
+// ---------------------------------------------------------------------------
+
+__global__ void FinalizeProductDigestsKernel(const DeviceDigestBytes* __restrict__ tile_hashes,
+                                             const DeviceSeedBytes* __restrict__ sigmas,
+                                             uint32_t tiles_per_request,
+                                             uint32_t batch_size,
+                                             uint32_t n,
+                                             uint32_t b,
+                                             DeviceDigestBytes* __restrict__ digests)
 {
     const uint32_t batch_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (batch_index >= batch_size) {
         return;
     }
 
-    ProductDigestFromCompressedWords(
-        words + static_cast<size_t>(batch_index) * words_per_request,
-        words_per_request,
-        sigmas[batch_index],
-        n,
-        b,
-        digests[batch_index]);
+    uint32_t state[8];
+    Sha256Init(state);
+    uint32_t w[16];
+    uint32_t wi = 0;
+    const DeviceDigestBytes* tiles = tile_hashes + static_cast<size_t>(batch_index) * tiles_per_request;
+    for (uint32_t t = 0; t < tiles_per_request; ++t) {
+        const uint4* words = reinterpret_cast<const uint4*>(tiles[t].data);
+        const uint4 lo = words[0];
+        const uint4 hi = words[1];
+        // Raw digest bytes read little-endian; SHA words are big-endian.
+        w[wi++] = Bswap32(lo.x);
+        w[wi++] = Bswap32(lo.y);
+        w[wi++] = Bswap32(lo.z);
+        w[wi++] = Bswap32(lo.w);
+        w[wi++] = Bswap32(hi.x);
+        w[wi++] = Bswap32(hi.y);
+        w[wi++] = Bswap32(hi.z);
+        w[wi++] = Bswap32(hi.w);
+        if (wi == 16U) {
+            Sha256Compress(state, w);
+            wi = 0;
+        }
+    }
+    const uint64_t bit_length = static_cast<uint64_t>(tiles_per_request) * 32U * 8U;
+    w[wi] = 0x80000000U;
+    for (uint32_t i = wi + 1U; i < 16U; ++i) {
+        w[i] = 0U;
+    }
+    if (wi <= 13U) {
+        w[14] = static_cast<uint32_t>(bit_length >> 32U);
+        w[15] = static_cast<uint32_t>(bit_length);
+        Sha256Compress(state, w);
+    } else {
+        Sha256Compress(state, w);
+        #pragma unroll
+        for (uint32_t i = 0; i < 16U; ++i) {
+            w[i] = 0U;
+        }
+        w[14] = static_cast<uint32_t>(bit_length >> 32U);
+        w[15] = static_cast<uint32_t>(bit_length);
+        Sha256Compress(state, w);
+    }
+    uint8_t root[32];
+    Sha256StateToBytes(state, root);
+
+    constexpr uint8_t PRODUCT_DIGEST_TAG_V4[24] = {
+        'm', 'a', 't', 'm', 'u', 'l', '-', 'p',
+        'r', 'o', 'd', 'u', 'c', 't', '-', 'd',
+        'i', 'g', 'e', 's', 't', '-', 'v', '4'
+    };
+    Sha256Init(state);
+    uint32_t block0[16] = {};
+    SetShaBytes(block0, 0U, PRODUCT_DIGEST_TAG_V4, 24U);
+    SetShaBytes(block0, 24U, sigmas[batch_index].data, 32U);
+    SetShaBytes(block0, 56U, root, 8U);
+    Sha256Compress(state, block0);
+
+    uint32_t block1[16] = {};
+    SetShaBytes(block1, 0U, root + 8U, 24U);
+    SetShaLE32(block1, 24U, n);
+    SetShaLE32(block1, 28U, b);
+    SetShaByte(block1, 32U, 0x80U);
+    block1[15] = 96U * 8U;
+    Sha256Compress(state, block1);
+
+    uint8_t inner[32];
+    Sha256StateToBytes(state, inner);
+    Sha256SingleBlock32(inner, digests[batch_index].data);
 }
+
+// ---------------------------------------------------------------------------
+// Host plumbing
+// ---------------------------------------------------------------------------
 
 std::string CudaErrorString(cudaError_t error)
 {
     return cudaGetErrorString(error);
-}
-
-uint32_t ResolveThreadCount(uint32_t block_size)
-{
-    uint32_t threads{1};
-    const uint32_t required = std::min<uint32_t>(block_size * block_size, MAX_BLOCK_THREADS);
-    while (threads < required) {
-        threads <<= 1;
-    }
-    return std::min<uint32_t>(threads, MAX_BLOCK_THREADS);
 }
 
 void ResetWorkspaceForDevice(DigestWorkspace& workspace, int device_index)
@@ -2507,114 +1612,82 @@ bool EnsureCachedBaseMatrices(DigestWorkspace& workspace,
     return true;
 }
 
-bool ValidateBatchRequest(const MatMulCompressedWordsBatchRequest& request, std::string& error)
+bool ValidateShape(uint32_t n, uint32_t b, uint32_t batch_size, std::string& error)
 {
-    if (request.batch_size == 0) {
+    if (batch_size == 0) {
         error = "CUDA digest batch request requires at least one entry";
         return false;
     }
-    if (request.n == 0 || request.b == 0) {
+    if (n == 0 || b == 0) {
         error = "matrix dimension and transcript block size must be non-zero";
         return false;
     }
-    if ((request.n % request.b) != 0) {
+    if ((n % b) != 0) {
         error = "matrix dimension must be divisible by transcript block size";
         return false;
     }
-    if (request.matrix_a_perturbed == nullptr || request.matrix_b_perturbed == nullptr || request.compress_vec == nullptr) {
-        error = "CUDA digest batch request requires perturbed matrices and compression vectors";
+    if ((n % ORACLE_LANES) != 0) {
+        error = "matrix dimension must be a multiple of the 8-lane oracle block";
         return false;
     }
-    if (request.b * request.b > MAX_BLOCK_THREADS) {
-        error = "CUDA digest request block size exceeds supported thread budget";
+    if (b > MAX_SUPPORTED_BLOCK_SIZE) {
+        error = "CUDA digest request block size exceeds supported tile size";
         return false;
     }
-    for (uint32_t i = 0; i < request.batch_size; ++i) {
-        if (request.matrix_a_perturbed[i] == nullptr ||
-            request.matrix_b_perturbed[i] == nullptr ||
-            request.compress_vec[i] == nullptr) {
-            error = "CUDA digest batch request contains null matrix or compression-vector pointers";
+    if (n > 4096U) {
+        error = "CUDA digest request dimension exceeds supported bounds";
+        return false;
+    }
+    if (batch_size > 65535U) {
+        error = "CUDA digest batch size exceeds supported bounds";
+        return false;
+    }
+    return true;
+}
+
+bool ValidateRank(uint32_t n, uint32_t r, std::string& error)
+{
+    if (r == 0) {
+        error = "noise rank must be non-zero";
+        return false;
+    }
+    if (r > n) {
+        error = "noise rank exceeds matrix dimension";
+        return false;
+    }
+    return true;
+}
+
+bool ValidateHostNoisePointers(const Element* const* e_l,
+                               const Element* const* e_r,
+                               const Element* const* f_l,
+                               const Element* const* f_r,
+                               uint32_t batch_size,
+                               std::string& error)
+{
+    if (e_l == nullptr || e_r == nullptr || f_l == nullptr || f_r == nullptr) {
+        error = "CUDA digest batch request requires all four noise factor arrays";
+        return false;
+    }
+    for (uint32_t i = 0; i < batch_size; ++i) {
+        if (e_l[i] == nullptr || e_r[i] == nullptr || f_l[i] == nullptr || f_r[i] == nullptr) {
+            error = "CUDA digest batch request contains null noise pointers";
             return false;
         }
     }
     return true;
 }
 
-bool ValidateLowRankBatchRequest(const MatMulLowRankCompressedWordsBatchRequest& request, std::string& error)
+bool ValidateGeneratedInputs(const MatMulGeneratedInputsDevice* const* generated_inputs,
+                             uint32_t batch_size,
+                             std::string& error)
 {
-    if (request.batch_size == 0) {
-        error = "CUDA digest batch request requires at least one entry";
+    if (generated_inputs == nullptr) {
+        error = "CUDA digest batch request requires device-generated inputs";
         return false;
     }
-    if (request.n == 0 || request.b == 0 || request.r == 0) {
-        error = "matrix dimension, transcript block size, and noise rank must be non-zero";
-        return false;
-    }
-    if (request.r > request.n) {
-        error = "noise rank exceeds matrix dimension";
-        return false;
-    }
-    if ((request.n % request.b) != 0) {
-        error = "matrix dimension must be divisible by transcript block size";
-        return false;
-    }
-    if (request.b * request.b > MAX_BLOCK_THREADS) {
-        error = "CUDA digest request block size exceeds supported thread budget";
-        return false;
-    }
-    if (request.matrix_a == nullptr ||
-        request.matrix_b == nullptr ||
-        request.noise_e_l == nullptr ||
-        request.noise_e_r == nullptr ||
-        request.noise_f_l == nullptr ||
-        request.noise_f_r == nullptr ||
-        request.compress_vec == nullptr) {
-        error = "CUDA digest batch request requires base matrices, noise factors, and compression vectors";
-        return false;
-    }
-    for (uint32_t i = 0; i < request.batch_size; ++i) {
-        if (request.noise_e_l[i] == nullptr ||
-            request.noise_e_r[i] == nullptr ||
-            request.noise_f_l[i] == nullptr ||
-            request.noise_f_r[i] == nullptr ||
-            request.compress_vec[i] == nullptr) {
-            error = "CUDA digest batch request contains null noise or compression-vector pointers";
-            return false;
-        }
-    }
-    return true;
-}
-
-bool ValidateLowRankDeviceBatchRequest(const MatMulLowRankCompressedWordsDeviceBatchRequest& request, std::string& error)
-{
-    if (request.batch_size == 0) {
-        error = "CUDA digest batch request requires at least one entry";
-        return false;
-    }
-    if (request.n == 0 || request.b == 0 || request.r == 0) {
-        error = "matrix dimension, transcript block size, and noise rank must be non-zero";
-        return false;
-    }
-    if (request.r > request.n) {
-        error = "noise rank exceeds matrix dimension";
-        return false;
-    }
-    if ((request.n % request.b) != 0) {
-        error = "matrix dimension must be divisible by transcript block size";
-        return false;
-    }
-    if (request.b * request.b > MAX_BLOCK_THREADS) {
-        error = "CUDA digest request block size exceeds supported thread budget";
-        return false;
-    }
-    if (request.matrix_a == nullptr ||
-        request.matrix_b == nullptr ||
-        request.generated_inputs == nullptr) {
-        error = "CUDA digest batch request requires base matrices and device-generated inputs";
-        return false;
-    }
-    for (uint32_t i = 0; i < request.batch_size; ++i) {
-        if (request.generated_inputs[i] == nullptr) {
+    for (uint32_t i = 0; i < batch_size; ++i) {
+        if (generated_inputs[i] == nullptr) {
             error = "CUDA digest batch request contains null device-generated input handles";
             return false;
         }
@@ -2622,640 +1695,646 @@ bool ValidateLowRankDeviceBatchRequest(const MatMulLowRankCompressedWordsDeviceB
     return true;
 }
 
-bool ValidateLowRankVariableBaseDeviceBatchRequest(const MatMulLowRankVariableBaseDeviceBatchRequest& request, std::string& error)
+bool ValidateProductTileHashBatchRequest(const MatMulProductTileHashBatchRequest& request, std::string& error)
 {
-    if (request.batch_size == 0) {
-        error = "CUDA variable-base digest batch request requires at least one entry";
+    if (!ValidateShape(request.n, request.b, request.batch_size, error)) {
         return false;
     }
-    if (request.n == 0 || request.b == 0 || request.r == 0) {
-        error = "matrix dimension, transcript block size, and noise rank must be non-zero";
-        return false;
-    }
-    if (request.r > request.n) {
-        error = "noise rank exceeds matrix dimension";
-        return false;
-    }
-    if ((request.n % request.b) != 0) {
-        error = "matrix dimension must be divisible by transcript block size";
-        return false;
-    }
-    if (request.b * request.b > MAX_BLOCK_THREADS) {
-        error = "CUDA digest request block size exceeds supported thread budget";
-        return false;
-    }
-    if (request.matrix_a_seeds == nullptr ||
-        request.matrix_b_seeds == nullptr ||
-        request.generated_inputs == nullptr) {
-        error = "CUDA variable-base digest batch request requires matrix seeds and device-generated inputs";
+    if (request.matrix_a_perturbed == nullptr || request.matrix_b_perturbed == nullptr) {
+        error = "CUDA digest batch request requires perturbed matrices";
         return false;
     }
     for (uint32_t i = 0; i < request.batch_size; ++i) {
-        if (request.generated_inputs[i] == nullptr) {
-            error = "CUDA variable-base digest batch request contains null device-generated input handles";
+        if (request.matrix_a_perturbed[i] == nullptr || request.matrix_b_perturbed[i] == nullptr) {
+            error = "CUDA digest batch request contains null matrix pointers";
             return false;
         }
     }
     return true;
 }
 
-bool ValidateLowRankVariableBaseProductDigestDeviceBatchRequest(
-    const MatMulLowRankVariableBaseProductDigestDeviceBatchRequest& request,
-    std::string& error)
+bool ValidateLowRankBatchRequest(const MatMulLowRankProductBatchRequest& request, std::string& error)
 {
-    if (request.batch_size == 0) {
-        error = "CUDA variable-base product digest batch request requires at least one entry";
+    if (!ValidateShape(request.n, request.b, request.batch_size, error) ||
+        !ValidateRank(request.n, request.r, error)) {
         return false;
     }
-    if (request.n == 0 || request.b == 0 || request.r == 0) {
-        error = "matrix dimension, transcript block size, and noise rank must be non-zero";
+    if (request.matrix_a == nullptr || request.matrix_b == nullptr) {
+        error = "CUDA digest batch request requires base matrices";
         return false;
     }
-    if (request.r > request.n) {
-        error = "noise rank exceeds matrix dimension";
+    return ValidateHostNoisePointers(
+        request.noise_e_l, request.noise_e_r, request.noise_f_l, request.noise_f_r, request.batch_size, error);
+}
+
+bool ValidateLowRankDeviceBatchRequest(const MatMulLowRankProductDeviceBatchRequest& request, std::string& error)
+{
+    if (!ValidateShape(request.n, request.b, request.batch_size, error) ||
+        !ValidateRank(request.n, request.r, error)) {
         return false;
     }
-    if ((request.n % request.b) != 0) {
-        error = "matrix dimension must be divisible by transcript block size";
+    if (request.matrix_a == nullptr || request.matrix_b == nullptr) {
+        error = "CUDA digest batch request requires base matrices";
         return false;
     }
-    if (request.b * request.b > MAX_BLOCK_THREADS) {
-        error = "CUDA digest request block size exceeds supported thread budget";
+    return ValidateGeneratedInputs(request.generated_inputs, request.batch_size, error);
+}
+
+bool VariableBaseRequestUsesDeviceInputs(const MatMulLowRankVariableBaseProductBatchRequest& request)
+{
+    return request.generated_inputs != nullptr;
+}
+
+bool ValidateLowRankVariableBaseBatchRequest(const MatMulLowRankVariableBaseProductBatchRequest& request,
+                                             std::string& error)
+{
+    if (!ValidateShape(request.n, request.b, request.batch_size, error) ||
+        !ValidateRank(request.n, request.r, error)) {
         return false;
     }
-    if (request.matrix_a_seeds == nullptr ||
-        request.matrix_b_seeds == nullptr ||
-        request.sigmas == nullptr ||
-        request.generated_inputs == nullptr) {
-        error = "CUDA variable-base product digest batch request requires matrix seeds, sigmas, and device-generated inputs";
+    if (request.matrix_a_seeds == nullptr || request.matrix_b_seeds == nullptr) {
+        error = "CUDA variable-base digest batch request requires matrix seeds";
         return false;
     }
-    for (uint32_t i = 0; i < request.batch_size; ++i) {
-        if (request.generated_inputs[i] == nullptr) {
-            error = "CUDA variable-base product digest batch request contains null device-generated input handles";
-            return false;
-        }
+    if (VariableBaseRequestUsesDeviceInputs(request)) {
+        return ValidateGeneratedInputs(request.generated_inputs, request.batch_size, error);
+    }
+    return ValidateHostNoisePointers(
+        request.noise_e_l, request.noise_e_r, request.noise_f_l, request.noise_f_r, request.batch_size, error);
+}
+
+struct NoiseLayout {
+    uint32_t noise_left_elements{0};
+    uint32_t noise_right_elements{0};
+    uint32_t e_l_offset{0};
+    uint32_t e_r_offset{0};
+    uint32_t f_l_offset{0};
+    uint32_t f_r_offset{0};
+    uint32_t packed_words{0};
+};
+
+NoiseLayout MakeNoiseLayout(uint32_t n, uint32_t r)
+{
+    NoiseLayout layout;
+    layout.noise_left_elements = n * r;
+    layout.noise_right_elements = r * n;
+    layout.e_l_offset = 0;
+    layout.e_r_offset = layout.e_l_offset + layout.noise_left_elements;
+    layout.f_l_offset = layout.e_r_offset + layout.noise_right_elements;
+    layout.f_r_offset = layout.f_l_offset + layout.noise_left_elements;
+    layout.packed_words = layout.f_r_offset + layout.noise_right_elements;
+    return layout;
+}
+
+// Stage host noise pointers into a per-request packed device buffer and build
+// the device pointer table so every downstream kernel sees the same
+// [E_L | E_R | F_L | F_R] layout as device-generated inputs.
+bool StageHostNoise(DigestWorkspace& workspace,
+                    const NoiseLayout& layout,
+                    uint32_t batch_size,
+                    const Element* const* noise_e_l,
+                    const Element* const* noise_e_r,
+                    const Element* const* noise_f_l,
+                    const Element* const* noise_f_r,
+                    DigestProfilingSample& sample,
+                    std::string& error,
+                    bool& allocated_buffers)
+{
+    const size_t total_packed = static_cast<size_t>(batch_size) * layout.packed_words;
+    if (!EnsureDeviceBuffer(workspace.device_packed_noise, workspace.packed_noise_capacity, total_packed, error, allocated_buffers) ||
+        !EnsureDeviceBuffer(workspace.device_prepared_input_ptrs, workspace.prepared_input_ptr_capacity, batch_size, error, allocated_buffers)) {
+        return false;
+    }
+    std::string staging_warning;
+    if (!workspace.host_packed_noise.Ensure(total_packed, staging_warning)) {
+        error = staging_warning;
+        return false;
+    }
+    sample.used_pinned_host_staging = sample.used_pinned_host_staging && workspace.host_packed_noise.pinned != nullptr;
+
+    if (!workspace.host_pointer_table.Ensure(batch_size, staging_warning)) {
+        error = staging_warning;
+        return false;
+    }
+    const auto host_stage_start = SteadyClock::now();
+    const Element** pointer_table = workspace.host_pointer_table.data();
+    Element* host = workspace.host_packed_noise.data();
+    for (uint32_t i = 0; i < batch_size; ++i) {
+        Element* dst = host + static_cast<size_t>(i) * layout.packed_words;
+        std::memcpy(dst + layout.e_l_offset, noise_e_l[i], layout.noise_left_elements * sizeof(Element));
+        std::memcpy(dst + layout.e_r_offset, noise_e_r[i], layout.noise_right_elements * sizeof(Element));
+        std::memcpy(dst + layout.f_l_offset, noise_f_l[i], layout.noise_left_elements * sizeof(Element));
+        std::memcpy(dst + layout.f_r_offset, noise_f_r[i], layout.noise_right_elements * sizeof(Element));
+        pointer_table[i] = workspace.device_packed_noise + static_cast<size_t>(i) * layout.packed_words;
+    }
+    sample.host_stage_us += DurationMicros(host_stage_start, SteadyClock::now());
+
+    const auto h2d_start = SteadyClock::now();
+    cudaError_t copy_error = cudaMemcpyAsync(workspace.device_packed_noise,
+                                             host,
+                                             total_packed * sizeof(Element),
+                                             cudaMemcpyHostToDevice,
+                                             workspace.stream);
+    if (copy_error == cudaSuccess) {
+        copy_error = cudaMemcpyAsync(workspace.device_prepared_input_ptrs,
+                                     pointer_table,
+                                     batch_size * sizeof(const Element*),
+                                     cudaMemcpyHostToDevice,
+                                     workspace.stream);
+    }
+    sample.submit_h2d_us += DurationMicros(h2d_start, SteadyClock::now());
+    if (copy_error != cudaSuccess) {
+        error = "cudaMemcpy host noise failed:" + CudaErrorString(copy_error);
+        return false;
     }
     return true;
 }
 
-bool FinalizeCompressedWordsBatch(const BufferPoolLease& lease,
-                                  DigestWorkspace& workspace,
-                                  uint32_t n,
-                                  uint32_t b,
-                                  uint32_t r,
-                                  uint32_t batch_size,
-                                  MatMulCompressedWordsMode mode,
-                                  MatMulCompressedWordsBatchResult& result,
-                                  DigestProfilingSample& sample,
-                                  bool& allocated_buffers)
+// Wait on device-generated inputs and build the device pointer table.
+bool StageDeviceGeneratedInputs(DigestWorkspace& workspace,
+                                const CudaRuntimeProbe& runtime,
+                                const NoiseLayout& layout,
+                                uint32_t n,
+                                uint32_t b,
+                                uint32_t r,
+                                uint32_t batch_size,
+                                const MatMulGeneratedInputsDevice* const* generated_inputs,
+                                DigestProfilingSample& sample,
+                                std::string& error,
+                                bool& allocated_buffers)
 {
-    const uint32_t blocks_per_axis = n / b;
-    const uint32_t matrix_elements = n * n;
-    const uint32_t compress_elements = b * b;
-    const uint32_t pair_count_per_request = blocks_per_axis * blocks_per_axis;
-    const uint32_t words_per_request = mode == MatMulCompressedWordsMode::TRANSCRIPT_PREFIXES
-        ? pair_count_per_request * blocks_per_axis
-        : pair_count_per_request;
-    const size_t total_output_count = static_cast<size_t>(batch_size) * words_per_request;
-
-    if (!EnsureDeviceBuffer(workspace.device_output,
-                            workspace.output_capacity,
-                            total_output_count,
-                            result.error,
-                            allocated_buffers)) {
-        return false;
-    }
-
-    lease.RecordRequest(n, b, r, allocated_buffers);
-
-    const uint32_t thread_count = ResolveThreadCount(b);
-    const uint32_t total_pair_count = batch_size * pair_count_per_request;
-    const auto finalize_start = SteadyClock::now();
-    if (mode == MatMulCompressedWordsMode::TRANSCRIPT_PREFIXES) {
-        ComputeCompressedWordsFusedKernel<true><<<total_pair_count, thread_count, 0, workspace.stream>>>(
-            workspace.device_matrix_a,
-            workspace.device_matrix_b,
-            workspace.device_compress,
-            n,
-            b,
-            blocks_per_axis,
-            pair_count_per_request,
-            words_per_request,
-            matrix_elements,
-            compress_elements,
-            workspace.device_output);
-    } else if (n % 32U == 0U && (blocks_per_axis & 1U) == 0U) {
-        // Factored compression: build D once per request, then warp-per-word.
-        // Byte-identical to the fused kernel (see kernel comment); ~10x fewer MACs.
-        const uint32_t rhs_elements = b * n * blocks_per_axis;
-        const size_t total_rhs_elements = static_cast<size_t>(batch_size) * rhs_elements;
-        if (!EnsureDeviceBuffer(workspace.device_factored_rhs,
-                                workspace.factored_rhs_capacity,
-                                total_rhs_elements,
-                                result.error,
-                                allocated_buffers)) {
-            return false;
-        }
-        const uint32_t rhs_blocks = static_cast<uint32_t>(
-            (total_rhs_elements + WORKSPACE_THREADS - 1) / WORKSPACE_THREADS);
-        BuildFactoredRhsKernel<<<rhs_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-            workspace.device_matrix_b,
-            workspace.device_compress,
-            n,
-            b,
-            total_rhs_elements,
-            rhs_elements,
-            matrix_elements,
-            compress_elements,
-            workspace.device_factored_rhs);
-        const uint32_t warps_per_block = WORKSPACE_THREADS / 32U;
-        const uint32_t tiles_per_request = (blocks_per_axis >> 1U) * (blocks_per_axis >> 1U);
-        const uint32_t total_tile_count = batch_size * tiles_per_request;
-        const uint32_t word_blocks = (total_tile_count + warps_per_block - 1U) / warps_per_block;
-        ComputeFactoredWordsKernel<<<word_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-            workspace.device_matrix_a,
-            workspace.device_factored_rhs,
-            n,
-            b,
-            blocks_per_axis,
-            pair_count_per_request,
-            words_per_request,
-            matrix_elements,
-            rhs_elements,
-            total_tile_count,
-            workspace.device_output);
-    } else {
-        ComputeCompressedWordsFusedKernel<false><<<total_pair_count, thread_count, 0, workspace.stream>>>(
-            workspace.device_matrix_a,
-            workspace.device_matrix_b,
-            workspace.device_compress,
-            n,
-            b,
-            blocks_per_axis,
-            pair_count_per_request,
-            words_per_request,
-            matrix_elements,
-            compress_elements,
-            workspace.device_output);
-    }
-    cudaError_t error = cudaGetLastError();
-    sample.launch_finalize_us = DurationMicros(finalize_start, SteadyClock::now());
-    if (error != cudaSuccess) {
-        result.error = "CUDA finalize kernel failed:" + CudaErrorString(error);
+    if (!EnsureDeviceBuffer(workspace.device_prepared_input_ptrs, workspace.prepared_input_ptr_capacity, batch_size, error, allocated_buffers)) {
         return false;
     }
 
     std::string staging_warning;
-    if (!workspace.host_output.Ensure(total_output_count, staging_warning)) {
-        result.error = staging_warning;
+    if (!workspace.host_pointer_table.Ensure(batch_size, staging_warning)) {
+        error = staging_warning;
         return false;
     }
-    sample.used_pinned_host_staging = sample.used_pinned_host_staging && workspace.host_output.pinned != nullptr;
-
-    result.words_per_request = words_per_request;
-    const auto d2h_start = SteadyClock::now();
-    error = cudaMemcpyAsync(workspace.host_output.data(),
-                            workspace.device_output,
-                            total_output_count * sizeof(Element),
-                            cudaMemcpyDeviceToHost,
-                            workspace.stream);
-    sample.submit_d2h_us = DurationMicros(d2h_start, SteadyClock::now());
-    const auto sync_start = SteadyClock::now();
-    if (error == cudaSuccess) {
-        error = cudaStreamSynchronize(workspace.stream);
-    }
-    sample.stream_sync_us = DurationMicros(sync_start, SteadyClock::now());
-    if (error != cudaSuccess) {
-        result.words_per_request = 0;
-        result.error = "CUDA stream completion failed:" + CudaErrorString(error);
-        return false;
-    }
-
-    result.words.assign(workspace.host_output.data(), workspace.host_output.data() + total_output_count);
-    result.success = true;
-    return true;
-}
-
-bool FinalizeCompressedWordsPackedPointerBatch(const BufferPoolLease& lease,
-                                               DigestWorkspace& workspace,
-                                               uint32_t n,
-                                               uint32_t b,
-                                               uint32_t r,
-                                               uint32_t batch_size,
-                                               uint32_t compress_offset_words,
-                                               MatMulCompressedWordsMode mode,
-                                               MatMulCompressedWordsBatchResult& result,
-                                               DigestProfilingSample& sample,
-                                               bool& allocated_buffers)
-{
-    const uint32_t blocks_per_axis = n / b;
-    const uint32_t matrix_elements = n * n;
-    const uint32_t pair_count_per_request = blocks_per_axis * blocks_per_axis;
-    const uint32_t words_per_request = mode == MatMulCompressedWordsMode::TRANSCRIPT_PREFIXES
-        ? pair_count_per_request * blocks_per_axis
-        : pair_count_per_request;
-    const size_t total_output_count = static_cast<size_t>(batch_size) * words_per_request;
-
-    if (!EnsureDeviceBuffer(workspace.device_output,
-                            workspace.output_capacity,
-                            total_output_count,
-                            result.error,
-                            allocated_buffers)) {
-        return false;
-    }
-
-    lease.RecordRequest(n, b, r, allocated_buffers);
-
-    const uint32_t thread_count = ResolveThreadCount(b);
-    const uint32_t total_pair_count = batch_size * pair_count_per_request;
-    const auto finalize_start = SteadyClock::now();
-    if (mode == MatMulCompressedWordsMode::TRANSCRIPT_PREFIXES) {
-        ComputeCompressedWordsFusedPackedPointersKernel<true><<<total_pair_count, thread_count, 0, workspace.stream>>>(
-            workspace.device_matrix_a,
-            workspace.device_matrix_b,
-            workspace.device_prepared_input_ptrs,
-            n,
-            b,
-            blocks_per_axis,
-            pair_count_per_request,
-            words_per_request,
-            matrix_elements,
-            compress_offset_words,
-            workspace.device_output);
-    } else if (n % 32U == 0U && (blocks_per_axis & 1U) == 0U) {
-        // Factored compression (see BuildFactoredRhsKernel): byte-identical
-        // to the fused kernel with ~10x fewer MACs.
-        const uint32_t rhs_elements = b * n * blocks_per_axis;
-        const size_t total_rhs_elements = static_cast<size_t>(batch_size) * rhs_elements;
-        if (!EnsureDeviceBuffer(workspace.device_factored_rhs,
-                                workspace.factored_rhs_capacity,
-                                total_rhs_elements,
-                                result.error,
-                                allocated_buffers)) {
+    const Element** pointer_table = workspace.host_pointer_table.data();
+    const auto wait_start = SteadyClock::now();
+    for (uint32_t i = 0; i < batch_size; ++i) {
+        const auto* generated = generated_inputs[i];
+        if (generated->device_index != runtime.device_index ||
+            generated->n != n ||
+            generated->b != b ||
+            generated->r != r ||
+            generated->noise_words != layout.noise_left_elements ||
+            generated->storage == nullptr ||
+            generated->noise_e_l != generated->storage + layout.e_l_offset ||
+            generated->noise_e_r != generated->storage + layout.e_r_offset ||
+            generated->noise_f_l != generated->storage + layout.f_l_offset ||
+            generated->noise_f_r != generated->storage + layout.f_r_offset) {
+            error = "CUDA digest batch request contains incompatible device-generated inputs";
             return false;
         }
-        const uint32_t rhs_blocks = static_cast<uint32_t>(
-            (total_rhs_elements + WORKSPACE_THREADS - 1) / WORKSPACE_THREADS);
-        BuildFactoredRhsPackedPointersKernel<<<rhs_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-            workspace.device_matrix_b,
-            workspace.device_prepared_input_ptrs,
-            compress_offset_words,
-            n,
-            b,
-            total_rhs_elements,
-            rhs_elements,
-            matrix_elements,
-            workspace.device_factored_rhs);
-        const uint32_t warps_per_block = WORKSPACE_THREADS / 32U;
-        const uint32_t tiles_per_request = (blocks_per_axis >> 1U) * (blocks_per_axis >> 1U);
-        const uint32_t total_tile_count = batch_size * tiles_per_request;
-        const uint32_t word_blocks = (total_tile_count + warps_per_block - 1U) / warps_per_block;
-        ComputeFactoredWordsKernel<<<word_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-            workspace.device_matrix_a,
-            workspace.device_factored_rhs,
-            n,
-            b,
-            blocks_per_axis,
-            pair_count_per_request,
-            words_per_request,
-            matrix_elements,
-            rhs_elements,
-            total_tile_count,
-            workspace.device_output);
-    } else {
-        ComputeCompressedWordsFusedPackedPointersKernel<false><<<total_pair_count, thread_count, 0, workspace.stream>>>(
-            workspace.device_matrix_a,
-            workspace.device_matrix_b,
-            workspace.device_prepared_input_ptrs,
-            n,
-            b,
-            blocks_per_axis,
-            pair_count_per_request,
-            words_per_request,
-            matrix_elements,
-            compress_offset_words,
-            workspace.device_output);
+
+        if (generated->ready_event != nullptr) {
+            const cudaError_t wait_error = cudaStreamWaitEvent(
+                workspace.stream,
+                reinterpret_cast<cudaEvent_t>(generated->ready_event),
+                0);
+            if (wait_error != cudaSuccess) {
+                error = "cudaStreamWaitEvent failed:" + CudaErrorString(wait_error);
+                return false;
+            }
+        }
+
+        pointer_table[i] = generated->storage;
     }
-    cudaError_t error = cudaGetLastError();
-    sample.launch_finalize_us = DurationMicros(finalize_start, SteadyClock::now());
-    if (error != cudaSuccess) {
-        result.error = "CUDA finalize kernel failed:" + CudaErrorString(error);
+    sample.stream_wait_event_us = DurationMicros(wait_start, SteadyClock::now());
+
+    const auto pointer_copy_start = SteadyClock::now();
+    const cudaError_t copy_error = cudaMemcpyAsync(workspace.device_prepared_input_ptrs,
+                                                   pointer_table,
+                                                   batch_size * sizeof(const Element*),
+                                                   cudaMemcpyHostToDevice,
+                                                   workspace.stream);
+    sample.submit_h2d_us += DurationMicros(pointer_copy_start, SteadyClock::now());
+    if (copy_error != cudaSuccess) {
+        error = "cudaMemcpy prepared_input_ptrs failed:" + CudaErrorString(copy_error);
         return false;
     }
-
-    std::string staging_warning;
-    if (!workspace.host_output.Ensure(total_output_count, staging_warning)) {
-        result.error = staging_warning;
-        return false;
-    }
-    sample.used_pinned_host_staging = sample.used_pinned_host_staging && workspace.host_output.pinned != nullptr;
-
-    result.words_per_request = words_per_request;
-    const auto d2h_start = SteadyClock::now();
-    error = cudaMemcpyAsync(workspace.host_output.data(),
-                            workspace.device_output,
-                            total_output_count * sizeof(Element),
-                            cudaMemcpyDeviceToHost,
-                            workspace.stream);
-    sample.submit_d2h_us = DurationMicros(d2h_start, SteadyClock::now());
-    const auto sync_start = SteadyClock::now();
-    if (error == cudaSuccess) {
-        error = cudaStreamSynchronize(workspace.stream);
-    }
-    sample.stream_sync_us = DurationMicros(sync_start, SteadyClock::now());
-    if (error != cudaSuccess) {
-        result.words_per_request = 0;
-        result.error = "CUDA stream completion failed:" + CudaErrorString(error);
-        return false;
-    }
-
-    result.words.assign(workspace.host_output.data(), workspace.host_output.data() + total_output_count);
-    result.success = true;
     return true;
 }
 
-bool FinalizeProductDigestsPackedPointerBatch(const BufferPoolLease& lease,
-                                              DigestWorkspace& workspace,
-                                              uint32_t n,
-                                              uint32_t b,
-                                              uint32_t r,
-                                              uint32_t batch_size,
-                                              uint32_t noise_e_left_offset_words,
-                                              uint32_t noise_e_right_offset_words,
-                                              uint32_t noise_f_left_offset_words,
-                                              uint32_t noise_f_right_offset_words,
-                                              uint32_t compress_offset_words,
-                                              bool stream_b_rhs,
-                                              bool stream_a_words,
-                                              MatMulProductDigestBatchResult& result,
-                                              DigestProfilingSample& sample,
-                                              bool& allocated_buffers)
+// Build A'/B' from the cached base matrices plus the staged packed noise.
+bool LaunchPerturbFromCachedBase(DigestWorkspace& workspace,
+                                 const NoiseLayout& layout,
+                                 uint32_t n,
+                                 uint32_t r,
+                                 uint32_t batch_size,
+                                 DigestProfilingSample& sample,
+                                 std::string& error,
+                                 bool& allocated_buffers)
+{
+    const uint32_t matrix_elements = n * n;
+    const size_t total_matrix_elements = static_cast<size_t>(batch_size) * matrix_elements;
+    if (!EnsureDeviceBuffer(workspace.device_matrix_a, workspace.matrix_a_capacity, total_matrix_elements, error, allocated_buffers) ||
+        !EnsureDeviceBuffer(workspace.device_matrix_b, workspace.matrix_b_capacity, total_matrix_elements, error, allocated_buffers)) {
+        return false;
+    }
+
+    const uint32_t build_blocks = static_cast<uint32_t>((total_matrix_elements + WORKSPACE_THREADS - 1) / WORKSPACE_THREADS);
+    const auto build_start = SteadyClock::now();
+    workspace.MarkBuildStart();
+    BuildPerturbedMatrixPackedPointersKernel<<<build_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
+        workspace.device_base_a,
+        workspace.device_prepared_input_ptrs,
+        layout.e_l_offset,
+        layout.e_r_offset,
+        n,
+        r,
+        total_matrix_elements,
+        matrix_elements,
+        workspace.device_matrix_a);
+    cudaError_t launch_error = cudaGetLastError();
+    if (launch_error == cudaSuccess) {
+        BuildPerturbedMatrixPackedPointersKernel<<<build_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
+            workspace.device_base_b,
+            workspace.device_prepared_input_ptrs,
+            layout.f_l_offset,
+            layout.f_r_offset,
+            n,
+            r,
+            total_matrix_elements,
+            matrix_elements,
+            workspace.device_matrix_b);
+        launch_error = cudaGetLastError();
+    }
+    sample.launch_build_perturbed_us = DurationMicros(build_start, SteadyClock::now());
+    if (launch_error != cudaSuccess) {
+        error = "CUDA perturbed-matrix kernel failed:" + CudaErrorString(launch_error);
+        return false;
+    }
+    return true;
+}
+
+// GEMM + tile hashing over device_matrix_a/b, then copy the tile hashes back.
+bool RunProductTileHashPipeline(const BufferPoolLease& lease,
+                                DigestWorkspace& workspace,
+                                uint32_t n,
+                                uint32_t b,
+                                uint32_t r,
+                                uint32_t batch_size,
+                                const uint256* sigmas,
+                                bool return_tile_hashes,
+                                MatMulProductTileHashBatchResult& result,
+                                DigestProfilingSample& sample,
+                                bool& allocated_buffers)
 {
     const uint32_t blocks_per_axis = n / b;
+    const uint32_t tiles_per_request = blocks_per_axis * blocks_per_axis;
     const uint32_t matrix_elements = n * n;
-    const uint32_t pair_count_per_request = blocks_per_axis * blocks_per_axis;
-    const uint32_t words_per_request = pair_count_per_request;
-    const size_t total_output_count = static_cast<size_t>(batch_size) * words_per_request;
+    const size_t total_output_count = static_cast<size_t>(batch_size) * matrix_elements;
+    const uint32_t total_tiles = batch_size * tiles_per_request;
+    const bool finish_on_device = sigmas != nullptr;
+    const bool fetch_tile_hashes = !finish_on_device || return_tile_hashes;
 
     if (!EnsureDeviceBuffer(workspace.device_output,
                             workspace.output_capacity,
                             total_output_count,
                             result.error,
                             allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_digests,
-                            workspace.digest_capacity,
-                            batch_size,
+        !EnsureDeviceBuffer(workspace.device_tile_hashes,
+                            workspace.tile_hash_capacity,
+                            total_tiles,
                             result.error,
                             allocated_buffers)) {
         return false;
     }
+    if (finish_on_device) {
+        if (!EnsureDeviceBuffer(workspace.device_sigma,
+                                workspace.sigma_capacity,
+                                batch_size,
+                                result.error,
+                                allocated_buffers) ||
+            !EnsureDeviceBuffer(workspace.device_digests,
+                                workspace.digest_capacity,
+                                batch_size,
+                                result.error,
+                                allocated_buffers)) {
+            return false;
+        }
+        std::string staging_warning;
+        if (!workspace.host_sigma.Ensure(batch_size, staging_warning) ||
+            !workspace.host_digests.Ensure(batch_size, staging_warning)) {
+            result.error = staging_warning;
+            return false;
+        }
+        std::memcpy(workspace.host_sigma.data(), sigmas, static_cast<size_t>(batch_size) * sizeof(DeviceSeedBytes));
+        const auto sigma_h2d_start = SteadyClock::now();
+        const cudaError_t sigma_error = cudaMemcpyAsync(workspace.device_sigma,
+                                                        workspace.host_sigma.data(),
+                                                        static_cast<size_t>(batch_size) * sizeof(DeviceSeedBytes),
+                                                        cudaMemcpyHostToDevice,
+                                                        workspace.stream);
+        sample.submit_h2d_us += DurationMicros(sigma_h2d_start, SteadyClock::now());
+        if (sigma_error != cudaSuccess) {
+            result.error = "cudaMemcpy sigmas failed:" + CudaErrorString(sigma_error);
+            return false;
+        }
+    }
 
     lease.RecordRequest(n, b, r, allocated_buffers);
 
-    const uint32_t total_pair_count = batch_size * pair_count_per_request;
+    const bool timing_events = workspace.EnsureTimingEvents();
+    if (timing_events) {
+        cudaEventRecord(workspace.event_gemm_start, workspace.stream);
+    }
     const auto finalize_start = SteadyClock::now();
-    if (n % 32U == 0U && (blocks_per_axis & 1U) == 0U) {
-        const uint32_t rhs_elements = b * n * blocks_per_axis;
-        const size_t total_rhs_elements = static_cast<size_t>(batch_size) * rhs_elements;
-        const bool split_b_low_rank_rhs = ShouldUseSplitBLowRankProductDigestRhs(n, b, r, stream_b_rhs);
-        const bool slabbed_split_b_words =
-            !stream_a_words && split_b_low_rank_rhs && ShouldUseSlabbedSplitBLowRankProductDigestWords(n, b, r, stream_b_rhs);
-        if (slabbed_split_b_words) {
-            const uint32_t transform_elements = blocks_per_axis * b * r;
-            const size_t total_transform_elements = static_cast<size_t>(batch_size) * transform_elements;
-            if (!EnsureDeviceBuffer(workspace.device_matrix_b,
-                                    workspace.matrix_b_capacity,
-                                    total_transform_elements,
-                                    result.error,
-                                    allocated_buffers)) {
-                return false;
-            }
-            const uint32_t transform_blocks = static_cast<uint32_t>(
-                (total_transform_elements + WORKSPACE_THREADS - 1) / WORKSPACE_THREADS);
-            BuildRhsLowRankRightTransformPackedPointersKernel<16, 512, 8><<<transform_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-                workspace.device_prepared_input_ptrs,
-                noise_f_right_offset_words,
-                compress_offset_words,
-                transform_elements,
-                total_transform_elements,
-                workspace.device_matrix_b);
-            const uint32_t j_pair_count_per_request = blocks_per_axis >> 1U;
-            const uint32_t word_blocks = batch_size * j_pair_count_per_request;
-            ComputeFactoredWordsSplitBLowRankSlabbedKernel<16, 512, 8, 128><<<word_blocks, SLABBED_RHS_THREADS, 0, workspace.stream>>>(
-                workspace.device_matrix_a,
-                workspace.device_seed_b,
-                workspace.device_seed_midstates + static_cast<size_t>(batch_size) * 16U,
-                workspace.device_prepared_input_ptrs,
-                workspace.device_matrix_b,
-                noise_f_left_offset_words,
-                compress_offset_words,
-                transform_elements,
-                matrix_elements,
-                words_per_request,
-                workspace.device_output);
-        } else {
-            if (!EnsureDeviceBuffer(workspace.device_factored_rhs,
-                                    workspace.factored_rhs_capacity,
-                                    total_rhs_elements,
-                                    result.error,
-                                    allocated_buffers)) {
-                return false;
-            }
-            const uint32_t rhs_blocks = static_cast<uint32_t>(
-                (total_rhs_elements + WORKSPACE_THREADS - 1) / WORKSPACE_THREADS);
-            if (split_b_low_rank_rhs) {
-                const uint32_t jm_elements = blocks_per_axis * n;
-                const size_t total_jm_elements = static_cast<size_t>(batch_size) * jm_elements;
-                const uint32_t transform_elements = blocks_per_axis * b * r;
-                const size_t total_transform_elements = static_cast<size_t>(batch_size) * transform_elements;
-                if (!EnsureDeviceBuffer(workspace.device_matrix_b,
-                                        workspace.matrix_b_capacity,
-                                        total_transform_elements,
-                                        result.error,
-                                        allocated_buffers)) {
-                    return false;
-                }
-                const uint32_t transform_blocks = static_cast<uint32_t>(
-                    (total_transform_elements + WORKSPACE_THREADS - 1) / WORKSPACE_THREADS);
-                BuildRhsLowRankRightTransformPackedPointersKernel<16, 512, 8><<<transform_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-                    workspace.device_prepared_input_ptrs,
-                    noise_f_right_offset_words,
-                    compress_offset_words,
-                    transform_elements,
-                    total_transform_elements,
-                    workspace.device_matrix_b);
-                const uint32_t jm_blocks = static_cast<uint32_t>(
-                    (total_jm_elements + WORKSPACE_THREADS - 1) / WORKSPACE_THREADS);
-                BuildFactoredRhsSplitBLowRankFromSeedMidstatePackedPointersKernel<16, 512, 8><<<jm_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-                    workspace.device_seed_b,
-                    workspace.device_seed_midstates + static_cast<size_t>(batch_size) * 16U,
-                    workspace.device_prepared_input_ptrs,
-                    workspace.device_matrix_b,
-                    noise_f_left_offset_words,
-                    compress_offset_words,
-                    total_jm_elements,
-                    jm_elements,
-                    rhs_elements,
-                    transform_elements,
-                    workspace.device_factored_rhs);
-            } else if (stream_b_rhs && b == 16U) {
-                const uint32_t jm_elements = blocks_per_axis * n;
-                const size_t total_jm_elements = static_cast<size_t>(batch_size) * jm_elements;
-                const uint32_t jm_blocks = static_cast<uint32_t>(
-                    (total_jm_elements + WORKSPACE_THREADS - 1) / WORKSPACE_THREADS);
-                BuildFactoredRhsFromSeedMidstatePackedPointersKernel<16><<<jm_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-                    workspace.device_seed_b,
-                    workspace.device_seed_midstates + static_cast<size_t>(batch_size) * 16U,
-                    workspace.device_prepared_input_ptrs,
-                    noise_f_left_offset_words,
-                    noise_f_right_offset_words,
-                    compress_offset_words,
-                    n,
-                    r,
-                    total_jm_elements,
-                    jm_elements,
-                    rhs_elements,
-                    workspace.device_factored_rhs);
-            } else {
-                BuildFactoredRhsPackedPointersKernel<<<rhs_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-                    workspace.device_matrix_b,
-                    workspace.device_prepared_input_ptrs,
-                    compress_offset_words,
-                    n,
-                    b,
-                    total_rhs_elements,
-                    rhs_elements,
-                    matrix_elements,
-                    workspace.device_factored_rhs);
-            }
-            const uint32_t warps_per_block = WORKSPACE_THREADS / 32U;
-            const uint32_t tiles_per_request = (blocks_per_axis >> 1U) * (blocks_per_axis >> 1U);
-            const uint32_t total_tile_count = batch_size * tiles_per_request;
-            const uint32_t word_blocks = (total_tile_count + warps_per_block - 1U) / warps_per_block;
-            if (stream_a_words) {
-                constexpr uint32_t row_pair_shared_elements = 2U * 16U * 512U;
-                constexpr uint32_t row_pair_shared_bytes = row_pair_shared_elements * sizeof(Element);
-                const bool row_pair_enabled = ShouldUseStreamARowPairWords();
-                cudaError_t pending_launch_error = cudaSuccess;
-                cudaError_t attr_error = cudaErrorInvalidValue;
-                if (row_pair_enabled) {
-                    pending_launch_error = cudaPeekAtLastError();
-                    attr_error = pending_launch_error == cudaSuccess
-                        ? cudaFuncSetAttribute(
-                        ComputeFactoredWordsStreamARowPairKernel<16, 512, 8>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                        static_cast<int>(row_pair_shared_bytes))
-                        : pending_launch_error;
-                }
-                if (attr_error == cudaSuccess) {
-                    const uint32_t row_pair_blocks = batch_size * (blocks_per_axis >> 1U);
-                    ComputeFactoredWordsStreamARowPairKernel<16, 512, 8><<<row_pair_blocks, WORKSPACE_THREADS, row_pair_shared_bytes, workspace.stream>>>(
-                        workspace.device_seed_a,
-                        workspace.device_seed_midstates,
-                        workspace.device_prepared_input_ptrs,
-                        workspace.device_factored_rhs,
-                        noise_e_left_offset_words,
-                        noise_e_right_offset_words,
-                        rhs_elements,
-                        words_per_request,
-                        workspace.device_output);
-                } else {
-                    if (row_pair_enabled && pending_launch_error == cudaSuccess) {
-                        (void)cudaGetLastError();
-                    }
-                    const uint32_t row_blocks = batch_size * blocks_per_axis;
-                    ComputeFactoredWordsStreamARowBlockKernel<16, 512, 8><<<row_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-                        workspace.device_seed_a,
-                        workspace.device_seed_midstates,
-                        workspace.device_prepared_input_ptrs,
-                        workspace.device_factored_rhs,
-                        noise_e_left_offset_words,
-                        noise_e_right_offset_words,
-                        rhs_elements,
-                        words_per_request,
-                        workspace.device_output);
-                }
-            } else {
-                ComputeFactoredWordsKernel<<<word_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-                    workspace.device_matrix_a,
-                    workspace.device_factored_rhs,
-                    n,
-                    b,
-                    blocks_per_axis,
-                    pair_count_per_request,
-                    words_per_request,
-                    matrix_elements,
-                    rhs_elements,
-                    total_tile_count,
-                    workspace.device_output);
-            }
-        }
-    } else {
-        const uint32_t thread_count = ResolveThreadCount(b);
-        ComputeCompressedWordsFusedPackedPointersKernel<false><<<total_pair_count, thread_count, 0, workspace.stream>>>(
+    if (n % GEMM_BM == 0U) {
+        const dim3 grid(n / GEMM_BN, n / GEMM_BM, batch_size);
+        FieldGemmTiledKernel<<<grid, GEMM_THREADS, 0, workspace.stream>>>(
             workspace.device_matrix_a,
             workspace.device_matrix_b,
-            workspace.device_prepared_input_ptrs,
             n,
-            b,
-            blocks_per_axis,
-            pair_count_per_request,
-            words_per_request,
             matrix_elements,
-            compress_offset_words,
+            workspace.device_output);
+    } else {
+        const uint32_t gemm_blocks = static_cast<uint32_t>((total_output_count + WORKSPACE_THREADS - 1) / WORKSPACE_THREADS);
+        FieldGemmSimpleKernel<<<gemm_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
+            workspace.device_matrix_a,
+            workspace.device_matrix_b,
+            n,
+            matrix_elements,
+            total_output_count,
             workspace.device_output);
     }
-
     cudaError_t error = cudaGetLastError();
-    sample.launch_finalize_us = DurationMicros(finalize_start, SteadyClock::now());
     if (error != cudaSuccess) {
-        result.error = "CUDA product digest finalize kernel failed:" + CudaErrorString(error);
+        result.error = "CUDA product GEMM kernel failed:" + CudaErrorString(error);
         return false;
     }
 
-    const auto digest_start = SteadyClock::now();
-    const uint32_t digest_blocks = (batch_size + WORKSPACE_THREADS - 1U) / WORKSPACE_THREADS;
-    ComputeProductDigestsKernel<<<digest_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
+    if (timing_events) {
+        cudaEventRecord(workspace.event_gemm_end, workspace.stream);
+    }
+    const uint32_t hash_blocks = (total_tiles + TILE_HASH_THREADS - 1U) / TILE_HASH_THREADS;
+    HashProductTilesKernel<<<hash_blocks, TILE_HASH_THREADS, 0, workspace.stream>>>(
         workspace.device_output,
-        workspace.device_sigma,
-        words_per_request,
-        batch_size,
         n,
         b,
-        workspace.device_digests);
+        blocks_per_axis,
+        tiles_per_request,
+        matrix_elements,
+        total_tiles,
+        workspace.device_tile_hashes);
     error = cudaGetLastError();
-    sample.submit_d2d_us += DurationMicros(digest_start, SteadyClock::now());
     if (error != cudaSuccess) {
-        result.error = "CUDA product digest hash kernel failed:" + CudaErrorString(error);
+        result.error = "CUDA product tile hash kernel failed:" + CudaErrorString(error);
+        return false;
+    }
+    if (finish_on_device) {
+        const uint32_t finalize_blocks = (batch_size + 63U) / 64U;
+        FinalizeProductDigestsKernel<<<finalize_blocks, 64U, 0, workspace.stream>>>(
+            workspace.device_tile_hashes,
+            workspace.device_sigma,
+            tiles_per_request,
+            batch_size,
+            n,
+            b,
+            workspace.device_digests);
+        error = cudaGetLastError();
+        if (error != cudaSuccess) {
+            result.error = "CUDA product digest finalize kernel failed:" + CudaErrorString(error);
+            return false;
+        }
+    }
+    if (timing_events) {
+        cudaEventRecord(workspace.event_hash_end, workspace.stream);
+    }
+    sample.launch_finalize_us = DurationMicros(finalize_start, SteadyClock::now());
+
+    std::string staging_warning;
+    if (fetch_tile_hashes && !workspace.host_tile_hashes.Ensure(total_tiles, staging_warning)) {
+        result.error = staging_warning;
         return false;
     }
 
-    std::vector<DeviceDigestBytes> host_digests(batch_size);
+    if (const char* debug_sync = std::getenv("QTC_MATMUL_CUDA_DEBUG_SYNC_BEFORE_D2H"); debug_sync != nullptr && debug_sync[0] == '1') {
+        // Diagnostics only: isolate the D2H call time from the pipeline completion.
+        const auto pre_sync_start = SteadyClock::now();
+        error = cudaStreamSynchronize(workspace.stream);
+        sample.submit_d2d_us = DurationMicros(pre_sync_start, SteadyClock::now());
+        if (error != cudaSuccess) {
+            result.error = "CUDA debug pre-D2H sync failed:" + CudaErrorString(error);
+            return false;
+        }
+    }
     const auto d2h_start = SteadyClock::now();
-    error = cudaMemcpyAsync(host_digests.data(),
-                            workspace.device_digests,
-                            batch_size * sizeof(DeviceDigestBytes),
-                            cudaMemcpyDeviceToHost,
-                            workspace.stream);
+    error = cudaSuccess;
+    if (finish_on_device) {
+        error = cudaMemcpyAsync(workspace.host_digests.data(),
+                                workspace.device_digests,
+                                static_cast<size_t>(batch_size) * sizeof(DeviceDigestBytes),
+                                cudaMemcpyDeviceToHost,
+                                workspace.stream);
+    }
+    if (error == cudaSuccess && fetch_tile_hashes) {
+        error = cudaMemcpyAsync(workspace.host_tile_hashes.data(),
+                                workspace.device_tile_hashes,
+                                static_cast<size_t>(total_tiles) * sizeof(DeviceDigestBytes),
+                                cudaMemcpyDeviceToHost,
+                                workspace.stream);
+    }
     sample.submit_d2h_us = DurationMicros(d2h_start, SteadyClock::now());
+    if (timing_events) {
+        cudaEventRecord(workspace.event_copy_end, workspace.stream);
+    }
+    {
+        // Report the real staging type: a pageable destination turns the D2H
+        // copy into a synchronous, slow transfer.
+        cudaPointerAttributes attributes{};
+        void* staging = finish_on_device
+            ? static_cast<void*>(workspace.host_digests.data())
+            : static_cast<void*>(workspace.host_tile_hashes.data());
+        const cudaError_t attr_error = cudaPointerGetAttributes(&attributes, staging);
+        sample.used_pinned_host_staging = attr_error == cudaSuccess && attributes.type == cudaMemoryTypeHost;
+        if (attr_error != cudaSuccess) {
+            (void)cudaGetLastError();
+        }
+    }
     const auto sync_start = SteadyClock::now();
     if (error == cudaSuccess) {
         error = cudaStreamSynchronize(workspace.stream);
     }
     sample.stream_sync_us = DurationMicros(sync_start, SteadyClock::now());
     if (error != cudaSuccess) {
-        result.error = "CUDA product digest stream completion failed:" + CudaErrorString(error);
+        result.error = "CUDA stream completion failed:" + CudaErrorString(error);
         return false;
     }
 
+    if (timing_events) {
+        float copy_ms{0.0f};
+        if (cudaEventElapsedTime(&copy_ms, workspace.event_hash_end, workspace.event_copy_end) == cudaSuccess) {
+            sample.gpu_copy_us = static_cast<double>(copy_ms) * 1000.0;
+        }
+        float ms{0.0f};
+        if (workspace.build_event_recorded &&
+            cudaEventElapsedTime(&ms, workspace.event_build_start, workspace.event_gemm_start) == cudaSuccess) {
+            sample.gpu_build_us = static_cast<double>(ms) * 1000.0;
+        }
+        if (cudaEventElapsedTime(&ms, workspace.event_gemm_start, workspace.event_gemm_end) == cudaSuccess) {
+            sample.gpu_gemm_us = static_cast<double>(ms) * 1000.0;
+        }
+        if (cudaEventElapsedTime(&ms, workspace.event_gemm_end, workspace.event_hash_end) == cudaSuccess) {
+            sample.gpu_tile_hash_us = static_cast<double>(ms) * 1000.0;
+        }
+        workspace.build_event_recorded = false;
+    }
+
+    result.tiles_per_request = tiles_per_request;
+    result.tile_hashes.clear();
     result.digests.clear();
-    result.digests.reserve(batch_size);
-    for (uint32_t i = 0; i < batch_size; ++i) {
-        result.digests.emplace_back(Span<const unsigned char>{host_digests[i].data, sizeof(host_digests[i].data)});
+    if (fetch_tile_hashes) {
+        result.tile_hashes.reserve(total_tiles);
+        const DeviceDigestBytes* host_tiles = workspace.host_tile_hashes.data();
+        for (uint32_t i = 0; i < total_tiles; ++i) {
+            result.tile_hashes.emplace_back(Span<const unsigned char>{host_tiles[i].data, sizeof(host_tiles[i].data)});
+        }
+    }
+    if (finish_on_device) {
+        result.digests.reserve(batch_size);
+        const DeviceDigestBytes* host_digests = workspace.host_digests.data();
+        for (uint32_t i = 0; i < batch_size; ++i) {
+            result.digests.emplace_back(Span<const unsigned char>{host_digests[i].data, sizeof(host_digests[i].data)});
+        }
     }
     result.success = true;
     return true;
+}
+
+struct DeviceSession {
+    CudaRuntimeProbe runtime;
+    std::optional<BufferPoolLease> lease;
+};
+
+bool OpenDeviceSession(int device_index,
+                       DeviceSession& session,
+                       MatMulProductTileHashBatchResult& result)
+{
+    const auto runtime_probe = ResolveCudaRuntimeForSelectedDevice(device_index, result.error);
+    result.available = runtime_probe.has_value();
+    if (!runtime_probe.has_value()) {
+        return false;
+    }
+    session.runtime = *runtime_probe;
+
+    session.lease = AcquireBufferPoolSlot(session.runtime.device_index, result.error);
+    if (!session.lease.has_value()) {
+        return false;
+    }
+
+    auto& workspace = session.lease->workspace();
+    ResetWorkspaceForDevice(workspace, session.runtime.device_index);
+
+    const cudaError_t error = cudaSetDevice(session.runtime.device_index);
+    if (error != cudaSuccess) {
+        result.error = "cudaSetDevice failed:" + CudaErrorString(error);
+        return false;
+    }
+    return EnsureWorkspaceStream(workspace, result.error);
+}
+
+// Merge per-device shard results back into batch order.
+template <typename Shard>
+bool MergeShardResults(const std::vector<std::pair<Shard, MatMulProductTileHashBatchResult>>& shard_results,
+                       uint32_t batch_size,
+                       const char* failure_prefix,
+                       MatMulProductTileHashBatchResult& result)
+{
+    for (const auto& [shard, shard_result] : shard_results) {
+        if (!shard_result.success) {
+            result.available = shard_result.available;
+            result.error = "cuda_device_" + std::to_string(shard.device_index) + failure_prefix +
+                (shard_result.error.empty() ? "unknown_error" : shard_result.error);
+            return false;
+        }
+        if (result.tiles_per_request == 0) {
+            result.tiles_per_request = shard_result.tiles_per_request;
+        } else if (result.tiles_per_request != shard_result.tiles_per_request) {
+            result.error = "cuda_multi_device_batch_tiles_per_request_mismatch";
+            return false;
+        }
+    }
+    if (result.tiles_per_request == 0) {
+        result.error = "cuda_multi_device_batch_empty_result";
+        return false;
+    }
+
+    const bool have_digests = !shard_results.front().second.digests.empty();
+    const bool have_tiles = !shard_results.front().second.tile_hashes.empty();
+    if (have_digests) {
+        result.digests.assign(batch_size, uint256{});
+    }
+    if (have_tiles) {
+        result.tile_hashes.assign(static_cast<size_t>(batch_size) * result.tiles_per_request, uint256{});
+    }
+    for (const auto& [shard, shard_result] : shard_results) {
+        const bool digests_ok = !have_digests || shard_result.digests.size() == shard.indices.size();
+        const bool tiles_ok = !have_tiles ||
+            shard_result.tile_hashes.size() == shard.indices.size() * result.tiles_per_request;
+        if (!digests_ok || !tiles_ok) {
+            result.success = false;
+            result.error = "cuda_multi_device_batch_result_size_mismatch";
+            result.tile_hashes.clear();
+            result.digests.clear();
+            result.tiles_per_request = 0;
+            return false;
+        }
+        for (size_t i = 0; i < shard.indices.size(); ++i) {
+            if (have_digests) {
+                result.digests[shard.indices[i]] = shard_result.digests[i];
+            }
+            if (have_tiles) {
+                std::copy(
+                    shard_result.tile_hashes.begin() + i * result.tiles_per_request,
+                    shard_result.tile_hashes.begin() + (i + 1) * result.tiles_per_request,
+                    result.tile_hashes.begin() + shard.indices[i] * result.tiles_per_request);
+            }
+        }
+    }
+    result.success = true;
+    return true;
+}
+
+struct IndexShard {
+    int device_index{-1};
+    std::vector<size_t> indices;
+};
+
+std::vector<IndexShard> PlanContiguousShards(const CudaTopologyProbe& topology, uint32_t batch_size)
+{
+    std::vector<IndexShard> shards;
+    for (const auto& shard : PlanCudaBatchShards(topology.selected_devices, batch_size)) {
+        IndexShard entry;
+        entry.device_index = shard.device_index;
+        entry.indices.reserve(shard.count);
+        for (size_t i = 0; i < shard.count; ++i) {
+            entry.indices.push_back(shard.start_index + i);
+        }
+        shards.push_back(std::move(entry));
+    }
+    return shards;
+}
+
+std::vector<IndexShard> PlanShardsByDeviceInputs(const MatMulGeneratedInputsDevice* const* generated_inputs,
+                                                 uint32_t batch_size)
+{
+    std::map<int, IndexShard> shard_map;
+    for (uint32_t i = 0; i < batch_size; ++i) {
+        auto& shard = shard_map[generated_inputs[i]->device_index];
+        shard.device_index = generated_inputs[i]->device_index;
+        shard.indices.push_back(i);
+    }
+    std::vector<IndexShard> shards;
+    shards.reserve(shard_map.size());
+    for (auto& entry : shard_map) {
+        shards.push_back(std::move(entry.second));
+    }
+    return shards;
 }
 
 } // namespace
@@ -3323,9 +2402,6 @@ MatMulBufferPoolStats ProbeMatMulBufferPool()
         }
     }
     stats.reason = stats.initialized ? "buffer_pool_slots_ready" : "buffer_pool_uninitialized";
-    if (stats.reason.empty()) {
-        stats.reason = stats.initialized ? "buffer_pool_slots_ready" : "buffer_pool_uninitialized";
-    }
     return stats;
 }
 
@@ -3341,11 +2417,10 @@ MatMulDispatchConfig ProbeMatMulDispatchConfig()
 
     config.available = true;
     config.build_perturbed_threads = WORKSPACE_THREADS;
-    config.finalize_max_threads = MAX_BLOCK_THREADS;
-    config.finalize_threads_b4 = ResolveThreadCount(4);
-    config.finalize_threads_b8 = ResolveThreadCount(8);
-    config.finalize_threads_b16 = ResolveThreadCount(16);
-    config.max_supported_block_size = 16;
+    config.gemm_tile_dim = GEMM_BM;
+    config.gemm_threads = GEMM_THREADS;
+    config.tile_hash_threads = TILE_HASH_THREADS;
+    config.max_supported_block_size = MAX_SUPPORTED_BLOCK_SIZE;
     config.nonblocking_streams = true;
     config.reason = "ready";
     return config;
@@ -3364,7 +2439,7 @@ MatMulKernelProfile ProbeMatMulKernelProfile()
     const char* device_prepared_env = std::getenv("QTC_MATMUL_CUDA_DEVICE_PREPARED_INPUTS");
     profile.available = true;
     profile.low_rank_perturbation_kernel = true;
-    profile.fused_compressed_words_finalize = true;
+    profile.tiled_product_digest_v4 = true;
     profile.pinned_host_staging = true;
     profile.base_matrix_cache = true;
     profile.shared_buffer_pool = true;
@@ -3412,40 +2487,18 @@ MatMulProfilingStats ProbeMatMulProfilingStats()
     stats.last_used_device_prepared_inputs = context.last_used_device_prepared_inputs;
     stats.last_used_pinned_host_staging = context.last_used_pinned_host_staging;
     stats.last_base_matrix_cache_hit = context.last_base_matrix_cache_hit;
+    stats.last_gpu_build_us = context.last_gpu_build_us;
+    stats.last_gpu_gemm_us = context.last_gpu_gemm_us;
+    stats.last_gpu_tile_hash_us = context.last_gpu_tile_hash_us;
+    stats.last_gpu_copy_us = context.last_gpu_copy_us;
     stats.last_mode = context.last_mode;
     stats.reason = context.reason;
     return stats;
 }
 
-MatMulCompressedWordsResult ComputeCompressedWords(const MatMulCompressedWordsRequest& request,
-                                                  MatMulCompressedWordsMode mode)
+MatMulProductTileHashBatchResult ComputeProductTileHashesBatch(const MatMulProductTileHashBatchRequest& request)
 {
-    const Element* matrix_a_ptrs[] = {request.matrix_a_perturbed};
-    const Element* matrix_b_ptrs[] = {request.matrix_b_perturbed};
-    const Element* compress_ptrs[] = {request.compress_vec};
-    auto batch_result = ComputeCompressedWordsBatch(
-        {
-            .n = request.n,
-            .b = request.b,
-            .batch_size = 1,
-            .matrix_a_perturbed = matrix_a_ptrs,
-            .matrix_b_perturbed = matrix_b_ptrs,
-            .compress_vec = compress_ptrs,
-        },
-        mode);
-
-    MatMulCompressedWordsResult result;
-    result.available = batch_result.available;
-    result.success = batch_result.success;
-    result.words = std::move(batch_result.words);
-    result.error = std::move(batch_result.error);
-    return result;
-}
-
-MatMulCompressedWordsBatchResult ComputeCompressedWordsBatch(const MatMulCompressedWordsBatchRequest& request,
-                                                            MatMulCompressedWordsMode mode)
-{
-    MatMulCompressedWordsBatchResult result;
+    MatMulProductTileHashBatchResult result;
     DigestProfilingSample sample;
     const auto runtime = ProbeCudaRuntime();
     result.available = runtime.available;
@@ -3453,54 +2506,37 @@ MatMulCompressedWordsBatchResult ComputeCompressedWordsBatch(const MatMulCompres
         result.error = runtime.reason;
         return result;
     }
-
-    if (!ValidateBatchRequest(request, result.error)) {
+    if (!ValidateProductTileHashBatchRequest(request, result.error)) {
         return result;
     }
 
-    auto lease = AcquireBufferPoolSlot(runtime.device_index, result.error);
-    if (!lease.has_value()) {
+    DeviceSession session;
+    if (!OpenDeviceSession(runtime.device_index, session, result)) {
         return result;
     }
-
-    auto& workspace = lease->workspace();
-    ResetWorkspaceForDevice(workspace, runtime.device_index);
-
-    cudaError_t error = cudaSetDevice(runtime.device_index);
-    if (error != cudaSuccess) {
-        result.error = "cudaSetDevice failed:" + CudaErrorString(error);
-        return result;
-    }
-    if (!EnsureWorkspaceStream(workspace, result.error)) {
-        return result;
-    }
+    auto& workspace = session.lease->workspace();
 
     sample.n = request.n;
     sample.b = request.b;
     sample.batch_size = request.batch_size;
-    sample.mode = ModeToString(mode);
+    sample.mode = "product_tile_hashes_perturbed";
     const uint32_t matrix_elements = request.n * request.n;
-    const uint32_t compress_elements = request.b * request.b;
     const size_t total_matrix_elements = static_cast<size_t>(request.batch_size) * matrix_elements;
-    const size_t total_compress_elements = static_cast<size_t>(request.batch_size) * compress_elements;
     bool allocated_buffers{false};
 
     if (!EnsureDeviceBuffer(workspace.device_matrix_a, workspace.matrix_a_capacity, total_matrix_elements, result.error, allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_matrix_b, workspace.matrix_b_capacity, total_matrix_elements, result.error, allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_compress, workspace.compress_capacity, total_compress_elements, result.error, allocated_buffers)) {
+        !EnsureDeviceBuffer(workspace.device_matrix_b, workspace.matrix_b_capacity, total_matrix_elements, result.error, allocated_buffers)) {
         return result;
     }
 
     std::string staging_warning;
     if (!workspace.host_matrix_a.Ensure(total_matrix_elements, staging_warning) ||
-        !workspace.host_matrix_b.Ensure(total_matrix_elements, staging_warning) ||
-        !workspace.host_compress.Ensure(total_compress_elements, staging_warning)) {
+        !workspace.host_matrix_b.Ensure(total_matrix_elements, staging_warning)) {
         result.error = staging_warning;
         return result;
     }
     sample.used_pinned_host_staging = workspace.host_matrix_a.pinned != nullptr &&
-        workspace.host_matrix_b.pinned != nullptr &&
-        workspace.host_compress.pinned != nullptr;
+        workspace.host_matrix_b.pinned != nullptr;
     const auto total_start = SteadyClock::now();
     const auto host_stage_start = SteadyClock::now();
     for (uint32_t i = 0; i < request.batch_size; ++i) {
@@ -3510,18 +2546,15 @@ MatMulCompressedWordsBatchResult ComputeCompressedWordsBatch(const MatMulCompres
         std::memcpy(workspace.host_matrix_b.data() + static_cast<size_t>(i) * matrix_elements,
                     request.matrix_b_perturbed[i],
                     matrix_elements * sizeof(Element));
-        std::memcpy(workspace.host_compress.data() + static_cast<size_t>(i) * compress_elements,
-                    request.compress_vec[i],
-                    compress_elements * sizeof(Element));
     }
     sample.host_stage_us = DurationMicros(host_stage_start, SteadyClock::now());
 
     const auto h2d_start = SteadyClock::now();
-    error = cudaMemcpyAsync(workspace.device_matrix_a,
-                            workspace.host_matrix_a.data(),
-                            total_matrix_elements * sizeof(Element),
-                            cudaMemcpyHostToDevice,
-                            workspace.stream);
+    cudaError_t error = cudaMemcpyAsync(workspace.device_matrix_a,
+                                        workspace.host_matrix_a.data(),
+                                        total_matrix_elements * sizeof(Element),
+                                        cudaMemcpyHostToDevice,
+                                        workspace.stream);
     if (error == cudaSuccess) {
         error = cudaMemcpyAsync(workspace.device_matrix_b,
                                 workspace.host_matrix_b.data(),
@@ -3529,30 +2562,15 @@ MatMulCompressedWordsBatchResult ComputeCompressedWordsBatch(const MatMulCompres
                                 cudaMemcpyHostToDevice,
                                 workspace.stream);
     }
-    if (error == cudaSuccess) {
-        error = cudaMemcpyAsync(workspace.device_compress,
-                                workspace.host_compress.data(),
-                                total_compress_elements * sizeof(Element),
-                                cudaMemcpyHostToDevice,
-                                workspace.stream);
-    }
     sample.submit_h2d_us = DurationMicros(h2d_start, SteadyClock::now());
     if (error != cudaSuccess) {
         result.error = "cudaMemcpy host_to_device failed:" + CudaErrorString(error);
         return result;
     }
 
-    if (!FinalizeCompressedWordsBatch(
-            *lease,
-            workspace,
-            request.n,
-            request.b,
-            /*r=*/0,
-            request.batch_size,
-            mode,
-            result,
-            sample,
-            allocated_buffers)) {
+    if (!RunProductTileHashPipeline(
+            *session.lease, workspace, request.n, request.b, /*r=*/0, request.batch_size,
+            request.sigmas, request.return_tile_hashes, result, sample, allocated_buffers)) {
         return result;
     }
 
@@ -3561,204 +2579,57 @@ MatMulCompressedWordsBatchResult ComputeCompressedWordsBatch(const MatMulCompres
     return result;
 }
 
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankBatchOnDevice(
-    const MatMulLowRankCompressedWordsBatchRequest& request,
-    MatMulCompressedWordsMode mode,
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankBatchOnDevice(
+    const MatMulLowRankProductBatchRequest& request,
     int device_index)
 {
-    MatMulCompressedWordsBatchResult result;
+    MatMulProductTileHashBatchResult result;
     DigestProfilingSample sample;
-    const auto runtime_probe = ResolveCudaRuntimeForSelectedDevice(device_index, result.error);
-    result.available = runtime_probe.has_value();
-    if (!runtime_probe.has_value()) {
-        return result;
-    }
-    const auto runtime = *runtime_probe;
-
     if (!ValidateLowRankBatchRequest(request, result.error)) {
+        result.available = true;
         return result;
     }
 
-    auto lease = AcquireBufferPoolSlot(runtime.device_index, result.error);
-    if (!lease.has_value()) {
+    DeviceSession session;
+    if (!OpenDeviceSession(device_index, session, result)) {
         return result;
     }
-
-    auto& workspace = lease->workspace();
-    ResetWorkspaceForDevice(workspace, runtime.device_index);
-
-    cudaError_t error = cudaSetDevice(runtime.device_index);
-    if (error != cudaSuccess) {
-        result.error = "cudaSetDevice failed:" + CudaErrorString(error);
-        return result;
-    }
-    if (!EnsureWorkspaceStream(workspace, result.error)) {
-        return result;
-    }
+    auto& workspace = session.lease->workspace();
+    const auto& runtime = session.runtime;
 
     sample.n = request.n;
     sample.b = request.b;
     sample.r = request.r;
     sample.batch_size = request.batch_size;
-    sample.mode = ModeToString(mode);
+    sample.mode = "product_tile_hashes_low_rank_host_noise";
     sample.used_low_rank_path = true;
     const uint32_t matrix_elements = request.n * request.n;
-    const uint32_t noise_left_elements = request.n * request.r;
-    const uint32_t noise_right_elements = request.r * request.n;
-    const uint32_t compress_elements = request.b * request.b;
-    const size_t total_matrix_elements = static_cast<size_t>(request.batch_size) * matrix_elements;
-    const size_t total_noise_left_elements = static_cast<size_t>(request.batch_size) * noise_left_elements;
-    const size_t total_noise_right_elements = static_cast<size_t>(request.batch_size) * noise_right_elements;
-    const size_t total_compress_elements = static_cast<size_t>(request.batch_size) * compress_elements;
+    const NoiseLayout layout = MakeNoiseLayout(request.n, request.r);
     bool allocated_buffers{false};
     sample.base_matrix_cache_hit = IsBaseMatrixCacheHit(
-        workspace,
-        request.matrix_a_cache_key,
-        request.matrix_b_cache_key,
-        matrix_elements);
+        workspace, request.matrix_a_cache_key, request.matrix_b_cache_key, matrix_elements);
 
-    if (!EnsureCachedBaseMatrices(
-            workspace,
-            runtime,
-            request.matrix_a,
-            request.matrix_b,
-            request.matrix_a_cache_key,
-            request.matrix_b_cache_key,
-            matrix_elements,
-            result.error,
-            allocated_buffers)) {
-        return result;
-    }
-    if (!EnsureDeviceBuffer(workspace.device_noise_e_l, workspace.noise_e_l_capacity, total_noise_left_elements, result.error, allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_noise_e_r, workspace.noise_e_r_capacity, total_noise_right_elements, result.error, allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_noise_f_l, workspace.noise_f_l_capacity, total_noise_left_elements, result.error, allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_noise_f_r, workspace.noise_f_r_capacity, total_noise_right_elements, result.error, allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_matrix_a, workspace.matrix_a_capacity, total_matrix_elements, result.error, allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_matrix_b, workspace.matrix_b_capacity, total_matrix_elements, result.error, allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_compress, workspace.compress_capacity, total_compress_elements, result.error, allocated_buffers)) {
-        return result;
-    }
-
-    std::string staging_warning;
-    if (!workspace.host_noise_e_l.Ensure(total_noise_left_elements, staging_warning) ||
-        !workspace.host_noise_e_r.Ensure(total_noise_right_elements, staging_warning) ||
-        !workspace.host_noise_f_l.Ensure(total_noise_left_elements, staging_warning) ||
-        !workspace.host_noise_f_r.Ensure(total_noise_right_elements, staging_warning) ||
-        !workspace.host_compress.Ensure(total_compress_elements, staging_warning)) {
-        result.error = staging_warning;
-        return result;
-    }
-    sample.used_pinned_host_staging = workspace.host_noise_e_l.pinned != nullptr &&
-        workspace.host_noise_e_r.pinned != nullptr &&
-        workspace.host_noise_f_l.pinned != nullptr &&
-        workspace.host_noise_f_r.pinned != nullptr &&
-        workspace.host_compress.pinned != nullptr;
     const auto total_start = SteadyClock::now();
-    const auto host_stage_start = SteadyClock::now();
-    for (uint32_t i = 0; i < request.batch_size; ++i) {
-        std::memcpy(workspace.host_noise_e_l.data() + static_cast<size_t>(i) * noise_left_elements,
-                    request.noise_e_l[i],
-                    noise_left_elements * sizeof(Element));
-        std::memcpy(workspace.host_noise_e_r.data() + static_cast<size_t>(i) * noise_right_elements,
-                    request.noise_e_r[i],
-                    noise_right_elements * sizeof(Element));
-        std::memcpy(workspace.host_noise_f_l.data() + static_cast<size_t>(i) * noise_left_elements,
-                    request.noise_f_l[i],
-                    noise_left_elements * sizeof(Element));
-        std::memcpy(workspace.host_noise_f_r.data() + static_cast<size_t>(i) * noise_right_elements,
-                    request.noise_f_r[i],
-                    noise_right_elements * sizeof(Element));
-        std::memcpy(workspace.host_compress.data() + static_cast<size_t>(i) * compress_elements,
-                    request.compress_vec[i],
-                    compress_elements * sizeof(Element));
-    }
-    sample.host_stage_us = DurationMicros(host_stage_start, SteadyClock::now());
-
-    const auto h2d_start = SteadyClock::now();
-    error = cudaMemcpyAsync(workspace.device_noise_e_l,
-                            workspace.host_noise_e_l.data(),
-                            total_noise_left_elements * sizeof(Element),
-                            cudaMemcpyHostToDevice,
-                            workspace.stream);
-    if (error == cudaSuccess) {
-        error = cudaMemcpyAsync(workspace.device_noise_e_r,
-                                workspace.host_noise_e_r.data(),
-                                total_noise_right_elements * sizeof(Element),
-                                cudaMemcpyHostToDevice,
-                                workspace.stream);
-    }
-    if (error == cudaSuccess) {
-        error = cudaMemcpyAsync(workspace.device_noise_f_l,
-                                workspace.host_noise_f_l.data(),
-                                total_noise_left_elements * sizeof(Element),
-                                cudaMemcpyHostToDevice,
-                                workspace.stream);
-    }
-    if (error == cudaSuccess) {
-        error = cudaMemcpyAsync(workspace.device_noise_f_r,
-                                workspace.host_noise_f_r.data(),
-                                total_noise_right_elements * sizeof(Element),
-                                cudaMemcpyHostToDevice,
-                                workspace.stream);
-    }
-    if (error == cudaSuccess) {
-        error = cudaMemcpyAsync(workspace.device_compress,
-                                workspace.host_compress.data(),
-                                total_compress_elements * sizeof(Element),
-                                cudaMemcpyHostToDevice,
-                                workspace.stream);
-    }
-    sample.submit_h2d_us = DurationMicros(h2d_start, SteadyClock::now());
-    if (error != cudaSuccess) {
-        result.error = "cudaMemcpy host_to_device failed:" + CudaErrorString(error);
+    if (!EnsureCachedBaseMatrices(
+            workspace, runtime, request.matrix_a, request.matrix_b,
+            request.matrix_a_cache_key, request.matrix_b_cache_key,
+            matrix_elements, result.error, allocated_buffers)) {
         return result;
     }
-
-    const uint32_t build_blocks = static_cast<uint32_t>((total_matrix_elements + WORKSPACE_THREADS - 1) / WORKSPACE_THREADS);
-    const auto build_start = SteadyClock::now();
-    BuildPerturbedMatrixKernel<<<build_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-        workspace.device_base_a,
-        workspace.device_noise_e_l,
-        workspace.device_noise_e_r,
-        request.n,
-        request.r,
-        total_matrix_elements,
-        matrix_elements,
-        noise_left_elements,
-        noise_right_elements,
-        workspace.device_matrix_a);
-    error = cudaGetLastError();
-    if (error == cudaSuccess) {
-        BuildPerturbedMatrixKernel<<<build_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-            workspace.device_base_b,
-            workspace.device_noise_f_l,
-            workspace.device_noise_f_r,
-            request.n,
-            request.r,
-            total_matrix_elements,
-            matrix_elements,
-            noise_left_elements,
-            noise_right_elements,
-            workspace.device_matrix_b);
-        error = cudaGetLastError();
-    }
-    sample.launch_build_perturbed_us = DurationMicros(build_start, SteadyClock::now());
-    if (error != cudaSuccess) {
-        result.error = "CUDA perturbed-matrix kernel failed:" + CudaErrorString(error);
+    if (!StageHostNoise(
+            workspace, layout, request.batch_size,
+            request.noise_e_l, request.noise_e_r, request.noise_f_l, request.noise_f_r,
+            sample, result.error, allocated_buffers)) {
         return result;
     }
-
-    if (!FinalizeCompressedWordsBatch(
-            *lease,
-            workspace,
-            request.n,
-            request.b,
-            request.r,
-            request.batch_size,
-            mode,
-            result,
-            sample,
-            allocated_buffers)) {
+    if (!LaunchPerturbFromCachedBase(
+            workspace, layout, request.n, request.r, request.batch_size,
+            sample, result.error, allocated_buffers)) {
+        return result;
+    }
+    if (!RunProductTileHashPipeline(
+            *session.lease, workspace, request.n, request.b, request.r, request.batch_size,
+            request.sigmas, request.return_tile_hashes, result, sample, allocated_buffers)) {
         return result;
     }
 
@@ -3767,18 +2638,16 @@ MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankBatchOnDevice(
     return result;
 }
 
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankBatch(
-    const MatMulLowRankCompressedWordsBatchRequest& request,
-    MatMulCompressedWordsMode mode)
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankBatch(
+    const MatMulLowRankProductBatchRequest& request)
 {
-    return ComputeCompressedWordsLowRankBatchMultiDevice(request, mode);
+    return ComputeProductTileHashesLowRankBatchMultiDevice(request);
 }
 
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankBatchMultiDevice(
-    const MatMulLowRankCompressedWordsBatchRequest& request,
-    MatMulCompressedWordsMode mode)
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankBatchMultiDevice(
+    const MatMulLowRankProductBatchRequest& request)
 {
-    MatMulCompressedWordsBatchResult result;
+    MatMulProductTileHashBatchResult result;
 
     const auto topology = ProbeCudaTopology();
     result.available = topology.available;
@@ -3786,52 +2655,45 @@ MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankBatchMultiDevice(
         result.error = topology.reason;
         return result;
     }
-
     if (!ValidateLowRankBatchRequest(request, result.error)) {
         return result;
     }
 
-    const auto shards = PlanCudaBatchShards(topology.selected_devices, request.batch_size);
+    const auto shards = PlanContiguousShards(topology, request.batch_size);
     if (shards.empty()) {
         result.error = "no_cuda_batch_shards_available";
         return result;
     }
     if (shards.size() == 1) {
-        return ComputeCompressedWordsLowRankBatchOnDevice(request, mode, shards.front().device_index);
+        return ComputeProductTileHashesLowRankBatchOnDevice(request, shards.front().device_index);
     }
 
-    struct ShardResult {
-        CudaBatchShard shard;
-        MatMulCompressedWordsBatchResult result;
-    };
-
-    std::vector<std::future<ShardResult>> futures;
+    std::vector<std::future<std::pair<IndexShard, MatMulProductTileHashBatchResult>>> futures;
     futures.reserve(shards.size());
     for (const auto& shard : shards) {
-        futures.push_back(std::async(std::launch::async, [request, mode, shard]() {
-            const MatMulLowRankCompressedWordsBatchRequest shard_request{
+        futures.push_back(std::async(std::launch::async, [request, shard]() {
+            const size_t start = shard.indices.front();
+            const MatMulLowRankProductBatchRequest shard_request{
                 .n = request.n,
                 .b = request.b,
                 .r = request.r,
-                .batch_size = static_cast<uint32_t>(shard.count),
+                .batch_size = static_cast<uint32_t>(shard.indices.size()),
                 .matrix_a = request.matrix_a,
                 .matrix_b = request.matrix_b,
                 .matrix_a_cache_key = request.matrix_a_cache_key,
                 .matrix_b_cache_key = request.matrix_b_cache_key,
-                .noise_e_l = request.noise_e_l + shard.start_index,
-                .noise_e_r = request.noise_e_r + shard.start_index,
-                .noise_f_l = request.noise_f_l + shard.start_index,
-                .noise_f_r = request.noise_f_r + shard.start_index,
-                .compress_vec = request.compress_vec + shard.start_index,
+                .noise_e_l = request.noise_e_l + start,
+                .noise_e_r = request.noise_e_r + start,
+                .noise_f_l = request.noise_f_l + start,
+                .noise_f_r = request.noise_f_r + start,
+                .sigmas = request.sigmas != nullptr ? request.sigmas + start : nullptr,
+                .return_tile_hashes = request.return_tile_hashes,
             };
-            return ShardResult{
-                .shard = shard,
-                .result = ComputeCompressedWordsLowRankBatchOnDevice(shard_request, mode, shard.device_index),
-            };
+            return std::make_pair(shard, ComputeProductTileHashesLowRankBatchOnDevice(shard_request, shard.device_index));
         }));
     }
 
-    std::vector<ShardResult> shard_results;
+    std::vector<std::pair<IndexShard, MatMulProductTileHashBatchResult>> shard_results;
     shard_results.reserve(futures.size());
     try {
         for (auto& future : futures) {
@@ -3841,220 +2703,61 @@ MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankBatchMultiDevice(
         result.error = std::string{"cuda_multi_device_batch_exception:"} + e.what();
         return result;
     }
-
-    for (const auto& shard_result : shard_results) {
-        if (!shard_result.result.success) {
-            result.available = shard_result.result.available;
-            result.error = "cuda_device_" + std::to_string(shard_result.shard.device_index) + "_batch_failed:" +
-                (shard_result.result.error.empty() ? "unknown_error" : shard_result.result.error);
-            return result;
-        }
-        if (result.words_per_request == 0) {
-            result.words_per_request = shard_result.result.words_per_request;
-        } else if (result.words_per_request != shard_result.result.words_per_request) {
-            result.error = "cuda_multi_device_batch_words_per_request_mismatch";
-            return result;
-        }
-    }
-
-    if (result.words_per_request == 0) {
-        result.error = "cuda_multi_device_batch_empty_result";
-        return result;
-    }
-
-    result.words.assign(static_cast<size_t>(request.batch_size) * result.words_per_request, Element{0});
-    for (const auto& shard_result : shard_results) {
-        const size_t expected_words = shard_result.shard.count * result.words_per_request;
-        if (shard_result.result.words.size() != expected_words) {
-            result.success = false;
-            result.error = "cuda_multi_device_batch_result_size_mismatch";
-            result.words.clear();
-            result.words_per_request = 0;
-            return result;
-        }
-        std::copy(
-            shard_result.result.words.begin(),
-            shard_result.result.words.end(),
-            result.words.begin() + static_cast<size_t>(shard_result.shard.start_index) * result.words_per_request);
-    }
-
-    result.success = true;
+    MergeShardResults(shard_results, request.batch_size, "_batch_failed:", result);
     return result;
 }
 
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankDeviceBatchOnDevice(
-    const MatMulLowRankCompressedWordsDeviceBatchRequest& request,
-    MatMulCompressedWordsMode mode,
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankDeviceBatchOnDevice(
+    const MatMulLowRankProductDeviceBatchRequest& request,
     int device_index)
 {
-    MatMulCompressedWordsBatchResult result;
+    MatMulProductTileHashBatchResult result;
     DigestProfilingSample sample;
-    const auto runtime_probe = ResolveCudaRuntimeForSelectedDevice(device_index, result.error);
-    result.available = runtime_probe.has_value();
-    if (!runtime_probe.has_value()) {
-        return result;
-    }
-    const auto runtime = *runtime_probe;
-
     if (!ValidateLowRankDeviceBatchRequest(request, result.error)) {
+        result.available = true;
         return result;
     }
 
-    auto lease = AcquireBufferPoolSlot(runtime.device_index, result.error);
-    if (!lease.has_value()) {
+    DeviceSession session;
+    if (!OpenDeviceSession(device_index, session, result)) {
         return result;
     }
-
-    auto& workspace = lease->workspace();
-    ResetWorkspaceForDevice(workspace, runtime.device_index);
-
-    cudaError_t error = cudaSetDevice(runtime.device_index);
-    if (error != cudaSuccess) {
-        result.error = "cudaSetDevice failed:" + CudaErrorString(error);
-        return result;
-    }
-    if (!EnsureWorkspaceStream(workspace, result.error)) {
-        return result;
-    }
+    auto& workspace = session.lease->workspace();
+    const auto& runtime = session.runtime;
 
     sample.n = request.n;
     sample.b = request.b;
     sample.r = request.r;
     sample.batch_size = request.batch_size;
-    sample.mode = ModeToString(mode);
+    sample.mode = "product_tile_hashes_low_rank_device_noise";
     sample.used_low_rank_path = true;
     sample.used_device_prepared_inputs = true;
     const uint32_t matrix_elements = request.n * request.n;
-    const uint32_t noise_left_elements = request.n * request.r;
-    const uint32_t noise_right_elements = request.r * request.n;
-    const uint32_t compress_elements = request.b * request.b;
-    const size_t total_matrix_elements = static_cast<size_t>(request.batch_size) * matrix_elements;
-    const uint32_t noise_e_l_offset_words = 0;
-    const uint32_t noise_e_r_offset_words = noise_e_l_offset_words + noise_left_elements;
-    const uint32_t noise_f_l_offset_words = noise_e_r_offset_words + noise_right_elements;
-    const uint32_t noise_f_r_offset_words = noise_f_l_offset_words + noise_left_elements;
-    const uint32_t compress_offset_words = noise_f_r_offset_words + noise_right_elements;
+    const NoiseLayout layout = MakeNoiseLayout(request.n, request.r);
     bool allocated_buffers{false};
     sample.base_matrix_cache_hit = IsBaseMatrixCacheHit(
-        workspace,
-        request.matrix_a_cache_key,
-        request.matrix_b_cache_key,
-        matrix_elements);
-
-    if (!EnsureCachedBaseMatrices(
-            workspace,
-            runtime,
-            request.matrix_a,
-            request.matrix_b,
-            request.matrix_a_cache_key,
-            request.matrix_b_cache_key,
-            matrix_elements,
-            result.error,
-            allocated_buffers)) {
-        return result;
-    }
-    if (!EnsureDeviceBuffer(workspace.device_matrix_a, workspace.matrix_a_capacity, total_matrix_elements, result.error, allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_matrix_b, workspace.matrix_b_capacity, total_matrix_elements, result.error, allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_prepared_input_ptrs,
-                            workspace.prepared_input_ptr_capacity,
-                            request.batch_size,
-                            result.error,
-                            allocated_buffers)) {
-        return result;
-    }
+        workspace, request.matrix_a_cache_key, request.matrix_b_cache_key, matrix_elements);
 
     const auto total_start = SteadyClock::now();
-    std::vector<const Element*> prepared_input_ptrs;
-    prepared_input_ptrs.reserve(request.batch_size);
-    const auto wait_start = SteadyClock::now();
-    for (uint32_t i = 0; i < request.batch_size; ++i) {
-        const auto* generated = request.generated_inputs[i];
-        if (generated->device_index != runtime.device_index ||
-            generated->n != request.n ||
-            generated->b != request.b ||
-            generated->r != request.r ||
-            generated->noise_words != noise_left_elements ||
-            generated->compress_words != compress_elements ||
-            generated->noise_e_l == nullptr ||
-            generated->noise_e_r == nullptr ||
-            generated->noise_f_l == nullptr ||
-            generated->noise_f_r == nullptr ||
-            generated->compress_vec == nullptr) {
-            result.error = "CUDA digest batch request contains incompatible device-generated inputs";
-            return result;
-        }
-
-        if (generated->ready_event != nullptr) {
-            error = cudaStreamWaitEvent(
-                workspace.stream,
-                reinterpret_cast<cudaEvent_t>(generated->ready_event),
-                0);
-            if (error != cudaSuccess) {
-                result.error = "cudaStreamWaitEvent failed:" + CudaErrorString(error);
-                return result;
-            }
-        }
-
-        prepared_input_ptrs.push_back(generated->storage);
-    }
-    sample.stream_wait_event_us = DurationMicros(wait_start, SteadyClock::now());
-
-    const auto pointer_copy_start = SteadyClock::now();
-    error = cudaMemcpyAsync(workspace.device_prepared_input_ptrs,
-                            prepared_input_ptrs.data(),
-                            request.batch_size * sizeof(const Element*),
-                            cudaMemcpyHostToDevice,
-                            workspace.stream);
-    sample.submit_h2d_us = DurationMicros(pointer_copy_start, SteadyClock::now());
-    if (error != cudaSuccess) {
-        result.error = "cudaMemcpy prepared_input_ptrs failed:" + CudaErrorString(error);
+    if (!EnsureCachedBaseMatrices(
+            workspace, runtime, request.matrix_a, request.matrix_b,
+            request.matrix_a_cache_key, request.matrix_b_cache_key,
+            matrix_elements, result.error, allocated_buffers)) {
         return result;
     }
-
-    const uint32_t build_blocks = static_cast<uint32_t>((total_matrix_elements + WORKSPACE_THREADS - 1) / WORKSPACE_THREADS);
-    const auto build_start = SteadyClock::now();
-    BuildPerturbedMatrixPackedPointersKernel<<<build_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-        workspace.device_base_a,
-        workspace.device_prepared_input_ptrs,
-        noise_e_l_offset_words,
-        noise_e_r_offset_words,
-        request.n,
-        request.r,
-        total_matrix_elements,
-        matrix_elements,
-        workspace.device_matrix_a);
-    error = cudaGetLastError();
-    if (error == cudaSuccess) {
-        BuildPerturbedMatrixPackedPointersKernel<<<build_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-            workspace.device_base_b,
-            workspace.device_prepared_input_ptrs,
-            noise_f_l_offset_words,
-            noise_f_r_offset_words,
-            request.n,
-            request.r,
-            total_matrix_elements,
-            matrix_elements,
-            workspace.device_matrix_b);
-        error = cudaGetLastError();
-    }
-    sample.launch_build_perturbed_us = DurationMicros(build_start, SteadyClock::now());
-    if (error != cudaSuccess) {
-        result.error = "CUDA perturbed-matrix kernel failed:" + CudaErrorString(error);
+    if (!StageDeviceGeneratedInputs(
+            workspace, runtime, layout, request.n, request.b, request.r, request.batch_size,
+            request.generated_inputs, sample, result.error, allocated_buffers)) {
         return result;
     }
-
-    if (!FinalizeCompressedWordsPackedPointerBatch(
-            *lease,
-            workspace,
-            request.n,
-            request.b,
-            request.r,
-            request.batch_size,
-            compress_offset_words,
-            mode,
-            result,
-            sample,
-            allocated_buffers)) {
+    if (!LaunchPerturbFromCachedBase(
+            workspace, layout, request.n, request.r, request.batch_size,
+            sample, result.error, allocated_buffers)) {
+        return result;
+    }
+    if (!RunProductTileHashPipeline(
+            *session.lease, workspace, request.n, request.b, request.r, request.batch_size,
+            request.sigmas, request.return_tile_hashes, result, sample, allocated_buffers)) {
         return result;
     }
 
@@ -4063,163 +2766,165 @@ MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankDeviceBatchOnDevic
     return result;
 }
 
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankVariableBaseDeviceBatchOnDevice(
-    const MatMulLowRankVariableBaseDeviceBatchRequest& request,
-    MatMulCompressedWordsMode mode,
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankDeviceBatch(
+    const MatMulLowRankProductDeviceBatchRequest& request)
+{
+    return ComputeProductTileHashesLowRankDeviceBatchMultiDevice(request);
+}
+
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankDeviceBatchMultiDevice(
+    const MatMulLowRankProductDeviceBatchRequest& request)
+{
+    MatMulProductTileHashBatchResult result;
+
+    const auto topology = ProbeCudaTopology();
+    result.available = topology.available;
+    if (!topology.available) {
+        result.error = topology.reason;
+        return result;
+    }
+    if (!ValidateLowRankDeviceBatchRequest(request, result.error)) {
+        return result;
+    }
+
+    const auto shards = PlanShardsByDeviceInputs(request.generated_inputs, request.batch_size);
+    if (shards.size() == 1) {
+        return ComputeProductTileHashesLowRankDeviceBatchOnDevice(request, shards.front().device_index);
+    }
+
+    std::vector<std::future<std::pair<IndexShard, MatMulProductTileHashBatchResult>>> futures;
+    futures.reserve(shards.size());
+    for (const auto& shard : shards) {
+        futures.push_back(std::async(std::launch::async, [request, shard]() {
+            std::vector<const MatMulGeneratedInputsDevice*> inputs;
+            std::vector<uint256> sigmas;
+            inputs.reserve(shard.indices.size());
+            sigmas.reserve(shard.indices.size());
+            for (const size_t index : shard.indices) {
+                inputs.push_back(request.generated_inputs[index]);
+                if (request.sigmas != nullptr) {
+                    sigmas.push_back(request.sigmas[index]);
+                }
+            }
+            const MatMulLowRankProductDeviceBatchRequest shard_request{
+                .n = request.n,
+                .b = request.b,
+                .r = request.r,
+                .batch_size = static_cast<uint32_t>(inputs.size()),
+                .matrix_a = request.matrix_a,
+                .matrix_b = request.matrix_b,
+                .matrix_a_cache_key = request.matrix_a_cache_key,
+                .matrix_b_cache_key = request.matrix_b_cache_key,
+                .generated_inputs = inputs.data(),
+                .sigmas = request.sigmas != nullptr ? sigmas.data() : nullptr,
+                .return_tile_hashes = request.return_tile_hashes,
+            };
+            return std::make_pair(shard, ComputeProductTileHashesLowRankDeviceBatchOnDevice(shard_request, shard.device_index));
+        }));
+    }
+
+    std::vector<std::pair<IndexShard, MatMulProductTileHashBatchResult>> shard_results;
+    shard_results.reserve(futures.size());
+    try {
+        for (auto& future : futures) {
+            shard_results.push_back(future.get());
+        }
+    } catch (const std::exception& e) {
+        result.error = std::string{"cuda_multi_device_prepared_batch_exception:"} + e.what();
+        return result;
+    }
+    MergeShardResults(shard_results, request.batch_size, "_prepared_batch_failed:", result);
+    return result;
+}
+
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankVariableBaseBatchOnDevice(
+    const MatMulLowRankVariableBaseProductBatchRequest& request,
     int device_index)
 {
-    MatMulCompressedWordsBatchResult result;
+    MatMulProductTileHashBatchResult result;
     DigestProfilingSample sample;
-    const auto runtime_probe = ResolveCudaRuntimeForSelectedDevice(device_index, result.error);
-    result.available = runtime_probe.has_value();
-    if (!runtime_probe.has_value()) {
-        return result;
-    }
-    const auto runtime = *runtime_probe;
-
-    if (!ValidateLowRankVariableBaseDeviceBatchRequest(request, result.error)) {
+    if (!ValidateLowRankVariableBaseBatchRequest(request, result.error)) {
+        result.available = true;
         return result;
     }
 
-    auto lease = AcquireBufferPoolSlot(runtime.device_index, result.error);
-    if (!lease.has_value()) {
+    DeviceSession session;
+    if (!OpenDeviceSession(device_index, session, result)) {
         return result;
     }
-
-    auto& workspace = lease->workspace();
-    ResetWorkspaceForDevice(workspace, runtime.device_index);
-
-    cudaError_t error = cudaSetDevice(runtime.device_index);
-    if (error != cudaSuccess) {
-        result.error = "cudaSetDevice failed:" + CudaErrorString(error);
-        return result;
-    }
-    if (!EnsureWorkspaceStream(workspace, result.error)) {
-        return result;
-    }
+    auto& workspace = session.lease->workspace();
+    const auto& runtime = session.runtime;
+    const bool device_inputs = VariableBaseRequestUsesDeviceInputs(request);
 
     sample.n = request.n;
     sample.b = request.b;
     sample.r = request.r;
     sample.batch_size = request.batch_size;
-    sample.mode = ModeToString(mode);
+    sample.mode = device_inputs
+        ? "product_tile_hashes_variable_base_device_noise"
+        : "product_tile_hashes_variable_base_host_noise";
     sample.used_low_rank_path = true;
-    sample.used_device_prepared_inputs = true;
+    sample.used_device_prepared_inputs = device_inputs;
     const uint32_t matrix_elements = request.n * request.n;
-    const uint32_t noise_left_elements = request.n * request.r;
-    const uint32_t noise_right_elements = request.r * request.n;
-    const uint32_t compress_elements = request.b * request.b;
     const size_t total_matrix_elements = static_cast<size_t>(request.batch_size) * matrix_elements;
-    const uint32_t noise_e_l_offset_words = 0;
-    const uint32_t noise_e_r_offset_words = noise_e_l_offset_words + noise_left_elements;
-    const uint32_t noise_f_l_offset_words = noise_e_r_offset_words + noise_right_elements;
-    const uint32_t noise_f_r_offset_words = noise_f_l_offset_words + noise_left_elements;
-    const uint32_t compress_offset_words = noise_f_r_offset_words + noise_right_elements;
+    const NoiseLayout layout = MakeNoiseLayout(request.n, request.r);
     bool allocated_buffers{false};
 
-    if (!EnsureDeviceBuffer(workspace.device_seed_a,
-                            workspace.seed_a_capacity,
-                            request.batch_size,
-                            result.error,
-                            allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_seed_b,
-                            workspace.seed_b_capacity,
-                            request.batch_size,
-                            result.error,
-                            allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_matrix_a,
-                            workspace.matrix_a_capacity,
-                            total_matrix_elements,
-                            result.error,
-                            allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_matrix_b,
-                            workspace.matrix_b_capacity,
-                            total_matrix_elements,
-                            result.error,
-                            allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_prepared_input_ptrs,
-                            workspace.prepared_input_ptr_capacity,
-                            request.batch_size,
-                            result.error,
-                            allocated_buffers)) {
+    if (!EnsureDeviceBuffer(workspace.device_seed_a, workspace.seed_a_capacity, request.batch_size, result.error, allocated_buffers) ||
+        !EnsureDeviceBuffer(workspace.device_seed_b, workspace.seed_b_capacity, request.batch_size, result.error, allocated_buffers) ||
+        !EnsureDeviceBuffer(workspace.device_matrix_a, workspace.matrix_a_capacity, total_matrix_elements, result.error, allocated_buffers) ||
+        !EnsureDeviceBuffer(workspace.device_matrix_b, workspace.matrix_b_capacity, total_matrix_elements, result.error, allocated_buffers) ||
+        !EnsureDeviceBuffer(workspace.device_seed_midstates, workspace.seed_midstates_capacity, static_cast<size_t>(request.batch_size) * 32U, result.error, allocated_buffers)) {
         return result;
     }
 
     const auto total_start = SteadyClock::now();
-    std::vector<const Element*> prepared_input_ptrs;
-    prepared_input_ptrs.reserve(request.batch_size);
-    const auto wait_start = SteadyClock::now();
-    for (uint32_t i = 0; i < request.batch_size; ++i) {
-        const auto* generated = request.generated_inputs[i];
-        if (generated->device_index != runtime.device_index ||
-            generated->n != request.n ||
-            generated->b != request.b ||
-            generated->r != request.r ||
-            generated->noise_words != noise_left_elements ||
-            generated->compress_words != compress_elements ||
-            generated->noise_e_l == nullptr ||
-            generated->noise_e_r == nullptr ||
-            generated->noise_f_l == nullptr ||
-            generated->noise_f_r == nullptr ||
-            generated->compress_vec == nullptr) {
-            result.error = "CUDA variable-base digest batch request contains incompatible device-generated inputs";
+    if (device_inputs) {
+        if (!StageDeviceGeneratedInputs(
+                workspace, runtime, layout, request.n, request.b, request.r, request.batch_size,
+                request.generated_inputs, sample, result.error, allocated_buffers)) {
             return result;
         }
-
-        if (generated->ready_event != nullptr) {
-            error = cudaStreamWaitEvent(
-                workspace.stream,
-                reinterpret_cast<cudaEvent_t>(generated->ready_event),
-                0);
-            if (error != cudaSuccess) {
-                result.error = "cudaStreamWaitEvent failed:" + CudaErrorString(error);
-                return result;
-            }
-        }
-
-        prepared_input_ptrs.push_back(generated->storage);
+    } else if (!StageHostNoise(
+                   workspace, layout, request.batch_size,
+                   request.noise_e_l, request.noise_e_r, request.noise_f_l, request.noise_f_r,
+                   sample, result.error, allocated_buffers)) {
+        return result;
     }
-    sample.stream_wait_event_us = DurationMicros(wait_start, SteadyClock::now());
 
+    std::string staging_warning;
+    if (!workspace.host_seeds.Ensure(static_cast<size_t>(request.batch_size) * 2U, staging_warning)) {
+        result.error = staging_warning;
+        return result;
+    }
+    DeviceSeedBytes* host_seeds = workspace.host_seeds.data();
+    std::memcpy(host_seeds, request.matrix_a_seeds, static_cast<size_t>(request.batch_size) * sizeof(DeviceSeedBytes));
+    std::memcpy(host_seeds + request.batch_size, request.matrix_b_seeds, static_cast<size_t>(request.batch_size) * sizeof(DeviceSeedBytes));
     const auto h2d_start = SteadyClock::now();
-    error = cudaMemcpyAsync(workspace.device_seed_a,
-                            request.matrix_a_seeds,
-                            request.batch_size * sizeof(DeviceSeedBytes),
-                            cudaMemcpyHostToDevice,
-                            workspace.stream);
+    cudaError_t error = cudaMemcpyAsync(workspace.device_seed_a,
+                                        host_seeds,
+                                        request.batch_size * sizeof(DeviceSeedBytes),
+                                        cudaMemcpyHostToDevice,
+                                        workspace.stream);
     if (error == cudaSuccess) {
         error = cudaMemcpyAsync(workspace.device_seed_b,
-                                request.matrix_b_seeds,
+                                host_seeds + request.batch_size,
                                 request.batch_size * sizeof(DeviceSeedBytes),
                                 cudaMemcpyHostToDevice,
                                 workspace.stream);
     }
-    if (error == cudaSuccess) {
-        error = cudaMemcpyAsync(workspace.device_prepared_input_ptrs,
-                                prepared_input_ptrs.data(),
-                                request.batch_size * sizeof(const Element*),
-                                cudaMemcpyHostToDevice,
-                                workspace.stream);
-    }
-    sample.submit_h2d_us = DurationMicros(h2d_start, SteadyClock::now());
+    sample.submit_h2d_us += DurationMicros(h2d_start, SteadyClock::now());
     if (error != cudaSuccess) {
-        result.error = "cudaMemcpy variable-base request data failed:" + CudaErrorString(error);
+        result.error = "cudaMemcpy variable-base seeds failed:" + CudaErrorString(error);
         return result;
     }
 
-    const uint32_t build_blocks = static_cast<uint32_t>((total_matrix_elements + WORKSPACE_THREADS - 1) / WORKSPACE_THREADS);
-    // Per-seed SHA midstate buffer (16 words/seed), with A records followed by
-    // B records so one launch can precompute both seed streams.
-    const uint32_t seed_midstate_words = request.batch_size * 32U;
-    if (!EnsureDeviceBuffer(workspace.device_seed_midstates,
-                            workspace.seed_midstates_capacity,
-                            seed_midstate_words,
-                            result.error,
-                            allocated_buffers)) {
-        return result;
-    }
+    const uint32_t blocks_per_matrix = matrix_elements / ORACLE_LANES;
+    const size_t total_blocks = static_cast<size_t>(request.batch_size) * blocks_per_matrix;
+    const uint32_t build_blocks = static_cast<uint32_t>((total_blocks + WORKSPACE_THREADS - 1) / WORKSPACE_THREADS);
     const uint32_t midstate_blocks = (request.batch_size + WORKSPACE_THREADS - 1U) / WORKSPACE_THREADS;
     const auto build_start = SteadyClock::now();
+    workspace.MarkBuildStart();
     PrecomputeSeedPairMidstatesKernel<<<midstate_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
         workspace.device_seed_a,
         workspace.device_seed_b,
@@ -4227,20 +2932,18 @@ MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankVariableBaseDevice
         workspace.device_seed_midstates);
     error = cudaGetLastError();
     if (error == cudaSuccess) {
-        GeneratePerturbedMatrixPairFromSeedMidstatePackedPointersKernel<<<build_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-            workspace.device_seed_a,
-            workspace.device_seed_b,
+        GeneratePerturbedMatrixPairFromSeedMidstateKernel<<<build_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
             workspace.device_seed_midstates,
             workspace.device_seed_midstates + static_cast<size_t>(request.batch_size) * 16U,
             workspace.device_prepared_input_ptrs,
-            noise_e_l_offset_words,
-            noise_e_r_offset_words,
-            noise_f_l_offset_words,
-            noise_f_r_offset_words,
+            layout.e_l_offset,
+            layout.e_r_offset,
+            layout.f_l_offset,
+            layout.f_r_offset,
             request.n,
             request.r,
-            total_matrix_elements,
-            matrix_elements,
+            blocks_per_matrix,
+            total_blocks,
             workspace.device_matrix_a,
             workspace.device_matrix_b);
         error = cudaGetLastError();
@@ -4251,18 +2954,9 @@ MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankVariableBaseDevice
         return result;
     }
 
-    if (!FinalizeCompressedWordsPackedPointerBatch(
-            *lease,
-            workspace,
-            request.n,
-            request.b,
-            request.r,
-            request.batch_size,
-            compress_offset_words,
-            mode,
-            result,
-            sample,
-            allocated_buffers)) {
+    if (!RunProductTileHashPipeline(
+            *session.lease, workspace, request.n, request.b, request.r, request.batch_size,
+            request.sigmas, request.return_tile_hashes, result, sample, allocated_buffers)) {
         return result;
     }
 
@@ -4271,461 +2965,91 @@ MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankVariableBaseDevice
     return result;
 }
 
-MatMulProductDigestBatchResult ComputeProductDigestsLowRankVariableBaseDeviceBatchOnDevice(
-    const MatMulLowRankVariableBaseProductDigestDeviceBatchRequest& request,
-    int device_index)
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankVariableBaseBatch(
+    const MatMulLowRankVariableBaseProductBatchRequest& request)
 {
-    MatMulProductDigestBatchResult result;
-    DigestProfilingSample sample;
-    const auto runtime_probe = ResolveCudaRuntimeForSelectedDevice(device_index, result.error);
-    result.available = runtime_probe.has_value();
-    if (!runtime_probe.has_value()) {
+    return ComputeProductTileHashesLowRankVariableBaseBatchMultiDevice(request);
+}
+
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankVariableBaseBatchMultiDevice(
+    const MatMulLowRankVariableBaseProductBatchRequest& request)
+{
+    MatMulProductTileHashBatchResult result;
+
+    const auto topology = ProbeCudaTopology();
+    result.available = topology.available;
+    if (!topology.available) {
+        result.error = topology.reason;
         return result;
     }
-    const auto runtime = *runtime_probe;
-
-    if (!ValidateLowRankVariableBaseProductDigestDeviceBatchRequest(request, result.error)) {
-        return result;
-    }
-
-    auto lease = AcquireBufferPoolSlot(runtime.device_index, result.error);
-    if (!lease.has_value()) {
-        return result;
-    }
-
-    auto& workspace = lease->workspace();
-    ResetWorkspaceForDevice(workspace, runtime.device_index);
-
-    cudaError_t error = cudaSetDevice(runtime.device_index);
-    if (error != cudaSuccess) {
-        result.error = "cudaSetDevice failed:" + CudaErrorString(error);
-        return result;
-    }
-    if (!EnsureWorkspaceStream(workspace, result.error)) {
+    if (!ValidateLowRankVariableBaseBatchRequest(request, result.error)) {
         return result;
     }
 
-    sample.n = request.n;
-    sample.b = request.b;
-    sample.r = request.r;
-    sample.batch_size = request.batch_size;
-    sample.mode = "product_digest";
-    sample.used_low_rank_path = true;
-    sample.used_device_prepared_inputs = true;
-    const uint32_t matrix_elements = request.n * request.n;
-    const uint32_t noise_left_elements = request.n * request.r;
-    const uint32_t noise_right_elements = request.r * request.n;
-    const uint32_t compress_elements = request.b * request.b;
-    const size_t total_matrix_elements = static_cast<size_t>(request.batch_size) * matrix_elements;
-    const uint32_t noise_e_l_offset_words = 0;
-    const uint32_t noise_e_r_offset_words = noise_e_l_offset_words + noise_left_elements;
-    const uint32_t noise_f_l_offset_words = noise_e_r_offset_words + noise_right_elements;
-    const uint32_t noise_f_r_offset_words = noise_f_l_offset_words + noise_left_elements;
-    const uint32_t compress_offset_words = noise_f_r_offset_words + noise_right_elements;
-    const bool stream_b_rhs = ShouldStreamProductDigestBIntoFactoredRhs(request.n, request.b);
-    const bool stream_a_words = ShouldUseStreamALowRankProductDigestWords(
-        request.n,
-        request.b,
-        request.r,
-        stream_b_rhs);
-    if (stream_a_words) {
-        sample.mode = "product_digest_stream_a";
-    }
-    bool allocated_buffers{false};
-
-    if (!EnsureDeviceBuffer(workspace.device_seed_a,
-                            workspace.seed_a_capacity,
-                            request.batch_size,
-                            result.error,
-                            allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_seed_b,
-                            workspace.seed_b_capacity,
-                            request.batch_size,
-                            result.error,
-                            allocated_buffers) ||
-        !EnsureDeviceBuffer(workspace.device_sigma,
-                            workspace.sigma_capacity,
-                            request.batch_size,
-                            result.error,
-                            allocated_buffers) ||
-        (!stream_a_words &&
-            !EnsureDeviceBuffer(workspace.device_matrix_a,
-                                workspace.matrix_a_capacity,
-                                total_matrix_elements,
-                                result.error,
-                                allocated_buffers)) ||
-        (!stream_b_rhs &&
-            !EnsureDeviceBuffer(workspace.device_matrix_b,
-                                workspace.matrix_b_capacity,
-                                total_matrix_elements,
-                                result.error,
-                                allocated_buffers)) ||
-        !EnsureDeviceBuffer(workspace.device_prepared_input_ptrs,
-                            workspace.prepared_input_ptr_capacity,
-                            request.batch_size,
-                            result.error,
-                            allocated_buffers)) {
+    const bool device_inputs = VariableBaseRequestUsesDeviceInputs(request);
+    const auto shards = device_inputs
+        ? PlanShardsByDeviceInputs(request.generated_inputs, request.batch_size)
+        : PlanContiguousShards(topology, request.batch_size);
+    if (shards.empty()) {
+        result.error = "no_cuda_batch_shards_available";
         return result;
     }
+    if (shards.size() == 1) {
+        return ComputeProductTileHashesLowRankVariableBaseBatchOnDevice(request, shards.front().device_index);
+    }
 
-    const auto total_start = SteadyClock::now();
-    std::vector<const Element*> prepared_input_ptrs;
-    prepared_input_ptrs.reserve(request.batch_size);
-    const auto wait_start = SteadyClock::now();
-    for (uint32_t i = 0; i < request.batch_size; ++i) {
-        const auto* generated = request.generated_inputs[i];
-        if (generated->device_index != runtime.device_index ||
-            generated->n != request.n ||
-            generated->b != request.b ||
-            generated->r != request.r ||
-            generated->noise_words != noise_left_elements ||
-            generated->compress_words != compress_elements ||
-            generated->noise_e_l == nullptr ||
-            generated->noise_e_r == nullptr ||
-            generated->noise_f_l == nullptr ||
-            generated->noise_f_r == nullptr ||
-            generated->compress_vec == nullptr) {
-            result.error = "CUDA variable-base product digest batch request contains incompatible device-generated inputs";
-            return result;
-        }
-
-        if (generated->ready_event != nullptr) {
-            error = cudaStreamWaitEvent(
-                workspace.stream,
-                reinterpret_cast<cudaEvent_t>(generated->ready_event),
-                0);
-            if (error != cudaSuccess) {
-                result.error = "cudaStreamWaitEvent failed:" + CudaErrorString(error);
-                return result;
+    std::vector<std::future<std::pair<IndexShard, MatMulProductTileHashBatchResult>>> futures;
+    futures.reserve(shards.size());
+    for (const auto& shard : shards) {
+        futures.push_back(std::async(std::launch::async, [request, shard, device_inputs]() {
+            std::vector<uint256> seed_a;
+            std::vector<uint256> seed_b;
+            std::vector<uint256> sigmas;
+            std::vector<const MatMulGeneratedInputsDevice*> inputs;
+            std::vector<const Element*> e_l;
+            std::vector<const Element*> e_r;
+            std::vector<const Element*> f_l;
+            std::vector<const Element*> f_r;
+            seed_a.reserve(shard.indices.size());
+            seed_b.reserve(shard.indices.size());
+            sigmas.reserve(shard.indices.size());
+            for (const size_t index : shard.indices) {
+                seed_a.push_back(request.matrix_a_seeds[index]);
+                seed_b.push_back(request.matrix_b_seeds[index]);
+                if (request.sigmas != nullptr) {
+                    sigmas.push_back(request.sigmas[index]);
+                }
+                if (device_inputs) {
+                    inputs.push_back(request.generated_inputs[index]);
+                } else {
+                    e_l.push_back(request.noise_e_l[index]);
+                    e_r.push_back(request.noise_e_r[index]);
+                    f_l.push_back(request.noise_f_l[index]);
+                    f_r.push_back(request.noise_f_r[index]);
+                }
             }
-        }
-
-        prepared_input_ptrs.push_back(generated->storage);
-    }
-    sample.stream_wait_event_us = DurationMicros(wait_start, SteadyClock::now());
-
-    const auto h2d_start = SteadyClock::now();
-    error = cudaMemcpyAsync(workspace.device_seed_a,
-                            request.matrix_a_seeds,
-                            request.batch_size * sizeof(DeviceSeedBytes),
-                            cudaMemcpyHostToDevice,
-                            workspace.stream);
-    if (error == cudaSuccess) {
-        error = cudaMemcpyAsync(workspace.device_seed_b,
-                                request.matrix_b_seeds,
-                                request.batch_size * sizeof(DeviceSeedBytes),
-                                cudaMemcpyHostToDevice,
-                                workspace.stream);
-    }
-    if (error == cudaSuccess) {
-        error = cudaMemcpyAsync(workspace.device_sigma,
-                                request.sigmas,
-                                request.batch_size * sizeof(DeviceSeedBytes),
-                                cudaMemcpyHostToDevice,
-                                workspace.stream);
-    }
-    if (error == cudaSuccess) {
-        error = cudaMemcpyAsync(workspace.device_prepared_input_ptrs,
-                                prepared_input_ptrs.data(),
-                                request.batch_size * sizeof(const Element*),
-                                cudaMemcpyHostToDevice,
-                                workspace.stream);
-    }
-    sample.submit_h2d_us = DurationMicros(h2d_start, SteadyClock::now());
-    if (error != cudaSuccess) {
-        result.error = "cudaMemcpy variable-base product digest request data failed:" + CudaErrorString(error);
-        return result;
-    }
-
-    const uint32_t build_blocks = static_cast<uint32_t>((total_matrix_elements + WORKSPACE_THREADS - 1) / WORKSPACE_THREADS);
-    const uint32_t seed_midstate_words = request.batch_size * 32U;
-    if (!EnsureDeviceBuffer(workspace.device_seed_midstates,
-                            workspace.seed_midstates_capacity,
-                            seed_midstate_words,
-                            result.error,
-                            allocated_buffers)) {
-        return result;
-    }
-    const uint32_t midstate_blocks = (request.batch_size + WORKSPACE_THREADS - 1U) / WORKSPACE_THREADS;
-    const auto build_start = SteadyClock::now();
-    PrecomputeSeedPairMidstatesKernel<<<midstate_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-        workspace.device_seed_a,
-        workspace.device_seed_b,
-        request.batch_size,
-        workspace.device_seed_midstates);
-    error = cudaGetLastError();
-    if (error == cudaSuccess && stream_a_words) {
-        // A' is reconstructed inside the word kernel. The B-side RHS builder
-        // still uses the B seed midstate below, so no full matrix batch is
-        // needed here.
-    } else if (error == cudaSuccess && stream_b_rhs) {
-        GeneratePerturbedMatrixFromSeedMidstatePackedPointersKernel<<<build_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-            workspace.device_seed_a,
-            workspace.device_seed_midstates,
-            workspace.device_prepared_input_ptrs,
-            noise_e_l_offset_words,
-            noise_e_r_offset_words,
-            request.n,
-            request.r,
-            total_matrix_elements,
-            matrix_elements,
-            workspace.device_matrix_a);
-        error = cudaGetLastError();
-    } else if (error == cudaSuccess) {
-        GeneratePerturbedMatrixPairFromSeedMidstatePackedPointersKernel<<<build_blocks, WORKSPACE_THREADS, 0, workspace.stream>>>(
-            workspace.device_seed_a,
-            workspace.device_seed_b,
-            workspace.device_seed_midstates,
-            workspace.device_seed_midstates + static_cast<size_t>(request.batch_size) * 16U,
-            workspace.device_prepared_input_ptrs,
-            noise_e_l_offset_words,
-            noise_e_r_offset_words,
-            noise_f_l_offset_words,
-            noise_f_r_offset_words,
-            request.n,
-            request.r,
-            total_matrix_elements,
-            matrix_elements,
-            workspace.device_matrix_a,
-            workspace.device_matrix_b);
-        error = cudaGetLastError();
-    }
-    sample.launch_build_perturbed_us = DurationMicros(build_start, SteadyClock::now());
-    if (error != cudaSuccess) {
-        result.error = "CUDA variable-base product digest matrix kernel failed:" + CudaErrorString(error);
-        return result;
-    }
-
-    if (!FinalizeProductDigestsPackedPointerBatch(
-            *lease,
-            workspace,
-            request.n,
-            request.b,
-            request.r,
-            request.batch_size,
-            noise_e_l_offset_words,
-            noise_e_r_offset_words,
-            noise_f_l_offset_words,
-            noise_f_r_offset_words,
-            compress_offset_words,
-            stream_b_rhs,
-            stream_a_words,
-            result,
-            sample,
-            allocated_buffers)) {
-        return result;
-    }
-
-    sample.total_wall_ms = DurationMillis(total_start, SteadyClock::now());
-    RecordProfilingSample(sample);
-    return result;
-}
-
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankDeviceBatch(
-    const MatMulLowRankCompressedWordsDeviceBatchRequest& request,
-    MatMulCompressedWordsMode mode)
-{
-    return ComputeCompressedWordsLowRankDeviceBatchMultiDevice(request, mode);
-}
-
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankDeviceBatchMultiDevice(
-    const MatMulLowRankCompressedWordsDeviceBatchRequest& request,
-    MatMulCompressedWordsMode mode)
-{
-    MatMulCompressedWordsBatchResult result;
-
-    const auto topology = ProbeCudaTopology();
-    result.available = topology.available;
-    if (!topology.available) {
-        result.error = topology.reason;
-        return result;
-    }
-
-    if (!ValidateLowRankDeviceBatchRequest(request, result.error)) {
-        return result;
-    }
-
-    struct DeviceShard {
-        int device_index{-1};
-        std::vector<size_t> indices;
-        std::vector<const MatMulGeneratedInputsDevice*> inputs;
-    };
-
-    std::map<int, DeviceShard> shard_map;
-    for (uint32_t i = 0; i < request.batch_size; ++i) {
-        const auto* generated = request.generated_inputs[i];
-        auto& shard = shard_map[generated->device_index];
-        shard.device_index = generated->device_index;
-        shard.indices.push_back(i);
-        shard.inputs.push_back(generated);
-    }
-
-    if (shard_map.size() == 1) {
-        return ComputeCompressedWordsLowRankDeviceBatchOnDevice(request, mode, shard_map.begin()->first);
-    }
-
-    struct ShardResult {
-        DeviceShard shard;
-        MatMulCompressedWordsBatchResult result;
-    };
-
-    std::vector<std::future<ShardResult>> futures;
-    futures.reserve(shard_map.size());
-    for (const auto& entry : shard_map) {
-        const auto& shard = entry.second;
-        futures.push_back(std::async(std::launch::async, [request, mode, shard]() {
-            const MatMulLowRankCompressedWordsDeviceBatchRequest shard_request{
+            const MatMulLowRankVariableBaseProductBatchRequest shard_request{
                 .n = request.n,
                 .b = request.b,
                 .r = request.r,
-                .batch_size = static_cast<uint32_t>(shard.inputs.size()),
-                .matrix_a = request.matrix_a,
-                .matrix_b = request.matrix_b,
-                .matrix_a_cache_key = request.matrix_a_cache_key,
-                .matrix_b_cache_key = request.matrix_b_cache_key,
-                .generated_inputs = shard.inputs.data(),
+                .batch_size = static_cast<uint32_t>(shard.indices.size()),
+                .matrix_a_seeds = seed_a.data(),
+                .matrix_b_seeds = seed_b.data(),
+                .generated_inputs = device_inputs ? inputs.data() : nullptr,
+                .noise_e_l = device_inputs ? nullptr : e_l.data(),
+                .noise_e_r = device_inputs ? nullptr : e_r.data(),
+                .noise_f_l = device_inputs ? nullptr : f_l.data(),
+                .noise_f_r = device_inputs ? nullptr : f_r.data(),
+                .sigmas = request.sigmas != nullptr ? sigmas.data() : nullptr,
+                .return_tile_hashes = request.return_tile_hashes,
             };
-            return ShardResult{
-                .shard = shard,
-                .result = ComputeCompressedWordsLowRankDeviceBatchOnDevice(shard_request, mode, shard.device_index),
-            };
+            return std::make_pair(
+                shard,
+                ComputeProductTileHashesLowRankVariableBaseBatchOnDevice(shard_request, shard.device_index));
         }));
     }
 
-    std::vector<ShardResult> shard_results;
-    shard_results.reserve(futures.size());
-    try {
-        for (auto& future : futures) {
-            shard_results.push_back(future.get());
-        }
-    } catch (const std::exception& e) {
-        result.error = std::string{"cuda_multi_device_prepared_batch_exception:"} + e.what();
-        return result;
-    }
-
-    for (const auto& shard_result : shard_results) {
-        if (!shard_result.result.success) {
-            result.available = shard_result.result.available;
-            result.error = "cuda_device_" + std::to_string(shard_result.shard.device_index) + "_prepared_batch_failed:" +
-                (shard_result.result.error.empty() ? "unknown_error" : shard_result.result.error);
-            return result;
-        }
-        if (result.words_per_request == 0) {
-            result.words_per_request = shard_result.result.words_per_request;
-        } else if (result.words_per_request != shard_result.result.words_per_request) {
-            result.error = "cuda_multi_device_prepared_batch_words_per_request_mismatch";
-            return result;
-        }
-    }
-
-    if (result.words_per_request == 0) {
-        result.error = "cuda_multi_device_prepared_batch_empty_result";
-        return result;
-    }
-
-    result.words.assign(static_cast<size_t>(request.batch_size) * result.words_per_request, Element{0});
-    for (const auto& shard_result : shard_results) {
-        const size_t expected_words = shard_result.shard.inputs.size() * result.words_per_request;
-        if (shard_result.result.words.size() != expected_words ||
-            shard_result.shard.indices.size() != shard_result.shard.inputs.size()) {
-            result.success = false;
-            result.error = "cuda_multi_device_prepared_batch_result_size_mismatch";
-            result.words.clear();
-            result.words_per_request = 0;
-            return result;
-        }
-        for (size_t i = 0; i < shard_result.shard.indices.size(); ++i) {
-            std::copy(
-                shard_result.result.words.begin() + i * result.words_per_request,
-                shard_result.result.words.begin() + (i + 1) * result.words_per_request,
-                result.words.begin() + shard_result.shard.indices[i] * result.words_per_request);
-        }
-    }
-
-    result.success = true;
-    return result;
-}
-
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankVariableBaseDeviceBatch(
-    const MatMulLowRankVariableBaseDeviceBatchRequest& request,
-    MatMulCompressedWordsMode mode)
-{
-    return ComputeCompressedWordsLowRankVariableBaseDeviceBatchMultiDevice(request, mode);
-}
-
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankVariableBaseDeviceBatchMultiDevice(
-    const MatMulLowRankVariableBaseDeviceBatchRequest& request,
-    MatMulCompressedWordsMode mode)
-{
-    MatMulCompressedWordsBatchResult result;
-
-    const auto topology = ProbeCudaTopology();
-    result.available = topology.available;
-    if (!topology.available) {
-        result.error = topology.reason;
-        return result;
-    }
-
-    if (!ValidateLowRankVariableBaseDeviceBatchRequest(request, result.error)) {
-        return result;
-    }
-
-    struct DeviceShard {
-        int device_index{-1};
-        std::vector<size_t> indices;
-        std::vector<uint256> seed_a;
-        std::vector<uint256> seed_b;
-        std::vector<const MatMulGeneratedInputsDevice*> inputs;
-    };
-
-    std::map<int, DeviceShard> shard_map;
-    for (uint32_t i = 0; i < request.batch_size; ++i) {
-        const auto* generated = request.generated_inputs[i];
-        auto& shard = shard_map[generated->device_index];
-        shard.device_index = generated->device_index;
-        shard.indices.push_back(i);
-        shard.seed_a.push_back(request.matrix_a_seeds[i]);
-        shard.seed_b.push_back(request.matrix_b_seeds[i]);
-        shard.inputs.push_back(generated);
-    }
-
-    if (shard_map.size() == 1) {
-        return ComputeCompressedWordsLowRankVariableBaseDeviceBatchOnDevice(
-            request,
-            mode,
-            shard_map.begin()->first);
-    }
-
-    struct ShardResult {
-        DeviceShard shard;
-        MatMulCompressedWordsBatchResult result;
-    };
-
-    std::vector<std::future<ShardResult>> futures;
-    futures.reserve(shard_map.size());
-    for (const auto& entry : shard_map) {
-        const auto& shard = entry.second;
-        futures.push_back(std::async(std::launch::async, [request, mode, shard]() {
-            const MatMulLowRankVariableBaseDeviceBatchRequest shard_request{
-                .n = request.n,
-                .b = request.b,
-                .r = request.r,
-                .batch_size = static_cast<uint32_t>(shard.inputs.size()),
-                .matrix_a_seeds = shard.seed_a.data(),
-                .matrix_b_seeds = shard.seed_b.data(),
-                .generated_inputs = shard.inputs.data(),
-            };
-            return ShardResult{
-                .shard = shard,
-                .result = ComputeCompressedWordsLowRankVariableBaseDeviceBatchOnDevice(
-                    shard_request,
-                    mode,
-                    shard.device_index),
-            };
-        }));
-    }
-
-    std::vector<ShardResult> shard_results;
+    std::vector<std::pair<IndexShard, MatMulProductTileHashBatchResult>> shard_results;
     shard_results.reserve(futures.size());
     try {
         for (auto& future : futures) {
@@ -4735,163 +3059,7 @@ MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankVariableBaseDevice
         result.error = std::string{"cuda_multi_device_variable_base_batch_exception:"} + e.what();
         return result;
     }
-
-    for (const auto& shard_result : shard_results) {
-        if (!shard_result.result.success) {
-            result.available = shard_result.result.available;
-            result.error = "cuda_device_" + std::to_string(shard_result.shard.device_index) + "_variable_base_batch_failed:" +
-                (shard_result.result.error.empty() ? "unknown_error" : shard_result.result.error);
-            return result;
-        }
-        if (result.words_per_request == 0) {
-            result.words_per_request = shard_result.result.words_per_request;
-        } else if (result.words_per_request != shard_result.result.words_per_request) {
-            result.error = "cuda_multi_device_variable_base_batch_words_per_request_mismatch";
-            return result;
-        }
-    }
-
-    if (result.words_per_request == 0) {
-        result.error = "cuda_multi_device_variable_base_batch_empty_result";
-        return result;
-    }
-
-    result.words.assign(static_cast<size_t>(request.batch_size) * result.words_per_request, Element{0});
-    for (const auto& shard_result : shard_results) {
-        const size_t expected_words = shard_result.shard.inputs.size() * result.words_per_request;
-        if (shard_result.result.words.size() != expected_words ||
-            shard_result.shard.indices.size() != shard_result.shard.inputs.size()) {
-            result.success = false;
-            result.error = "cuda_multi_device_variable_base_batch_result_size_mismatch";
-            result.words.clear();
-            result.words_per_request = 0;
-            return result;
-        }
-        for (size_t i = 0; i < shard_result.shard.indices.size(); ++i) {
-            std::copy(
-                shard_result.result.words.begin() + i * result.words_per_request,
-                shard_result.result.words.begin() + (i + 1) * result.words_per_request,
-                result.words.begin() + shard_result.shard.indices[i] * result.words_per_request);
-        }
-    }
-
-    result.success = true;
-    return result;
-}
-
-MatMulProductDigestBatchResult ComputeProductDigestsLowRankVariableBaseDeviceBatch(
-    const MatMulLowRankVariableBaseProductDigestDeviceBatchRequest& request)
-{
-    return ComputeProductDigestsLowRankVariableBaseDeviceBatchMultiDevice(request);
-}
-
-MatMulProductDigestBatchResult ComputeProductDigestsLowRankVariableBaseDeviceBatchMultiDevice(
-    const MatMulLowRankVariableBaseProductDigestDeviceBatchRequest& request)
-{
-    MatMulProductDigestBatchResult result;
-
-    const auto topology = ProbeCudaTopology();
-    result.available = topology.available;
-    if (!topology.available) {
-        result.error = topology.reason;
-        return result;
-    }
-
-    if (!ValidateLowRankVariableBaseProductDigestDeviceBatchRequest(request, result.error)) {
-        return result;
-    }
-
-    struct DeviceShard {
-        int device_index{-1};
-        std::vector<size_t> indices;
-        std::vector<uint256> seed_a;
-        std::vector<uint256> seed_b;
-        std::vector<uint256> sigmas;
-        std::vector<const MatMulGeneratedInputsDevice*> inputs;
-    };
-
-    std::map<int, DeviceShard> shard_map;
-    for (uint32_t i = 0; i < request.batch_size; ++i) {
-        const auto* generated = request.generated_inputs[i];
-        auto& shard = shard_map[generated->device_index];
-        shard.device_index = generated->device_index;
-        shard.indices.push_back(i);
-        shard.seed_a.push_back(request.matrix_a_seeds[i]);
-        shard.seed_b.push_back(request.matrix_b_seeds[i]);
-        shard.sigmas.push_back(request.sigmas[i]);
-        shard.inputs.push_back(generated);
-    }
-
-    if (shard_map.size() == 1) {
-        return ComputeProductDigestsLowRankVariableBaseDeviceBatchOnDevice(
-            request,
-            shard_map.begin()->first);
-    }
-
-    struct ShardResult {
-        DeviceShard shard;
-        MatMulProductDigestBatchResult result;
-    };
-
-    std::vector<std::future<ShardResult>> futures;
-    futures.reserve(shard_map.size());
-    for (const auto& entry : shard_map) {
-        const auto& shard = entry.second;
-        futures.push_back(std::async(std::launch::async, [request, shard]() {
-            const MatMulLowRankVariableBaseProductDigestDeviceBatchRequest shard_request{
-                .n = request.n,
-                .b = request.b,
-                .r = request.r,
-                .batch_size = static_cast<uint32_t>(shard.inputs.size()),
-                .matrix_a_seeds = shard.seed_a.data(),
-                .matrix_b_seeds = shard.seed_b.data(),
-                .sigmas = shard.sigmas.data(),
-                .generated_inputs = shard.inputs.data(),
-            };
-            return ShardResult{
-                .shard = shard,
-                .result = ComputeProductDigestsLowRankVariableBaseDeviceBatchOnDevice(
-                    shard_request,
-                    shard.device_index),
-            };
-        }));
-    }
-
-    std::vector<ShardResult> shard_results;
-    shard_results.reserve(futures.size());
-    try {
-        for (auto& future : futures) {
-            shard_results.push_back(future.get());
-        }
-    } catch (const std::exception& e) {
-        result.error = std::string{"cuda_multi_device_variable_base_product_digest_batch_exception:"} + e.what();
-        return result;
-    }
-
-    for (const auto& shard_result : shard_results) {
-        if (!shard_result.result.success) {
-            result.available = shard_result.result.available;
-            result.error = "cuda_device_" + std::to_string(shard_result.shard.device_index) + "_variable_base_product_digest_batch_failed:" +
-                (shard_result.result.error.empty() ? "unknown_error" : shard_result.result.error);
-            return result;
-        }
-    }
-
-    result.digests.assign(request.batch_size, uint256{});
-    for (const auto& shard_result : shard_results) {
-        if (shard_result.result.digests.size() != shard_result.shard.inputs.size() ||
-            shard_result.shard.indices.size() != shard_result.shard.inputs.size()) {
-            result.success = false;
-            result.error = "cuda_multi_device_variable_base_product_digest_batch_result_size_mismatch";
-            result.digests.clear();
-            return result;
-        }
-        for (size_t i = 0; i < shard_result.shard.indices.size(); ++i) {
-            result.digests[shard_result.shard.indices[i]] = shard_result.result.digests[i];
-        }
-    }
-
-    result.success = true;
+    MergeShardResults(shard_results, request.batch_size, "_variable_base_batch_failed:", result);
     return result;
 }
 

@@ -612,14 +612,12 @@ BOOST_AUTO_TEST_CASE(cuda_digest_buffer_pool_probe_reports_reuse_after_successfu
     const matmul::Matrix matrix_b(kN, kN);
     const uint256 sigma = ParseUint256("89abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567");
     const auto noise = matmul::noise::Generate(sigma, kN, kR);
-    const auto compress = matmul::transcript::DeriveCompressionVector(sigma, kB);
     const matmul::field::Element* noise_e_l[] = {noise.E_L.data()};
     const matmul::field::Element* noise_e_r[] = {noise.E_R.data()};
     const matmul::field::Element* noise_f_l[] = {noise.F_L.data()};
     const matmul::field::Element* noise_f_r[] = {noise.F_R.data()};
-    const matmul::field::Element* compress_vec[] = {compress.data()};
 
-    const auto first = qtc::cuda::ComputeCompressedWordsLowRankBatch(
+    const auto first = qtc::cuda::ComputeProductTileHashesLowRankBatch(
         {
             .n = kN,
             .b = kB,
@@ -631,9 +629,7 @@ BOOST_AUTO_TEST_CASE(cuda_digest_buffer_pool_probe_reports_reuse_after_successfu
             .noise_e_r = noise_e_r,
             .noise_f_l = noise_f_l,
             .noise_f_r = noise_f_r,
-            .compress_vec = compress_vec,
-        },
-        qtc::cuda::MatMulCompressedWordsMode::TRANSCRIPT_PREFIXES);
+        });
     BOOST_REQUIRE(first.success);
 
     const auto pool_after_first = qtc::cuda::ProbeMatMulBufferPool();
@@ -647,7 +643,7 @@ BOOST_AUTO_TEST_CASE(cuda_digest_buffer_pool_probe_reports_reuse_after_successfu
     BOOST_CHECK_GT(total_after_first, total_before);
     BOOST_CHECK_GT(pool_after_first.completed_submissions, pool_before.completed_submissions);
 
-    const auto second = qtc::cuda::ComputeCompressedWordsLowRankBatch(
+    const auto second = qtc::cuda::ComputeProductTileHashesLowRankBatch(
         {
             .n = kN,
             .b = kB,
@@ -659,9 +655,7 @@ BOOST_AUTO_TEST_CASE(cuda_digest_buffer_pool_probe_reports_reuse_after_successfu
             .noise_e_r = noise_e_r,
             .noise_f_l = noise_f_l,
             .noise_f_r = noise_f_r,
-            .compress_vec = compress_vec,
-        },
-        qtc::cuda::MatMulCompressedWordsMode::TRANSCRIPT_PREFIXES);
+        });
     BOOST_REQUIRE(second.success);
 
     const auto pool_after_second = qtc::cuda::ProbeMatMulBufferPool();
@@ -693,16 +687,14 @@ BOOST_AUTO_TEST_CASE(cuda_base_matrix_cache_requires_matching_content_keys)
         kN);
     const uint256 sigma = ParseUint256("3333333333333333333333333333333333333333333333333333333333333333");
     const auto noise = matmul::noise::Generate(sigma, kN, kR);
-    const auto compress = matmul::transcript::DeriveCompressionVector(sigma, kB);
     const matmul::field::Element* noise_e_l[] = {noise.E_L.data()};
     const matmul::field::Element* noise_e_r[] = {noise.E_R.data()};
     const matmul::field::Element* noise_f_l[] = {noise.F_L.data()};
     const matmul::field::Element* noise_f_r[] = {noise.F_R.data()};
-    const matmul::field::Element* compress_vec[] = {compress.data()};
 
     const uint256 cache_a0 = matrix_a.ContentHash();
     const uint256 cache_b0 = matrix_b.ContentHash();
-    const auto first = qtc::cuda::ComputeCompressedWordsLowRankBatch(
+    const auto first = qtc::cuda::ComputeProductTileHashesLowRankBatch(
         {
             .n = kN,
             .b = kB,
@@ -716,9 +708,7 @@ BOOST_AUTO_TEST_CASE(cuda_base_matrix_cache_requires_matching_content_keys)
             .noise_e_r = noise_e_r,
             .noise_f_l = noise_f_l,
             .noise_f_r = noise_f_r,
-            .compress_vec = compress_vec,
-        },
-        qtc::cuda::MatMulCompressedWordsMode::TRANSCRIPT_PREFIXES);
+        });
     BOOST_REQUIRE(first.success);
 
     matrix_a.at(0, 0) = matmul::field::add(matrix_a.at(0, 0), 7);
@@ -728,7 +718,7 @@ BOOST_AUTO_TEST_CASE(cuda_base_matrix_cache_requires_matching_content_keys)
 
     const uint256 cache_a1 = matrix_a.ContentHash();
     const uint256 cache_b1 = matrix_b.ContentHash();
-    const auto second = qtc::cuda::ComputeCompressedWordsLowRankBatch(
+    const auto second = qtc::cuda::ComputeProductTileHashesLowRankBatch(
         {
             .n = kN,
             .b = kB,
@@ -742,15 +732,13 @@ BOOST_AUTO_TEST_CASE(cuda_base_matrix_cache_requires_matching_content_keys)
             .noise_e_r = noise_e_r,
             .noise_f_l = noise_f_l,
             .noise_f_r = noise_f_r,
-            .compress_vec = compress_vec,
-        },
-        qtc::cuda::MatMulCompressedWordsMode::TRANSCRIPT_PREFIXES);
+        });
     BOOST_REQUIRE(second.success);
 
     const auto after_second = qtc::cuda::ProbeMatMulProfilingStats();
     BOOST_CHECK(!after_second.last_base_matrix_cache_hit);
 
-    const auto uncached = qtc::cuda::ComputeCompressedWordsLowRankBatch(
+    const auto uncached = qtc::cuda::ComputeProductTileHashesLowRankBatch(
         {
             .n = kN,
             .b = kB,
@@ -762,18 +750,16 @@ BOOST_AUTO_TEST_CASE(cuda_base_matrix_cache_requires_matching_content_keys)
             .noise_e_r = noise_e_r,
             .noise_f_l = noise_f_l,
             .noise_f_r = noise_f_r,
-            .compress_vec = compress_vec,
-        },
-        qtc::cuda::MatMulCompressedWordsMode::TRANSCRIPT_PREFIXES);
+        });
     BOOST_REQUIRE(uncached.success);
 
-    BOOST_CHECK(second.words == uncached.words);
-    BOOST_CHECK(first.words != second.words);
+    BOOST_CHECK(second.tile_hashes == uncached.tile_hashes);
+    BOOST_CHECK(first.tile_hashes != second.tile_hashes);
 
     const uint32_t repeat_attempts = std::max<uint32_t>(1U, qtc::cuda::ProbeMatMulBufferPool().slot_count);
     bool observed_cache_hit{false};
     for (uint32_t attempt = 0; attempt < repeat_attempts; ++attempt) {
-        const auto repeat = qtc::cuda::ComputeCompressedWordsLowRankBatch(
+        const auto repeat = qtc::cuda::ComputeProductTileHashesLowRankBatch(
             {
                 .n = kN,
                 .b = kB,
@@ -787,11 +773,9 @@ BOOST_AUTO_TEST_CASE(cuda_base_matrix_cache_requires_matching_content_keys)
                 .noise_e_r = noise_e_r,
                 .noise_f_l = noise_f_l,
                 .noise_f_r = noise_f_r,
-                .compress_vec = compress_vec,
-            },
-            qtc::cuda::MatMulCompressedWordsMode::TRANSCRIPT_PREFIXES);
+            });
         BOOST_REQUIRE(repeat.success);
-        BOOST_CHECK(repeat.words == second.words);
+        BOOST_CHECK(repeat.tile_hashes == second.tile_hashes);
 
         const auto after_repeat = qtc::cuda::ProbeMatMulProfilingStats();
         if (after_repeat.last_base_matrix_cache_hit) {
@@ -814,16 +798,15 @@ BOOST_AUTO_TEST_CASE(cuda_dispatch_probe_matches_runtime_availability)
     }
 
     BOOST_CHECK_EQUAL(dispatch.build_perturbed_threads, 256U);
-    BOOST_CHECK_EQUAL(dispatch.finalize_max_threads, 256U);
-    BOOST_CHECK_EQUAL(dispatch.finalize_threads_b4, 16U);
-    BOOST_CHECK_EQUAL(dispatch.finalize_threads_b8, 64U);
-    BOOST_CHECK_EQUAL(dispatch.finalize_threads_b16, 256U);
+    BOOST_CHECK_EQUAL(dispatch.gemm_tile_dim, 64U);
+    BOOST_CHECK_EQUAL(dispatch.gemm_threads, 256U);
+    BOOST_CHECK_EQUAL(dispatch.tile_hash_threads, 128U);
     BOOST_CHECK_EQUAL(dispatch.max_supported_block_size, 16U);
     BOOST_CHECK(dispatch.nonblocking_streams);
     BOOST_CHECK_EQUAL(dispatch.reason, "ready");
 }
 
-BOOST_AUTO_TEST_CASE(cuda_kernel_profile_reports_streamed_fused_pipeline)
+BOOST_AUTO_TEST_CASE(cuda_kernel_profile_reports_tiled_product_digest_v4_pipeline)
 {
     const auto probe = qtc::cuda::ProbeMatMulDigestAcceleration();
     const auto profile = qtc::cuda::ProbeMatMulKernelProfile();
@@ -840,7 +823,7 @@ BOOST_AUTO_TEST_CASE(cuda_kernel_profile_reports_streamed_fused_pipeline)
     }();
 
     BOOST_CHECK(profile.low_rank_perturbation_kernel);
-    BOOST_CHECK(profile.fused_compressed_words_finalize);
+    BOOST_CHECK(profile.tiled_product_digest_v4);
     BOOST_CHECK(profile.pinned_host_staging);
     BOOST_CHECK(profile.base_matrix_cache);
     BOOST_CHECK(profile.shared_buffer_pool);
@@ -872,14 +855,12 @@ BOOST_AUTO_TEST_CASE(cuda_profiling_probe_tracks_samples_after_successful_reques
     const matmul::Matrix matrix_b(kN, kN);
     const uint256 sigma = ParseUint256("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210");
     const auto noise = matmul::noise::Generate(sigma, kN, kR);
-    const auto compress = matmul::transcript::DeriveCompressionVector(sigma, kB);
     const matmul::field::Element* noise_e_l[] = {noise.E_L.data()};
     const matmul::field::Element* noise_e_r[] = {noise.E_R.data()};
     const matmul::field::Element* noise_f_l[] = {noise.F_L.data()};
     const matmul::field::Element* noise_f_r[] = {noise.F_R.data()};
-    const matmul::field::Element* compress_vec[] = {compress.data()};
 
-    const auto result = qtc::cuda::ComputeCompressedWordsLowRankBatch(
+    const auto result = qtc::cuda::ComputeProductTileHashesLowRankBatch(
         {
             .n = kN,
             .b = kB,
@@ -891,9 +872,7 @@ BOOST_AUTO_TEST_CASE(cuda_profiling_probe_tracks_samples_after_successful_reques
             .noise_e_r = noise_e_r,
             .noise_f_l = noise_f_l,
             .noise_f_r = noise_f_r,
-            .compress_vec = compress_vec,
-        },
-        qtc::cuda::MatMulCompressedWordsMode::TRANSCRIPT_PREFIXES);
+        });
     BOOST_REQUIRE(result.success);
 
     const auto after = qtc::cuda::ProbeMatMulProfilingStats();
@@ -902,7 +881,7 @@ BOOST_AUTO_TEST_CASE(cuda_profiling_probe_tracks_samples_after_successful_reques
     BOOST_CHECK_EQUAL(after.last_b, kB);
     BOOST_CHECK_EQUAL(after.last_r, kR);
     BOOST_CHECK_EQUAL(after.last_batch_size, 1U);
-    BOOST_CHECK_EQUAL(after.last_mode, "transcript_prefixes");
+    BOOST_CHECK_EQUAL(after.last_mode, "product_tile_hashes_low_rank_host_noise");
     BOOST_CHECK(after.last_used_low_rank_path);
     BOOST_CHECK(!after.last_used_device_prepared_inputs);
     BOOST_CHECK_GE(after.last_host_stage_us, 0.0);
@@ -944,7 +923,7 @@ BOOST_AUTO_TEST_CASE(cuda_profiling_probe_tracks_device_prepared_requests_withou
     const matmul::Matrix matrix_b(kN, kN);
     const qtc::cuda::MatMulGeneratedInputsDevice* generated_inputs[] = {generated.inputs.get()};
 
-    const auto result = qtc::cuda::ComputeCompressedWordsLowRankDeviceBatch(
+    const auto result = qtc::cuda::ComputeProductTileHashesLowRankDeviceBatch(
         {
             .n = kN,
             .b = kB,
@@ -953,8 +932,7 @@ BOOST_AUTO_TEST_CASE(cuda_profiling_probe_tracks_device_prepared_requests_withou
             .matrix_a = matrix_a.data(),
             .matrix_b = matrix_b.data(),
             .generated_inputs = generated_inputs,
-        },
-        qtc::cuda::MatMulCompressedWordsMode::TRANSCRIPT_PREFIXES);
+        });
     BOOST_REQUIRE(result.success);
 
     const auto after = qtc::cuda::ProbeMatMulProfilingStats();
@@ -963,7 +941,7 @@ BOOST_AUTO_TEST_CASE(cuda_profiling_probe_tracks_device_prepared_requests_withou
     BOOST_CHECK_EQUAL(after.last_b, kB);
     BOOST_CHECK_EQUAL(after.last_r, kR);
     BOOST_CHECK_EQUAL(after.last_batch_size, 1U);
-    BOOST_CHECK_EQUAL(after.last_mode, "transcript_prefixes");
+    BOOST_CHECK_EQUAL(after.last_mode, "product_tile_hashes_low_rank_device_noise");
     BOOST_CHECK(after.last_used_low_rank_path);
     BOOST_CHECK(after.last_used_device_prepared_inputs);
     BOOST_CHECK_EQUAL(after.last_submit_d2d_us, 0.0);
@@ -1297,7 +1275,6 @@ BOOST_AUTO_TEST_CASE(cuda_gpu_generated_inputs_match_cpu_oracle_generation)
 
     BOOST_REQUIRE(generated.success);
     const auto cpu_noise = matmul::noise::Generate(sigma, kN, kR);
-    const auto cpu_compress = matmul::transcript::DeriveCompressionVector(sigma, kB);
 
     BOOST_CHECK_EQUAL_COLLECTIONS(
         generated.noise_e_l.begin(), generated.noise_e_l.end(),
@@ -1311,9 +1288,6 @@ BOOST_AUTO_TEST_CASE(cuda_gpu_generated_inputs_match_cpu_oracle_generation)
     BOOST_CHECK_EQUAL_COLLECTIONS(
         generated.noise_f_r.begin(), generated.noise_f_r.end(),
         cpu_noise.F_R.data(), cpu_noise.F_R.data() + generated.noise_f_r.size());
-    BOOST_CHECK_EQUAL_COLLECTIONS(
-        generated.compress_vec.begin(), generated.compress_vec.end(),
-        cpu_compress.begin(), cpu_compress.end());
 }
 
 BOOST_AUTO_TEST_CASE(cuda_gpu_generated_inputs_profile_tracks_samples_and_pool_reuse)
@@ -1385,7 +1359,6 @@ BOOST_AUTO_TEST_CASE(cuda_gpu_generated_inputs_match_cpu_oracle_generation_for_m
 
     BOOST_REQUIRE(generated.success);
     const auto cpu_noise = matmul::noise::Generate(sigma, kN, kR);
-    const auto cpu_compress = matmul::transcript::DeriveCompressionVector(sigma, kB);
 
     BOOST_CHECK_EQUAL_COLLECTIONS(
         generated.noise_e_l.begin(), generated.noise_e_l.end(),
@@ -1399,9 +1372,6 @@ BOOST_AUTO_TEST_CASE(cuda_gpu_generated_inputs_match_cpu_oracle_generation_for_m
     BOOST_CHECK_EQUAL_COLLECTIONS(
         generated.noise_f_r.begin(), generated.noise_f_r.end(),
         cpu_noise.F_R.data(), cpu_noise.F_R.data() + generated.noise_f_r.size());
-    BOOST_CHECK_EQUAL_COLLECTIONS(
-        generated.compress_vec.begin(), generated.compress_vec.end(),
-        cpu_compress.begin(), cpu_compress.end());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

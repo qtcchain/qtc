@@ -1,6 +1,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// QTC oracle / nonce-seed Metal kernels.
+//
+// Oracle v2 reference: src/matmul/field.cpp (from_oracle / from_oracle_block).
+// Device output must be bit-identical to the CPU implementation.
+
 constant uint MODULUS = 0x7fffffffu;
 
 struct OracleParams {
@@ -118,7 +123,16 @@ inline uint bswap32(uint x)
            ((x & 0xff000000u) >> 24u);
 }
 
-inline uint candidate_from_seed_and_index(constant uchar* seed_internal, uint index, bool with_retry, uint retry)
+// ---------------------------------------------------------------------------
+// Oracle v2: block = index >> 3, lane = index & 7.
+//   H = SHA-256(seed_canonical || LE32(block) [|| LE32(retry) if retry > 0])
+//   candidate = LE32(H[4*lane..4*lane+3]) & 0x7FFFFFFF; 0x7FFFFFFF is rejected
+//   and retried with the SAME lane (retry 1..255); after 256 rejections the
+//   fallback is LE32(SHA-256(seed_canonical || LE32(block) || "oracle-fallback")
+//   [lane]) mod M31. seed_internal is the uint256 internal byte order.
+// ---------------------------------------------------------------------------
+
+inline void oracle_block_state(constant uchar* seed_internal, uint block, uint retry, thread uint state[8])
 {
     thread uint w[64];
     for (uint i = 0; i < 64; ++i) {
@@ -129,13 +143,13 @@ inline uint candidate_from_seed_and_index(constant uchar* seed_internal, uint in
         set_byte(w, i, seed_internal[31u - i]);
     }
 
-    set_byte(w, 32u, index & 0xffu);
-    set_byte(w, 33u, (index >> 8u) & 0xffu);
-    set_byte(w, 34u, (index >> 16u) & 0xffu);
-    set_byte(w, 35u, (index >> 24u) & 0xffu);
+    set_byte(w, 32u, block & 0xffu);
+    set_byte(w, 33u, (block >> 8u) & 0xffu);
+    set_byte(w, 34u, (block >> 16u) & 0xffu);
+    set_byte(w, 35u, (block >> 24u) & 0xffu);
 
     uint message_len = 36u;
-    if (with_retry) {
+    if (retry > 0u) {
         set_byte(w, 36u, retry & 0xffu);
         set_byte(w, 37u, (retry >> 8u) & 0xffu);
         set_byte(w, 38u, (retry >> 16u) & 0xffu);
@@ -146,14 +160,16 @@ inline uint candidate_from_seed_and_index(constant uchar* seed_internal, uint in
     set_byte(w, message_len, 0x80u);
     w[15] = message_len * 8u;
 
-    thread uint state[8];
     sha256_init(state);
     sha256_compress(state, w);
-
-    return bswap32(state[0]) & MODULUS;
 }
 
-inline uint fallback_candidate(constant uchar* seed_internal, uint index)
+inline uint oracle_lane_candidate(thread const uint state[8], uint lane)
+{
+    return bswap32(state[lane]) & MODULUS;
+}
+
+inline uint oracle_fallback_lane(constant uchar* seed_internal, uint block, uint lane)
 {
     thread uint w[64];
     for (uint i = 0; i < 64; ++i) {
@@ -164,10 +180,10 @@ inline uint fallback_candidate(constant uchar* seed_internal, uint index)
         set_byte(w, i, seed_internal[31u - i]);
     }
 
-    set_byte(w, 32u, index & 0xffu);
-    set_byte(w, 33u, (index >> 8u) & 0xffu);
-    set_byte(w, 34u, (index >> 16u) & 0xffu);
-    set_byte(w, 35u, (index >> 24u) & 0xffu);
+    set_byte(w, 32u, block & 0xffu);
+    set_byte(w, 33u, (block >> 8u) & 0xffu);
+    set_byte(w, 34u, (block >> 16u) & 0xffu);
+    set_byte(w, 35u, (block >> 24u) & 0xffu);
 
     const uchar fallback_tag[15] = {
         'o', 'r', 'a', 'c', 'l', 'e', '-', 'f', 'a', 'l', 'l', 'b', 'a', 'c', 'k'
@@ -182,21 +198,49 @@ inline uint fallback_candidate(constant uchar* seed_internal, uint index)
     thread uint state[8];
     sha256_init(state);
     sha256_compress(state, w);
-
-    return bswap32(state[0]) % MODULUS;
+    return bswap32(state[lane]) % MODULUS;
 }
 
-inline uint from_oracle(constant uchar* seed_internal, uint index)
+inline uint oracle_lane_with_retries(constant uchar* seed_internal, uint block, uint lane, uint first_retry)
 {
-    for (uint retry = 0; retry < 256; ++retry) {
-        const uint candidate = retry == 0
-            ? candidate_from_seed_and_index(seed_internal, index, false, 0u)
-            : candidate_from_seed_and_index(seed_internal, index, true, retry);
+    for (uint retry = first_retry; retry < 256u; ++retry) {
+        thread uint state[8];
+        oracle_block_state(seed_internal, block, retry, state);
+        const uint candidate = oracle_lane_candidate(state, lane);
         if (candidate < MODULUS) {
             return candidate;
         }
     }
-    return fallback_candidate(seed_internal, index);
+    return oracle_fallback_lane(seed_internal, block, lane);
+}
+
+// All eight lanes of one oracle block (== from_oracle(seed, 8*block + lane)).
+inline void oracle_fill_block(constant uchar* seed_internal, uint block, thread uint out[8])
+{
+    thread uint state[8];
+    oracle_block_state(seed_internal, block, 0u, state);
+    for (uint lane = 0; lane < 8u; ++lane) {
+        const uint candidate = oracle_lane_candidate(state, lane);
+        out[lane] = candidate < MODULUS
+            ? candidate
+            : oracle_lane_with_retries(seed_internal, block, lane, 1u);
+    }
+}
+
+inline void oracle_store_block(constant uchar* seed_internal, uint block, uint count, device uint* out)
+{
+    const uint base = block * 8u;
+    if (base >= count) {
+        return;
+    }
+    thread uint lanes[8];
+    oracle_fill_block(seed_internal, block, lanes);
+    for (uint lane = 0; lane < 8u; ++lane) {
+        const uint index = base + lane;
+        if (index < count) {
+            out[index] = lanes[lane];
+        }
+    }
 }
 
 inline void sha256_bytes(thread uchar* message, uint message_len, thread uchar out[32])
@@ -296,8 +340,9 @@ inline void compute_matmul_seed_v2(constant uchar* previous_block_hash,
 {
     thread uchar message[110];
     uint offset = 0u;
+    // HashWriter << std::string{"QTC_MATMUL_SEED_V2"}: CompactSize(18) || bytes
     const uchar tag[18] = {
-        'B', 'T', 'X', '_', 'M', 'A', 'T', 'M', 'U', 'L', '_', 'S', 'E', 'E', 'D', '_', 'V', '2'
+        'Q', 'T', 'C', '_', 'M', 'A', 'T', 'M', 'U', 'L', '_', 'S', 'E', 'E', 'D', '_', 'V', '2'
     };
     append_byte(message, offset, 18u);
     for (uint i = 0; i < 18u; ++i) {
@@ -329,8 +374,9 @@ inline void compute_matmul_seed_v3(constant uchar* previous_block_hash,
 {
     thread uchar message[118];
     uint offset = 0u;
+    // HashWriter << std::string{"QTC_MATMUL_SEED_V3"}: CompactSize(18) || bytes
     const uchar tag[18] = {
-        'B', 'T', 'X', '_', 'M', 'A', 'T', 'M', 'U', 'L', '_', 'S', 'E', 'E', 'D', '_', 'V', '3'
+        'Q', 'T', 'C', '_', 'M', 'A', 'T', 'M', 'U', 'L', '_', 'S', 'E', 'E', 'D', '_', 'V', '3'
     };
     append_byte(message, offset, 18u);
     for (uint i = 0; i < 18u; ++i) {
@@ -476,6 +522,8 @@ kernel void scan_nonce_seed_pre_hash(constant NonceSeedScanParams& p [[buffer(0)
     out_flags[gid] = uint256_internal_bytes_less_or_equal(sigma, pre_hash_target) ? 1u : 0u;
 }
 
+// One thread per oracle block (8 elements) for each of the four noise seeds.
+// Grid = ceil(count / 8).
 kernel void generate_oracle_noise_vectors(constant OracleParams& p [[buffer(0)]],
                                           constant uchar* seed_el [[buffer(1)]],
                                           constant uchar* seed_er [[buffer(2)]],
@@ -487,22 +535,17 @@ kernel void generate_oracle_noise_vectors(constant OracleParams& p [[buffer(0)]]
                                           device uint* out_f_r [[buffer(8)]],
                                           uint gid [[thread_position_in_grid]])
 {
-    if (gid >= p.count) {
-        return;
-    }
-    out_e_l[gid] = from_oracle(seed_el, gid);
-    out_e_r[gid] = from_oracle(seed_er, gid);
-    out_f_l[gid] = from_oracle(seed_fl, gid);
-    out_f_r[gid] = from_oracle(seed_fr, gid);
+    oracle_store_block(seed_el, gid, p.count, out_e_l);
+    oracle_store_block(seed_er, gid, p.count, out_e_r);
+    oracle_store_block(seed_fl, gid, p.count, out_f_l);
+    oracle_store_block(seed_fr, gid, p.count, out_f_r);
 }
 
+// out[i] = from_oracle(seed, i) for i in [0, count). One thread per block of 8.
 kernel void generate_oracle_vector(constant OracleParams& p [[buffer(0)]],
                                    constant uchar* seed_internal [[buffer(1)]],
                                    device uint* out [[buffer(2)]],
                                    uint gid [[thread_position_in_grid]])
 {
-    if (gid >= p.count) {
-        return;
-    }
-    out[gid] = from_oracle(seed_internal, gid);
+    oracle_store_block(seed_internal, gid, p.count, out);
 }

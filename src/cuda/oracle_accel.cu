@@ -8,7 +8,6 @@
 #include <cuda/cuda_context.h>
 #include <cuda_runtime.h>
 #include <matmul/noise.h>
-#include <matmul/transcript.h>
 #include <span.h>
 
 #include <algorithm>
@@ -16,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -30,6 +30,8 @@ using Element = matmul::field::Element;
 constexpr uint32_t MODULUS = matmul::field::MODULUS;
 constexpr uint32_t ORACLE_THREADS = 256;
 constexpr uint32_t ORACLE_SCAN_THREADS = 256;
+// Oracle v2 (QTC O5): one SHA-256 of seed||LE32(block) yields eight 31-bit lanes.
+constexpr uint32_t ORACLE_LANES = 8;
 
 struct OracleSeedBytes {
     uint8_t data[32];
@@ -54,7 +56,6 @@ struct OracleProfileState {
     std::atomic<uint64_t> reuse_events{0};
     std::mutex mutex;
     double last_encode_noise_us{0.0};
-    double last_encode_compress_us{0.0};
     double last_submit_wait_us{0.0};
     double last_gpu_generation_ms{0.0};
     std::string reason{"cuda_oracle_ready"};
@@ -120,7 +121,7 @@ struct OracleWorkspace {
     Element* out_e_r{nullptr};
     Element* out_f_l{nullptr};
     Element* out_f_r{nullptr};
-    Element* out_cv{nullptr};
+    Element* out_fill{nullptr};
     Element* out_scan_flags{nullptr};
     Element* out_scan_pass_count{nullptr};
     DeviceNonceSeedPreHashPassRecord* out_scan_pass_records{nullptr};
@@ -129,14 +130,12 @@ struct OracleWorkspace {
     OracleSeedBytes* batch_seed_er{nullptr};
     OracleSeedBytes* batch_seed_fl{nullptr};
     OracleSeedBytes* batch_seed_fr{nullptr};
-    OracleSeedBytes* batch_seed_cv{nullptr};
     Element** batch_out_e_l{nullptr};
     Element** batch_out_e_r{nullptr};
     Element** batch_out_f_l{nullptr};
     Element** batch_out_f_r{nullptr};
-    Element** batch_out_cv{nullptr};
     size_t noise_capacity{0};
-    size_t compress_capacity{0};
+    size_t fill_capacity{0};
     size_t scan_flags_capacity{0};
     size_t scan_pass_count_capacity{0};
     size_t scan_pass_records_capacity{0};
@@ -145,17 +144,15 @@ struct OracleWorkspace {
     size_t batch_seed_er_capacity{0};
     size_t batch_seed_fl_capacity{0};
     size_t batch_seed_fr_capacity{0};
-    size_t batch_seed_cv_capacity{0};
     size_t batch_out_e_l_capacity{0};
     size_t batch_out_e_r_capacity{0};
     size_t batch_out_f_l_capacity{0};
     size_t batch_out_f_r_capacity{0};
-    size_t batch_out_cv_capacity{0};
     HostStageBuffer host_e_l;
     HostStageBuffer host_e_r;
     HostStageBuffer host_f_l;
     HostStageBuffer host_f_r;
-    HostStageBuffer host_cv;
+    HostStageBuffer host_fill;
     HostStageBuffer host_scan_flags;
 
     void ReleaseScanBuffers()
@@ -181,13 +178,11 @@ struct OracleWorkspace {
         cudaFree(batch_seed_er);
         cudaFree(batch_seed_fl);
         cudaFree(batch_seed_fr);
-        cudaFree(batch_seed_cv);
         cudaFree(batch_out_e_l);
         cudaFree(batch_out_e_r);
         cudaFree(batch_out_f_l);
         cudaFree(batch_out_f_r);
-        cudaFree(batch_out_cv);
-        cudaFree(out_cv);
+        cudaFree(out_fill);
         cudaFree(out_f_r);
         cudaFree(out_f_l);
         cudaFree(out_e_r);
@@ -197,29 +192,25 @@ struct OracleWorkspace {
         batch_seed_er = nullptr;
         batch_seed_fl = nullptr;
         batch_seed_fr = nullptr;
-        batch_seed_cv = nullptr;
         batch_out_e_l = nullptr;
         batch_out_e_r = nullptr;
         batch_out_f_l = nullptr;
         batch_out_f_r = nullptr;
-        batch_out_cv = nullptr;
-        out_cv = nullptr;
+        out_fill = nullptr;
         out_f_r = nullptr;
         out_f_l = nullptr;
         out_e_r = nullptr;
         out_e_l = nullptr;
         noise_capacity = 0;
-        compress_capacity = 0;
+        fill_capacity = 0;
         batch_seed_el_capacity = 0;
         batch_seed_er_capacity = 0;
         batch_seed_fl_capacity = 0;
         batch_seed_fr_capacity = 0;
-        batch_seed_cv_capacity = 0;
         batch_out_e_l_capacity = 0;
         batch_out_e_r_capacity = 0;
         batch_out_f_l_capacity = 0;
         batch_out_f_r_capacity = 0;
-        batch_out_cv_capacity = 0;
     }
 
     void ReleaseStream()
@@ -268,37 +259,6 @@ DeviceInputPoolContext& GetDeviceInputPoolContext()
 {
     static DeviceInputPoolContext context;
     return context;
-}
-
-std::array<uint8_t, 32> ToCanonicalBytes(const uint256& value)
-{
-    std::array<uint8_t, 32> out;
-    for (size_t i = 0; i < out.size(); ++i) {
-        out[i] = value.data()[out.size() - 1 - i];
-    }
-    return out;
-}
-
-uint256 CanonicalBytesToUint256(const uint8_t* bytes)
-{
-    std::array<unsigned char, 32> internal;
-    for (size_t i = 0; i < internal.size(); ++i) {
-        internal[i] = bytes[internal.size() - 1 - i];
-    }
-    return uint256{Span<const unsigned char>{internal.data(), internal.size()}};
-}
-
-uint256 DeriveCompressionSeed(const uint256& sigma)
-{
-    const auto sigma_bytes = ToCanonicalBytes(sigma);
-    CSHA256 hasher;
-    hasher.Write(reinterpret_cast<const uint8_t*>(matmul::transcript::COMPRESS_TAG.data()),
-                 matmul::transcript::COMPRESS_TAG.size());
-    hasher.Write(sigma_bytes.data(), sigma_bytes.size());
-
-    uint8_t digest[CSHA256::OUTPUT_SIZE];
-    hasher.Finalize(digest);
-    return CanonicalBytesToUint256(digest);
 }
 
 OracleSeedBytes ToInternalSeedBytes(const uint256& seed)
@@ -393,16 +353,13 @@ bool EnsureTypedDeviceBuffer(T*& buffer, size_t& capacity, size_t required, std:
 
 bool EnsureOutputBuffers(OracleWorkspace& workspace,
                          size_t noise_words,
-                         size_t compress_words,
                          std::string& error)
 {
     const bool reused = workspace.out_e_l != nullptr &&
         workspace.out_e_r != nullptr &&
         workspace.out_f_l != nullptr &&
         workspace.out_f_r != nullptr &&
-        workspace.out_cv != nullptr &&
-        workspace.noise_capacity >= noise_words &&
-        workspace.compress_capacity >= compress_words;
+        workspace.noise_capacity >= noise_words;
 
     if (reused) {
         g_profile.pool_initialized.store(true, std::memory_order_relaxed);
@@ -446,19 +403,6 @@ bool EnsureOutputBuffers(OracleWorkspace& workspace,
         workspace.noise_capacity = noise_words;
     }
 
-    if (!EnsureDeviceBuffer(workspace.out_cv, workspace.compress_capacity, compress_words, error)) {
-        cudaFree(workspace.out_e_l);
-        cudaFree(workspace.out_e_r);
-        cudaFree(workspace.out_f_l);
-        cudaFree(workspace.out_f_r);
-        workspace.out_e_l = nullptr;
-        workspace.out_e_r = nullptr;
-        workspace.out_f_l = nullptr;
-        workspace.out_f_r = nullptr;
-        workspace.noise_capacity = 0;
-        return false;
-    }
-
     g_profile.pool_initialized.store(true, std::memory_order_relaxed);
     g_profile.allocation_events.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -466,8 +410,7 @@ bool EnsureOutputBuffers(OracleWorkspace& workspace,
 
 bool ValidateInputGenerationRequest(const MatMulInputGenerationRequest& request,
                                     std::string& error,
-                                    uint32_t& noise_words,
-                                    uint32_t& compress_words)
+                                    uint32_t& noise_words)
 {
     if (request.n == 0 || request.b == 0 || request.r == 0) {
         error = "invalid dimensions for GPU input generation";
@@ -483,27 +426,22 @@ bool ValidateInputGenerationRequest(const MatMulInputGenerationRequest& request,
     }
 
     const uint64_t noise_words64 = static_cast<uint64_t>(request.n) * request.r;
-    const uint64_t compress_words64 = static_cast<uint64_t>(request.b) * request.b;
-    if (noise_words64 > std::numeric_limits<uint32_t>::max() ||
-        compress_words64 > std::numeric_limits<uint32_t>::max()) {
+    if (noise_words64 > std::numeric_limits<uint32_t>::max()) {
         error = "input generation dimensions exceed supported bounds";
         return false;
     }
 
     noise_words = static_cast<uint32_t>(noise_words64);
-    compress_words = static_cast<uint32_t>(compress_words64);
     return true;
 }
 
 void UpdateProfile(double encode_noise_us,
-                   double encode_compress_us,
                    double submit_wait_us,
                    const char* reason)
 {
     {
         std::lock_guard<std::mutex> lock(g_profile.mutex);
         g_profile.last_encode_noise_us = encode_noise_us;
-        g_profile.last_encode_compress_us = encode_compress_us;
         g_profile.last_submit_wait_us = submit_wait_us;
         g_profile.last_gpu_generation_ms = submit_wait_us / 1000.0;
         g_profile.reason = reason;
@@ -517,7 +455,6 @@ bool EnsureGeneratedInputsDeviceBuffers(DeviceInputPoolSlot& slot,
                                         uint32_t b,
                                         uint32_t r,
                                         uint32_t noise_words,
-                                        uint32_t compress_words,
                                         std::string& error,
                                         bool& allocated)
 {
@@ -534,7 +471,6 @@ bool EnsureGeneratedInputsDeviceBuffers(DeviceInputPoolSlot& slot,
         inputs.noise_e_r = nullptr;
         inputs.noise_f_l = nullptr;
         inputs.noise_f_r = nullptr;
-        inputs.compress_vec = nullptr;
         slot.storage_capacity_words = 0;
     }
 
@@ -547,10 +483,8 @@ bool EnsureGeneratedInputsDeviceBuffers(DeviceInputPoolSlot& slot,
     inputs.b = b;
     inputs.r = r;
     inputs.noise_words = noise_words;
-    inputs.compress_words = compress_words;
 
-    const size_t total_words =
-        static_cast<size_t>(noise_words) * 4U + compress_words;
+    const size_t total_words = static_cast<size_t>(noise_words) * 4U;
     if (total_words == 0) {
         return true;
     }
@@ -562,7 +496,6 @@ bool EnsureGeneratedInputsDeviceBuffers(DeviceInputPoolSlot& slot,
         inputs.noise_e_r = nullptr;
         inputs.noise_f_l = nullptr;
         inputs.noise_f_r = nullptr;
-        inputs.compress_vec = nullptr;
 
         const cudaError_t alloc_error = cudaMalloc(&inputs.storage, total_words * sizeof(Element));
         if (alloc_error != cudaSuccess) {
@@ -577,7 +510,6 @@ bool EnsureGeneratedInputsDeviceBuffers(DeviceInputPoolSlot& slot,
     inputs.noise_e_r = inputs.noise_e_l + noise_words;
     inputs.noise_f_l = inputs.noise_e_r + noise_words;
     inputs.noise_f_r = inputs.noise_f_l + noise_words;
-    inputs.compress_vec = inputs.noise_f_r + noise_words;
     return true;
 }
 
@@ -603,7 +535,6 @@ std::shared_ptr<const MatMulGeneratedInputsDevice> AcquireGeneratedInputsDevice(
                                                                                 uint32_t b,
                                                                                 uint32_t r,
                                                                                 uint32_t noise_words,
-                                                                                uint32_t compress_words,
                                                                                 std::string& error)
 {
     auto& context = GetDeviceInputPoolContext();
@@ -642,7 +573,6 @@ std::shared_ptr<const MatMulGeneratedInputsDevice> AcquireGeneratedInputsDevice(
             b,
             r,
             noise_words,
-            compress_words,
             error,
             allocated_buffers)) {
         std::lock_guard<std::mutex> relock(context.mutex);
@@ -822,78 +752,134 @@ __device__ inline void Sha256StateToBytes(const uint32_t state[8], uint8_t out[3
     }
 }
 
-__device__ inline uint32_t CandidateFromSeedAndIndex(const OracleSeedBytes& seed,
-                                                     uint32_t index,
-                                                     bool with_retry,
-                                                     uint32_t retry)
+// ---- Oracle v2 (QTC O5), consensus reference: matmul/field.cpp ----
+// preimage = seed_canonical(32) || LE32(block) [|| LE32(retry) when retry > 0]
+// candidate(lane) = ReadLE32(SHA256(preimage) + 4*lane) & MODULUS; rejected when
+// == MODULUS and retried with the SAME lane (retry 1, 2, ...); after 256 retries
+// the deterministic fallback SHA256(seed || LE32(block) || "oracle-fallback")
+// supplies ReadLE32(lane bytes) % MODULUS. Element index i lives at
+// block = i >> 3, lane = i & 7, so index 0 equals the v1 oracle.
+//
+// The canonical seed bytes (seed.data() reversed) occupy message words w[0..7]
+// as big-endian SHA words; the lane value is ReadLE32 of state[lane]'s bytes,
+// i.e. Bswap32(state[lane]).
+
+__device__ inline void PackSeedWords(const OracleSeedBytes& seed, uint32_t seed_w[8])
 {
-    uint32_t w[16] = {};
-    for (uint32_t i = 0; i < 32; ++i) {
-        SetByte(w, i, seed.data[31U - i]);
+    #pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+        seed_w[i] = 0U;
     }
+    for (uint32_t i = 0; i < 32; ++i) {
+        SetByte(seed_w, i, seed.data[31U - i]);
+    }
+}
 
-    SetByte(w, 32U, index & 0xffU);
-    SetByte(w, 33U, (index >> 8U) & 0xffU);
-    SetByte(w, 34U, (index >> 16U) & 0xffU);
-    SetByte(w, 35U, (index >> 24U) & 0xffU);
-
+__device__ inline void OracleBlockState(const uint32_t seed_w[8],
+                                        uint32_t block,
+                                        uint32_t retry,
+                                        uint32_t state[8])
+{
+    uint32_t w[16];
+    #pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+        w[i] = seed_w[i];
+    }
+    #pragma unroll
+    for (uint32_t i = 8; i < 16; ++i) {
+        w[i] = 0U;
+    }
+    SetLE32(w, 32U, block);
     uint32_t message_len = 36U;
-    if (with_retry) {
-        SetByte(w, 36U, retry & 0xffU);
-        SetByte(w, 37U, (retry >> 8U) & 0xffU);
-        SetByte(w, 38U, (retry >> 16U) & 0xffU);
-        SetByte(w, 39U, (retry >> 24U) & 0xffU);
+    if (retry > 0) {
+        SetLE32(w, 36U, retry);
         message_len = 40U;
     }
-
     SetByte(w, message_len, 0x80U);
     w[15] = message_len * 8U;
 
-    uint32_t state[8];
     Sha256Init(state);
     Sha256Compress(state, w);
-    return Bswap32(state[0]) & MODULUS;
 }
 
-__device__ inline uint32_t FallbackCandidate(const OracleSeedBytes& seed, uint32_t index)
+__device__ inline Element OracleFallbackLane(const uint32_t seed_w[8], uint32_t block, uint32_t lane)
 {
-    uint32_t w[16] = {};
-    for (uint32_t i = 0; i < 32; ++i) {
-        SetByte(w, i, seed.data[31U - i]);
+    uint32_t w[16];
+    #pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+        w[i] = seed_w[i];
     }
-
-    SetByte(w, 32U, index & 0xffU);
-    SetByte(w, 33U, (index >> 8U) & 0xffU);
-    SetByte(w, 34U, (index >> 16U) & 0xffU);
-    SetByte(w, 35U, (index >> 24U) & 0xffU);
-
+    #pragma unroll
+    for (uint32_t i = 8; i < 16; ++i) {
+        w[i] = 0U;
+    }
+    SetLE32(w, 32U, block);
     constexpr uint8_t fallback_tag[15] = {
         'o', 'r', 'a', 'c', 'l', 'e', '-', 'f', 'a', 'l', 'l', 'b', 'a', 'c', 'k'
     };
     for (uint32_t i = 0; i < 15; ++i) {
         SetByte(w, 36U + i, fallback_tag[i]);
     }
-
     SetByte(w, 51U, 0x80U);
     w[15] = 51U * 8U;
 
     uint32_t state[8];
     Sha256Init(state);
     Sha256Compress(state, w);
-    return Bswap32(state[0]) % MODULUS;
+    return Bswap32(state[lane]) % MODULUS;
 }
 
-__device__ inline uint32_t FromOracle(const OracleSeedBytes& seed, uint32_t index)
+__device__ inline Element OracleLaneWithRetries(const uint32_t seed_w[8],
+                                                uint32_t block,
+                                                uint32_t lane,
+                                                uint32_t first_retry)
 {
-    for (uint32_t retry = 0; retry < 256; ++retry) {
-        const uint32_t candidate = retry == 0
-            ? CandidateFromSeedAndIndex(seed, index, false, 0U)
-            : CandidateFromSeedAndIndex(seed, index, true, retry);
+    for (uint32_t retry = first_retry; retry < 256; ++retry) {
+        uint32_t state[8];
+        OracleBlockState(seed_w, block, retry, state);
+        const uint32_t candidate = Bswap32(state[lane]) & MODULUS;
         if (candidate < MODULUS) {
             return candidate;
         }
     }
-    return FallbackCandidate(seed, index);
+    return OracleFallbackLane(seed_w, block, lane);
+}
+
+// All eight lanes of one oracle block: out[k] = from_oracle(seed, 8*block + k).
+__device__ inline void FromOracleBlock(const uint32_t seed_w[8], uint32_t block, Element out[ORACLE_LANES])
+{
+    uint32_t state[8];
+    OracleBlockState(seed_w, block, /*retry=*/0U, state);
+    #pragma unroll
+    for (uint32_t lane = 0; lane < ORACLE_LANES; ++lane) {
+        const uint32_t candidate = Bswap32(state[lane]) & MODULUS;
+        out[lane] = candidate < MODULUS
+            ? candidate
+            : OracleLaneWithRetries(seed_w, block, lane, /*first_retry=*/1U);
+    }
+}
+
+__device__ inline Element FromOracleIndex(const uint32_t seed_w[8], uint32_t index)
+{
+    return OracleLaneWithRetries(seed_w, index >> 3U, index & 7U, /*first_retry=*/0U);
+}
+
+// One thread per 8-lane oracle block; writes lanes [8*block, 8*block+8) ∩ [0,count).
+__device__ inline void WriteOracleBlock(const uint32_t seed_w[8], uint32_t block, uint32_t count, Element* out)
+{
+    Element lanes[ORACLE_LANES];
+    FromOracleBlock(seed_w, block, lanes);
+    const uint32_t base = block * ORACLE_LANES;
+    if (base + ORACLE_LANES <= count) {
+        #pragma unroll
+        for (uint32_t lane = 0; lane < ORACLE_LANES; ++lane) {
+            out[base + lane] = lanes[lane];
+        }
+    } else {
+        for (uint32_t lane = 0; base + lane < count; ++lane) {
+            out[base + lane] = lanes[lane];
+        }
+    }
 }
 
 __device__ inline void CopySha256State(const uint32_t in[8], uint32_t out[8])
@@ -1271,6 +1257,8 @@ __global__ void HydrateNonceSeedPreHashPassRecordsKernel(OracleSeedBytes merkle_
     out_records[gid] = record;
 }
 
+// Noise generation: one thread per 8-lane oracle block for all four noise
+// factors of one request. count = n*r words per factor.
 __global__ void GenerateOracleNoiseKernel(OracleSeedBytes seed_el,
                                           OracleSeedBytes seed_er,
                                           OracleSeedBytes seed_fl,
@@ -1279,29 +1267,23 @@ __global__ void GenerateOracleNoiseKernel(OracleSeedBytes seed_el,
                                           Element* out_e_r,
                                           Element* out_f_l,
                                           Element* out_f_r,
-                                          uint32_t count)
+                                          uint32_t count,
+                                          uint32_t block_count)
 {
-    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (gid >= count) {
+    const uint32_t block = blockIdx.x * blockDim.x + threadIdx.x;
+    if (block >= block_count) {
         return;
     }
 
-    out_e_l[gid] = FromOracle(seed_el, gid);
-    out_e_r[gid] = FromOracle(seed_er, gid);
-    out_f_l[gid] = FromOracle(seed_fl, gid);
-    out_f_r[gid] = FromOracle(seed_fr, gid);
-}
-
-__global__ void GenerateOracleVectorKernel(OracleSeedBytes seed_cv,
-                                           Element* out,
-                                           uint32_t count)
-{
-    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (gid >= count) {
-        return;
-    }
-
-    out[gid] = FromOracle(seed_cv, gid);
+    uint32_t seed_w[8];
+    PackSeedWords(seed_el, seed_w);
+    WriteOracleBlock(seed_w, block, count, out_e_l);
+    PackSeedWords(seed_er, seed_w);
+    WriteOracleBlock(seed_w, block, count, out_e_r);
+    PackSeedWords(seed_fl, seed_w);
+    WriteOracleBlock(seed_w, block, count, out_f_l);
+    PackSeedWords(seed_fr, seed_w);
+    WriteOracleBlock(seed_w, block, count, out_f_r);
 }
 
 __global__ void GenerateOracleNoiseBatchKernel(const OracleSeedBytes* seed_el,
@@ -1313,34 +1295,46 @@ __global__ void GenerateOracleNoiseBatchKernel(const OracleSeedBytes* seed_el,
                                                Element* const* out_f_l,
                                                Element* const* out_f_r,
                                                uint32_t count,
-                                               size_t total_count)
+                                               uint32_t blocks_per_request,
+                                               size_t total_block_count)
 {
     const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (gid >= total_count) {
+    if (gid >= total_block_count) {
         return;
     }
 
-    const uint32_t batch_index = static_cast<uint32_t>(gid / count);
-    const uint32_t local_index = static_cast<uint32_t>(gid % count);
-    out_e_l[batch_index][local_index] = FromOracle(seed_el[batch_index], local_index);
-    out_e_r[batch_index][local_index] = FromOracle(seed_er[batch_index], local_index);
-    out_f_l[batch_index][local_index] = FromOracle(seed_fl[batch_index], local_index);
-    out_f_r[batch_index][local_index] = FromOracle(seed_fr[batch_index], local_index);
+    const uint32_t batch_index = static_cast<uint32_t>(gid / blocks_per_request);
+    const uint32_t block = static_cast<uint32_t>(gid % blocks_per_request);
+    uint32_t seed_w[8];
+    PackSeedWords(seed_el[batch_index], seed_w);
+    WriteOracleBlock(seed_w, block, count, out_e_l[batch_index]);
+    PackSeedWords(seed_er[batch_index], seed_w);
+    WriteOracleBlock(seed_w, block, count, out_e_r[batch_index]);
+    PackSeedWords(seed_fl[batch_index], seed_w);
+    WriteOracleBlock(seed_w, block, count, out_f_l[batch_index]);
+    PackSeedWords(seed_fr[batch_index], seed_w);
+    WriteOracleBlock(seed_w, block, count, out_f_r[batch_index]);
 }
 
-__global__ void GenerateOracleVectorBatchKernel(const OracleSeedBytes* seed_cv,
-                                                Element* const* out,
-                                                uint32_t count,
-                                                size_t total_count)
+// Direct oracle fill for arbitrary index ranges (parity tooling): thread k
+// produces out[k] = from_oracle(seed, start_index + k).
+__global__ void FillFromOracleKernel(OracleSeedBytes seed,
+                                     uint32_t start_index,
+                                     uint32_t count,
+                                     Element* out)
 {
-    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (gid >= total_count) {
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= count) {
         return;
     }
+    uint32_t seed_w[8];
+    PackSeedWords(seed, seed_w);
+    out[gid] = FromOracleIndex(seed_w, start_index + gid);
+}
 
-    const uint32_t batch_index = static_cast<uint32_t>(gid / count);
-    const uint32_t local_index = static_cast<uint32_t>(gid % count);
-    out[batch_index][local_index] = FromOracle(seed_cv[batch_index], local_index);
+uint32_t OracleBlockCount(uint32_t count)
+{
+    return (count + ORACLE_LANES - 1U) / ORACLE_LANES;
 }
 
 } // namespace
@@ -1378,7 +1372,6 @@ MatMulInputGenerationProfile ProbeMatMulInputGenerationProfile()
     {
         std::lock_guard<std::mutex> lock(g_profile.mutex);
         profile.last_encode_noise_us = g_profile.last_encode_noise_us;
-        profile.last_encode_compress_us = g_profile.last_encode_compress_us;
         profile.last_submit_wait_us = g_profile.last_submit_wait_us;
         profile.last_gpu_generation_ms = g_profile.last_gpu_generation_ms;
         profile.reason = g_profile.reason;
@@ -1400,15 +1393,13 @@ MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationR
     }
 
     uint32_t noise_words{0};
-    uint32_t compress_words{0};
-    if (!ValidateInputGenerationRequest(request, result.error, noise_words, compress_words)) {
+    if (!ValidateInputGenerationRequest(request, result.error, noise_words)) {
         return result;
     }
     const auto seed_el = ToInternalSeedBytes(matmul::noise::DeriveNoiseSeed(matmul::noise::TAG_EL, request.sigma));
     const auto seed_er = ToInternalSeedBytes(matmul::noise::DeriveNoiseSeed(matmul::noise::TAG_ER, request.sigma));
     const auto seed_fl = ToInternalSeedBytes(matmul::noise::DeriveNoiseSeed(matmul::noise::TAG_FL, request.sigma));
     const auto seed_fr = ToInternalSeedBytes(matmul::noise::DeriveNoiseSeed(matmul::noise::TAG_FR, request.sigma));
-    const auto seed_cv = ToInternalSeedBytes(DeriveCompressionSeed(request.sigma));
 
     auto& workspace = g_workspace;
     ResetWorkspaceForDevice(workspace, runtime.device_index);
@@ -1422,12 +1413,12 @@ MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationR
         return result;
     }
 
-    if (!EnsureOutputBuffers(workspace, noise_words, compress_words, result.error)) {
+    if (!EnsureOutputBuffers(workspace, noise_words, result.error)) {
         return result;
     }
 
-    const uint32_t noise_blocks = (noise_words + ORACLE_THREADS - 1) / ORACLE_THREADS;
-    const uint32_t compress_blocks = (compress_words + ORACLE_THREADS - 1) / ORACLE_THREADS;
+    const uint32_t noise_block_count = OracleBlockCount(noise_words);
+    const uint32_t noise_blocks = (noise_block_count + ORACLE_THREADS - 1) / ORACLE_THREADS;
     const auto encode_noise_start = std::chrono::steady_clock::now();
     GenerateOracleNoiseKernel<<<noise_blocks, ORACLE_THREADS, 0, workspace.stream>>>(
         seed_el,
@@ -1438,7 +1429,8 @@ MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationR
         workspace.out_e_r,
         workspace.out_f_l,
         workspace.out_f_r,
-        noise_words);
+        noise_words,
+        noise_block_count);
     double encode_noise_us = std::chrono::duration<double, std::micro>(
                                  std::chrono::steady_clock::now() - encode_noise_start)
                                  .count();
@@ -1449,28 +1441,12 @@ MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationR
         return result;
     }
 
-    const auto encode_compress_start = std::chrono::steady_clock::now();
-    GenerateOracleVectorKernel<<<compress_blocks, ORACLE_THREADS, 0, workspace.stream>>>(
-        seed_cv,
-        workspace.out_cv,
-        compress_words);
-    double encode_compress_us = std::chrono::duration<double, std::micro>(
-                                    std::chrono::steady_clock::now() - encode_compress_start)
-                                    .count();
-
-    error = cudaGetLastError();
-    if (error != cudaSuccess) {
-        result.error = "CUDA oracle compress kernel failed:" + std::string(cudaGetErrorString(error));
-        return result;
-    }
-
     const auto submit_wait_start = std::chrono::steady_clock::now();
     std::string staging_warning;
     if (!workspace.host_e_l.Ensure(noise_words, staging_warning) ||
         !workspace.host_e_r.Ensure(noise_words, staging_warning) ||
         !workspace.host_f_l.Ensure(noise_words, staging_warning) ||
-        !workspace.host_f_r.Ensure(noise_words, staging_warning) ||
-        !workspace.host_cv.Ensure(compress_words, staging_warning)) {
+        !workspace.host_f_r.Ensure(noise_words, staging_warning)) {
         result.error = staging_warning;
         return result;
     }
@@ -1478,7 +1454,6 @@ MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationR
     if (error == cudaSuccess) error = cudaMemcpyAsync(workspace.host_e_r.data(), workspace.out_e_r, noise_words * sizeof(Element), cudaMemcpyDeviceToHost, workspace.stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(workspace.host_f_l.data(), workspace.out_f_l, noise_words * sizeof(Element), cudaMemcpyDeviceToHost, workspace.stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(workspace.host_f_r.data(), workspace.out_f_r, noise_words * sizeof(Element), cudaMemcpyDeviceToHost, workspace.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(workspace.host_cv.data(), workspace.out_cv, compress_words * sizeof(Element), cudaMemcpyDeviceToHost, workspace.stream);
     if (error == cudaSuccess) error = cudaStreamSynchronize(workspace.stream);
     const double submit_wait_us = std::chrono::duration<double, std::micro>(
                                       std::chrono::steady_clock::now() - submit_wait_start)
@@ -1492,9 +1467,8 @@ MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationR
     result.noise_e_r.assign(workspace.host_e_r.data(), workspace.host_e_r.data() + noise_words);
     result.noise_f_l.assign(workspace.host_f_l.data(), workspace.host_f_l.data() + noise_words);
     result.noise_f_r.assign(workspace.host_f_r.data(), workspace.host_f_r.data() + noise_words);
-    result.compress_vec.assign(workspace.host_cv.data(), workspace.host_cv.data() + compress_words);
     result.success = true;
-    UpdateProfile(encode_noise_us, encode_compress_us, submit_wait_us, "cuda_noise4_plus_compress");
+    UpdateProfile(encode_noise_us, submit_wait_us, "cuda_noise4_oracle_v2");
     return result;
 }
 
@@ -1509,8 +1483,7 @@ MatMulInputGenerationDeviceResult GenerateMatMulInputsGPUDevice(const MatMulInpu
     }
 
     uint32_t noise_words{0};
-    uint32_t compress_words{0};
-    if (!ValidateInputGenerationRequest(request, result.error, noise_words, compress_words)) {
+    if (!ValidateInputGenerationRequest(request, result.error, noise_words)) {
         return result;
     }
 
@@ -1518,7 +1491,6 @@ MatMulInputGenerationDeviceResult GenerateMatMulInputsGPUDevice(const MatMulInpu
     const auto seed_er = ToInternalSeedBytes(matmul::noise::DeriveNoiseSeed(matmul::noise::TAG_ER, request.sigma));
     const auto seed_fl = ToInternalSeedBytes(matmul::noise::DeriveNoiseSeed(matmul::noise::TAG_FL, request.sigma));
     const auto seed_fr = ToInternalSeedBytes(matmul::noise::DeriveNoiseSeed(matmul::noise::TAG_FR, request.sigma));
-    const auto seed_cv = ToInternalSeedBytes(DeriveCompressionSeed(request.sigma));
 
     auto& workspace = g_workspace;
     ResetWorkspaceForDevice(workspace, runtime.device_index);
@@ -1538,14 +1510,13 @@ MatMulInputGenerationDeviceResult GenerateMatMulInputsGPUDevice(const MatMulInpu
         request.b,
         request.r,
         noise_words,
-        compress_words,
         result.error);
     if (!generated) {
         return result;
     }
 
-    const uint32_t noise_blocks = (noise_words + ORACLE_THREADS - 1) / ORACLE_THREADS;
-    const uint32_t compress_blocks = (compress_words + ORACLE_THREADS - 1) / ORACLE_THREADS;
+    const uint32_t noise_block_count = OracleBlockCount(noise_words);
+    const uint32_t noise_blocks = (noise_block_count + ORACLE_THREADS - 1) / ORACLE_THREADS;
     const auto encode_noise_start = std::chrono::steady_clock::now();
     GenerateOracleNoiseKernel<<<noise_blocks, ORACLE_THREADS, 0, workspace.stream>>>(
         seed_el,
@@ -1556,7 +1527,8 @@ MatMulInputGenerationDeviceResult GenerateMatMulInputsGPUDevice(const MatMulInpu
         generated->noise_e_r,
         generated->noise_f_l,
         generated->noise_f_r,
-        noise_words);
+        noise_words,
+        noise_block_count);
     const double encode_noise_us = std::chrono::duration<double, std::micro>(
                                        std::chrono::steady_clock::now() - encode_noise_start)
                                        .count();
@@ -1564,21 +1536,6 @@ MatMulInputGenerationDeviceResult GenerateMatMulInputsGPUDevice(const MatMulInpu
     error = cudaGetLastError();
     if (error != cudaSuccess) {
         result.error = "CUDA oracle noise kernel failed:" + std::string(cudaGetErrorString(error));
-        return result;
-    }
-
-    const auto encode_compress_start = std::chrono::steady_clock::now();
-    GenerateOracleVectorKernel<<<compress_blocks, ORACLE_THREADS, 0, workspace.stream>>>(
-        seed_cv,
-        generated->compress_vec,
-        compress_words);
-    const double encode_compress_us = std::chrono::duration<double, std::micro>(
-                                          std::chrono::steady_clock::now() - encode_compress_start)
-                                          .count();
-
-    error = cudaGetLastError();
-    if (error != cudaSuccess) {
-        result.error = "CUDA oracle compress kernel failed:" + std::string(cudaGetErrorString(error));
         return result;
     }
 
@@ -1601,7 +1558,7 @@ MatMulInputGenerationDeviceResult GenerateMatMulInputsGPUDevice(const MatMulInpu
 
     result.success = true;
     result.inputs = std::move(generated);
-    UpdateProfile(encode_noise_us, encode_compress_us, submit_wait_us, "cuda_noise4_plus_compress_device");
+    UpdateProfile(encode_noise_us, submit_wait_us, "cuda_noise4_oracle_v2_device");
     return result;
 }
 
@@ -1625,7 +1582,6 @@ MatMulInputGenerationDeviceBatchResult GenerateMatMulInputsGPUDeviceBatch(
     }
 
     uint32_t noise_words{0};
-    uint32_t compress_words{0};
     if (!ValidateInputGenerationRequest(
             {
                 .n = request.n,
@@ -1634,8 +1590,7 @@ MatMulInputGenerationDeviceBatchResult GenerateMatMulInputsGPUDeviceBatch(
                 .sigma = request.sigmas[0],
             },
             result.error,
-            noise_words,
-            compress_words)) {
+            noise_words)) {
         return result;
     }
 
@@ -1643,13 +1598,11 @@ MatMulInputGenerationDeviceBatchResult GenerateMatMulInputsGPUDeviceBatch(
     std::vector<OracleSeedBytes> seed_er(request.batch_size);
     std::vector<OracleSeedBytes> seed_fl(request.batch_size);
     std::vector<OracleSeedBytes> seed_fr(request.batch_size);
-    std::vector<OracleSeedBytes> seed_cv(request.batch_size);
     for (uint32_t i = 0; i < request.batch_size; ++i) {
         seed_el[i] = ToInternalSeedBytes(matmul::noise::DeriveNoiseSeed(matmul::noise::TAG_EL, request.sigmas[i]));
         seed_er[i] = ToInternalSeedBytes(matmul::noise::DeriveNoiseSeed(matmul::noise::TAG_ER, request.sigmas[i]));
         seed_fl[i] = ToInternalSeedBytes(matmul::noise::DeriveNoiseSeed(matmul::noise::TAG_FL, request.sigmas[i]));
         seed_fr[i] = ToInternalSeedBytes(matmul::noise::DeriveNoiseSeed(matmul::noise::TAG_FR, request.sigmas[i]));
-        seed_cv[i] = ToInternalSeedBytes(DeriveCompressionSeed(request.sigmas[i]));
     }
 
     auto& workspace = g_workspace;
@@ -1670,7 +1623,6 @@ MatMulInputGenerationDeviceBatchResult GenerateMatMulInputsGPUDeviceBatch(
     std::vector<Element*> out_e_r(request.batch_size);
     std::vector<Element*> out_f_l(request.batch_size);
     std::vector<Element*> out_f_r(request.batch_size);
-    std::vector<Element*> out_cv(request.batch_size);
     for (uint32_t i = 0; i < request.batch_size; ++i) {
         auto generated = AcquireGeneratedInputsDevice(
             runtime.device_index,
@@ -1678,7 +1630,6 @@ MatMulInputGenerationDeviceBatchResult GenerateMatMulInputsGPUDeviceBatch(
             request.b,
             request.r,
             noise_words,
-            compress_words,
             result.error);
         if (!generated) {
             return result;
@@ -1687,7 +1638,6 @@ MatMulInputGenerationDeviceBatchResult GenerateMatMulInputsGPUDeviceBatch(
         out_e_r[i] = generated->noise_e_r;
         out_f_l[i] = generated->noise_f_l;
         out_f_r[i] = generated->noise_f_r;
-        out_cv[i] = generated->compress_vec;
         generated_inputs.push_back(std::move(generated));
     }
 
@@ -1695,12 +1645,10 @@ MatMulInputGenerationDeviceBatchResult GenerateMatMulInputsGPUDeviceBatch(
         !EnsureTypedDeviceBuffer(workspace.batch_seed_er, workspace.batch_seed_er_capacity, request.batch_size, result.error) ||
         !EnsureTypedDeviceBuffer(workspace.batch_seed_fl, workspace.batch_seed_fl_capacity, request.batch_size, result.error) ||
         !EnsureTypedDeviceBuffer(workspace.batch_seed_fr, workspace.batch_seed_fr_capacity, request.batch_size, result.error) ||
-        !EnsureTypedDeviceBuffer(workspace.batch_seed_cv, workspace.batch_seed_cv_capacity, request.batch_size, result.error) ||
         !EnsureTypedDeviceBuffer(workspace.batch_out_e_l, workspace.batch_out_e_l_capacity, request.batch_size, result.error) ||
         !EnsureTypedDeviceBuffer(workspace.batch_out_e_r, workspace.batch_out_e_r_capacity, request.batch_size, result.error) ||
         !EnsureTypedDeviceBuffer(workspace.batch_out_f_l, workspace.batch_out_f_l_capacity, request.batch_size, result.error) ||
-        !EnsureTypedDeviceBuffer(workspace.batch_out_f_r, workspace.batch_out_f_r_capacity, request.batch_size, result.error) ||
-        !EnsureTypedDeviceBuffer(workspace.batch_out_cv, workspace.batch_out_cv_capacity, request.batch_size, result.error)) {
+        !EnsureTypedDeviceBuffer(workspace.batch_out_f_r, workspace.batch_out_f_r_capacity, request.batch_size, result.error)) {
         return result;
     }
 
@@ -1709,12 +1657,10 @@ MatMulInputGenerationDeviceBatchResult GenerateMatMulInputsGPUDeviceBatch(
     if (error == cudaSuccess) error = cudaMemcpyAsync(workspace.batch_seed_er, seed_er.data(), request.batch_size * sizeof(OracleSeedBytes), cudaMemcpyHostToDevice, workspace.stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(workspace.batch_seed_fl, seed_fl.data(), request.batch_size * sizeof(OracleSeedBytes), cudaMemcpyHostToDevice, workspace.stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(workspace.batch_seed_fr, seed_fr.data(), request.batch_size * sizeof(OracleSeedBytes), cudaMemcpyHostToDevice, workspace.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(workspace.batch_seed_cv, seed_cv.data(), request.batch_size * sizeof(OracleSeedBytes), cudaMemcpyHostToDevice, workspace.stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(workspace.batch_out_e_l, out_e_l.data(), request.batch_size * sizeof(Element*), cudaMemcpyHostToDevice, workspace.stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(workspace.batch_out_e_r, out_e_r.data(), request.batch_size * sizeof(Element*), cudaMemcpyHostToDevice, workspace.stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(workspace.batch_out_f_l, out_f_l.data(), request.batch_size * sizeof(Element*), cudaMemcpyHostToDevice, workspace.stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(workspace.batch_out_f_r, out_f_r.data(), request.batch_size * sizeof(Element*), cudaMemcpyHostToDevice, workspace.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(workspace.batch_out_cv, out_cv.data(), request.batch_size * sizeof(Element*), cudaMemcpyHostToDevice, workspace.stream);
     const double h2d_us = std::chrono::duration<double, std::micro>(
                               std::chrono::steady_clock::now() - h2d_start)
                               .count();
@@ -1723,8 +1669,9 @@ MatMulInputGenerationDeviceBatchResult GenerateMatMulInputsGPUDeviceBatch(
         return result;
     }
 
-    const size_t total_noise_words = static_cast<size_t>(request.batch_size) * noise_words;
-    const uint32_t noise_blocks = static_cast<uint32_t>((total_noise_words + ORACLE_THREADS - 1) / ORACLE_THREADS);
+    const uint32_t blocks_per_request = OracleBlockCount(noise_words);
+    const size_t total_block_count = static_cast<size_t>(request.batch_size) * blocks_per_request;
+    const uint32_t noise_blocks = static_cast<uint32_t>((total_block_count + ORACLE_THREADS - 1) / ORACLE_THREADS);
     const auto encode_noise_start = std::chrono::steady_clock::now();
     GenerateOracleNoiseBatchKernel<<<noise_blocks, ORACLE_THREADS, 0, workspace.stream>>>(
         workspace.batch_seed_el,
@@ -1736,7 +1683,8 @@ MatMulInputGenerationDeviceBatchResult GenerateMatMulInputsGPUDeviceBatch(
         workspace.batch_out_f_l,
         workspace.batch_out_f_r,
         noise_words,
-        total_noise_words);
+        blocks_per_request,
+        total_block_count);
     const double encode_noise_us = std::chrono::duration<double, std::micro>(
                                        std::chrono::steady_clock::now() - encode_noise_start)
                                        .count();
@@ -1744,24 +1692,6 @@ MatMulInputGenerationDeviceBatchResult GenerateMatMulInputsGPUDeviceBatch(
     error = cudaGetLastError();
     if (error != cudaSuccess) {
         result.error = "CUDA batched oracle noise kernel failed:" + std::string(cudaGetErrorString(error));
-        return result;
-    }
-
-    const size_t total_compress_words = static_cast<size_t>(request.batch_size) * compress_words;
-    const uint32_t compress_blocks = static_cast<uint32_t>((total_compress_words + ORACLE_THREADS - 1) / ORACLE_THREADS);
-    const auto encode_compress_start = std::chrono::steady_clock::now();
-    GenerateOracleVectorBatchKernel<<<compress_blocks, ORACLE_THREADS, 0, workspace.stream>>>(
-        workspace.batch_seed_cv,
-        workspace.batch_out_cv,
-        compress_words,
-        total_compress_words);
-    const double encode_compress_us = std::chrono::duration<double, std::micro>(
-                                          std::chrono::steady_clock::now() - encode_compress_start)
-                                          .count();
-
-    error = cudaGetLastError();
-    if (error != cudaSuccess) {
-        result.error = "CUDA batched oracle compress kernel failed:" + std::string(cudaGetErrorString(error));
         return result;
     }
 
@@ -1779,13 +1709,87 @@ MatMulInputGenerationDeviceBatchResult GenerateMatMulInputsGPUDeviceBatch(
             return result;
         }
     }
+    if (const char* debug_sync = std::getenv("QTC_MATMUL_CUDA_DEBUG_SYNC_PREPARE"); debug_sync != nullptr && debug_sync[0] == '1') {
+        // Diagnostics only: make the prepare step wall time include the noise kernel.
+        error = cudaStreamSynchronize(workspace.stream);
+        if (error != cudaSuccess) {
+            result.error = "CUDA batched oracle debug sync failed:" + std::string(cudaGetErrorString(error));
+            return result;
+        }
+    }
     const double submit_wait_us = std::chrono::duration<double, std::micro>(
                                       std::chrono::steady_clock::now() - submit_wait_start)
                                       .count();
 
     result.inputs = std::move(generated_inputs);
     result.success = true;
-    UpdateProfile(encode_noise_us, encode_compress_us, h2d_us + submit_wait_us, "cuda_noise4_plus_compress_device_batch");
+    UpdateProfile(encode_noise_us, h2d_us + submit_wait_us, "cuda_noise4_oracle_v2_device_batch");
+    return result;
+}
+
+MatMulOracleFillResult FillFromOracleGPU(const uint256& seed, uint32_t start_index, uint32_t count)
+{
+    MatMulOracleFillResult result;
+    const auto runtime = ProbeCudaRuntime();
+    result.available = runtime.available;
+    if (!runtime.available) {
+        result.error = runtime.reason;
+        return result;
+    }
+    if (count == 0) {
+        result.success = true;
+        return result;
+    }
+    if (static_cast<uint64_t>(start_index) + count > (static_cast<uint64_t>(1) << 32)) {
+        result.error = "oracle index range exceeds 32-bit index space";
+        return result;
+    }
+
+    auto& workspace = g_workspace;
+    ResetWorkspaceForDevice(workspace, runtime.device_index);
+
+    cudaError_t error = cudaSetDevice(runtime.device_index);
+    if (error != cudaSuccess) {
+        result.error = "cudaSetDevice failed:" + std::string(cudaGetErrorString(error));
+        return result;
+    }
+    if (!EnsureWorkspaceStream(workspace, result.error)) {
+        return result;
+    }
+    if (!EnsureDeviceBuffer(workspace.out_fill, workspace.fill_capacity, count, result.error)) {
+        return result;
+    }
+    std::string staging_warning;
+    if (!workspace.host_fill.Ensure(count, staging_warning)) {
+        result.error = staging_warning;
+        return result;
+    }
+
+    const uint32_t blocks = (count + ORACLE_THREADS - 1) / ORACLE_THREADS;
+    FillFromOracleKernel<<<blocks, ORACLE_THREADS, 0, workspace.stream>>>(
+        ToInternalSeedBytes(seed),
+        start_index,
+        count,
+        workspace.out_fill);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        result.error = "CUDA oracle fill kernel failed:" + std::string(cudaGetErrorString(error));
+        return result;
+    }
+    error = cudaMemcpyAsync(workspace.host_fill.data(),
+                            workspace.out_fill,
+                            count * sizeof(Element),
+                            cudaMemcpyDeviceToHost,
+                            workspace.stream);
+    if (error == cudaSuccess) {
+        error = cudaStreamSynchronize(workspace.stream);
+    }
+    if (error != cudaSuccess) {
+        result.error = "CUDA oracle fill completion failed:" + std::string(cudaGetErrorString(error));
+        return result;
+    }
+    result.values.assign(workspace.host_fill.data(), workspace.host_fill.data() + count);
+    result.success = true;
     return result;
 }
 

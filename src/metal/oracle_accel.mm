@@ -84,6 +84,11 @@ constexpr const char* KERNEL_SOURCE = R"METAL(
 #include <metal_stdlib>
 using namespace metal;
 
+// QTC oracle / nonce-seed Metal kernels.
+//
+// Oracle v2 reference: src/matmul/field.cpp (from_oracle / from_oracle_block).
+// Device output must be bit-identical to the CPU implementation.
+
 constant uint MODULUS = 0x7fffffffu;
 
 struct OracleParams {
@@ -201,7 +206,16 @@ inline uint bswap32(uint x)
            ((x & 0xff000000u) >> 24u);
 }
 
-inline uint candidate_from_seed_and_index(constant uchar* seed_internal, uint index, bool with_retry, uint retry)
+// ---------------------------------------------------------------------------
+// Oracle v2: block = index >> 3, lane = index & 7.
+//   H = SHA-256(seed_canonical || LE32(block) [|| LE32(retry) if retry > 0])
+//   candidate = LE32(H[4*lane..4*lane+3]) & 0x7FFFFFFF; 0x7FFFFFFF is rejected
+//   and retried with the SAME lane (retry 1..255); after 256 rejections the
+//   fallback is LE32(SHA-256(seed_canonical || LE32(block) || "oracle-fallback")
+//   [lane]) mod M31. seed_internal is the uint256 internal byte order.
+// ---------------------------------------------------------------------------
+
+inline void oracle_block_state(constant uchar* seed_internal, uint block, uint retry, thread uint state[8])
 {
     thread uint w[64];
     for (uint i = 0; i < 64; ++i) {
@@ -212,13 +226,13 @@ inline uint candidate_from_seed_and_index(constant uchar* seed_internal, uint in
         set_byte(w, i, seed_internal[31u - i]);
     }
 
-    set_byte(w, 32u, index & 0xffu);
-    set_byte(w, 33u, (index >> 8u) & 0xffu);
-    set_byte(w, 34u, (index >> 16u) & 0xffu);
-    set_byte(w, 35u, (index >> 24u) & 0xffu);
+    set_byte(w, 32u, block & 0xffu);
+    set_byte(w, 33u, (block >> 8u) & 0xffu);
+    set_byte(w, 34u, (block >> 16u) & 0xffu);
+    set_byte(w, 35u, (block >> 24u) & 0xffu);
 
     uint message_len = 36u;
-    if (with_retry) {
+    if (retry > 0u) {
         set_byte(w, 36u, retry & 0xffu);
         set_byte(w, 37u, (retry >> 8u) & 0xffu);
         set_byte(w, 38u, (retry >> 16u) & 0xffu);
@@ -229,14 +243,16 @@ inline uint candidate_from_seed_and_index(constant uchar* seed_internal, uint in
     set_byte(w, message_len, 0x80u);
     w[15] = message_len * 8u;
 
-    thread uint state[8];
     sha256_init(state);
     sha256_compress(state, w);
-
-    return bswap32(state[0]) & MODULUS;
 }
 
-inline uint fallback_candidate(constant uchar* seed_internal, uint index)
+inline uint oracle_lane_candidate(thread const uint state[8], uint lane)
+{
+    return bswap32(state[lane]) & MODULUS;
+}
+
+inline uint oracle_fallback_lane(constant uchar* seed_internal, uint block, uint lane)
 {
     thread uint w[64];
     for (uint i = 0; i < 64; ++i) {
@@ -247,10 +263,10 @@ inline uint fallback_candidate(constant uchar* seed_internal, uint index)
         set_byte(w, i, seed_internal[31u - i]);
     }
 
-    set_byte(w, 32u, index & 0xffu);
-    set_byte(w, 33u, (index >> 8u) & 0xffu);
-    set_byte(w, 34u, (index >> 16u) & 0xffu);
-    set_byte(w, 35u, (index >> 24u) & 0xffu);
+    set_byte(w, 32u, block & 0xffu);
+    set_byte(w, 33u, (block >> 8u) & 0xffu);
+    set_byte(w, 34u, (block >> 16u) & 0xffu);
+    set_byte(w, 35u, (block >> 24u) & 0xffu);
 
     const uchar fallback_tag[15] = {
         'o', 'r', 'a', 'c', 'l', 'e', '-', 'f', 'a', 'l', 'l', 'b', 'a', 'c', 'k'
@@ -265,21 +281,49 @@ inline uint fallback_candidate(constant uchar* seed_internal, uint index)
     thread uint state[8];
     sha256_init(state);
     sha256_compress(state, w);
-
-    return bswap32(state[0]) % MODULUS;
+    return bswap32(state[lane]) % MODULUS;
 }
 
-inline uint from_oracle(constant uchar* seed_internal, uint index)
+inline uint oracle_lane_with_retries(constant uchar* seed_internal, uint block, uint lane, uint first_retry)
 {
-    for (uint retry = 0; retry < 256; ++retry) {
-        const uint candidate = retry == 0
-            ? candidate_from_seed_and_index(seed_internal, index, false, 0u)
-            : candidate_from_seed_and_index(seed_internal, index, true, retry);
+    for (uint retry = first_retry; retry < 256u; ++retry) {
+        thread uint state[8];
+        oracle_block_state(seed_internal, block, retry, state);
+        const uint candidate = oracle_lane_candidate(state, lane);
         if (candidate < MODULUS) {
             return candidate;
         }
     }
-    return fallback_candidate(seed_internal, index);
+    return oracle_fallback_lane(seed_internal, block, lane);
+}
+
+// All eight lanes of one oracle block (== from_oracle(seed, 8*block + lane)).
+inline void oracle_fill_block(constant uchar* seed_internal, uint block, thread uint out[8])
+{
+    thread uint state[8];
+    oracle_block_state(seed_internal, block, 0u, state);
+    for (uint lane = 0; lane < 8u; ++lane) {
+        const uint candidate = oracle_lane_candidate(state, lane);
+        out[lane] = candidate < MODULUS
+            ? candidate
+            : oracle_lane_with_retries(seed_internal, block, lane, 1u);
+    }
+}
+
+inline void oracle_store_block(constant uchar* seed_internal, uint block, uint count, device uint* out)
+{
+    const uint base = block * 8u;
+    if (base >= count) {
+        return;
+    }
+    thread uint lanes[8];
+    oracle_fill_block(seed_internal, block, lanes);
+    for (uint lane = 0; lane < 8u; ++lane) {
+        const uint index = base + lane;
+        if (index < count) {
+            out[index] = lanes[lane];
+        }
+    }
 }
 
 inline void sha256_bytes(thread uchar* message, uint message_len, thread uchar out[32])
@@ -379,8 +423,9 @@ inline void compute_matmul_seed_v2(constant uchar* previous_block_hash,
 {
     thread uchar message[110];
     uint offset = 0u;
+    // HashWriter << std::string{"QTC_MATMUL_SEED_V2"}: CompactSize(18) || bytes
     const uchar tag[18] = {
-        'B', 'T', 'X', '_', 'M', 'A', 'T', 'M', 'U', 'L', '_', 'S', 'E', 'E', 'D', '_', 'V', '2'
+        'Q', 'T', 'C', '_', 'M', 'A', 'T', 'M', 'U', 'L', '_', 'S', 'E', 'E', 'D', '_', 'V', '2'
     };
     append_byte(message, offset, 18u);
     for (uint i = 0; i < 18u; ++i) {
@@ -412,8 +457,9 @@ inline void compute_matmul_seed_v3(constant uchar* previous_block_hash,
 {
     thread uchar message[118];
     uint offset = 0u;
+    // HashWriter << std::string{"QTC_MATMUL_SEED_V3"}: CompactSize(18) || bytes
     const uchar tag[18] = {
-        'B', 'T', 'X', '_', 'M', 'A', 'T', 'M', 'U', 'L', '_', 'S', 'E', 'E', 'D', '_', 'V', '3'
+        'Q', 'T', 'C', '_', 'M', 'A', 'T', 'M', 'U', 'L', '_', 'S', 'E', 'E', 'D', '_', 'V', '3'
     };
     append_byte(message, offset, 18u);
     for (uint i = 0; i < 18u; ++i) {
@@ -559,6 +605,8 @@ kernel void scan_nonce_seed_pre_hash(constant NonceSeedScanParams& p [[buffer(0)
     out_flags[gid] = uint256_internal_bytes_less_or_equal(sigma, pre_hash_target) ? 1u : 0u;
 }
 
+// One thread per oracle block (8 elements) for each of the four noise seeds.
+// Grid = ceil(count / 8).
 kernel void generate_oracle_noise_vectors(constant OracleParams& p [[buffer(0)]],
                                           constant uchar* seed_el [[buffer(1)]],
                                           constant uchar* seed_er [[buffer(2)]],
@@ -570,24 +618,19 @@ kernel void generate_oracle_noise_vectors(constant OracleParams& p [[buffer(0)]]
                                           device uint* out_f_r [[buffer(8)]],
                                           uint gid [[thread_position_in_grid]])
 {
-    if (gid >= p.count) {
-        return;
-    }
-    out_e_l[gid] = from_oracle(seed_el, gid);
-    out_e_r[gid] = from_oracle(seed_er, gid);
-    out_f_l[gid] = from_oracle(seed_fl, gid);
-    out_f_r[gid] = from_oracle(seed_fr, gid);
+    oracle_store_block(seed_el, gid, p.count, out_e_l);
+    oracle_store_block(seed_er, gid, p.count, out_e_r);
+    oracle_store_block(seed_fl, gid, p.count, out_f_l);
+    oracle_store_block(seed_fr, gid, p.count, out_f_r);
 }
 
+// out[i] = from_oracle(seed, i) for i in [0, count). One thread per block of 8.
 kernel void generate_oracle_vector(constant OracleParams& p [[buffer(0)]],
                                    constant uchar* seed_internal [[buffer(1)]],
                                    device uint* out [[buffer(2)]],
                                    uint gid [[thread_position_in_grid]])
 {
-    if (gid >= p.count) {
-        return;
-    }
-    out[gid] = from_oracle(seed_internal, gid);
+    oracle_store_block(seed_internal, gid, p.count, out);
 }
 )METAL";
 
@@ -604,10 +647,8 @@ struct MetalContext {
     id<MTLBuffer> pool_out_e_r{nil};
     id<MTLBuffer> pool_out_f_l{nil};
     id<MTLBuffer> pool_out_f_r{nil};
-    id<MTLBuffer> pool_out_cv{nil};
     id<MTLBuffer> pool_scan_flags{nil};
     size_t pool_noise_bytes{0};
-    size_t pool_compress_bytes{0};
     size_t pool_scan_flags_bytes{0};
     uint64_t pool_allocation_events{0};
     uint64_t pool_reuse_events{0};
@@ -657,10 +698,8 @@ struct MetalContext {
         pool_out_e_r = nil;
         pool_out_f_l = nil;
         pool_out_f_r = nil;
-        pool_out_cv = nil;
         pool_scan_flags = nil;
         pool_noise_bytes = 0;
-        pool_compress_bytes = 0;
         pool_scan_flags_bytes = 0;
         pool_allocation_events = 0;
         pool_reuse_events = 0;
@@ -784,16 +823,13 @@ NSUInteger SelectThreadGroupSize(id<MTLComputePipelineState> pipeline, NSUIntege
 
 bool EnsureOutputBufferPool(MetalContext& context,
                             size_t noise_bytes,
-                            size_t compress_bytes,
                             std::string& error)
 {
     const bool needs_realloc = context.pool_out_e_l == nil ||
         context.pool_out_e_r == nil ||
         context.pool_out_f_l == nil ||
         context.pool_out_f_r == nil ||
-        context.pool_out_cv == nil ||
-        noise_bytes > context.pool_noise_bytes ||
-        compress_bytes > context.pool_compress_bytes;
+        noise_bytes > context.pool_noise_bytes;
     if (!needs_realloc) {
         ++context.pool_reuse_events;
         return true;
@@ -803,8 +839,7 @@ bool EnsureOutputBufferPool(MetalContext& context,
     id<MTLBuffer> out_e_r = [context.device newBufferWithLength:noise_bytes options:MTLResourceStorageModeShared];
     id<MTLBuffer> out_f_l = [context.device newBufferWithLength:noise_bytes options:MTLResourceStorageModeShared];
     id<MTLBuffer> out_f_r = [context.device newBufferWithLength:noise_bytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> out_cv = [context.device newBufferWithLength:compress_bytes options:MTLResourceStorageModeShared];
-    if (out_e_l == nil || out_e_r == nil || out_f_l == nil || out_f_r == nil || out_cv == nil) {
+    if (out_e_l == nil || out_e_r == nil || out_f_l == nil || out_f_r == nil) {
         error = "Failed to allocate Metal output buffers for oracle generation";
         return false;
     }
@@ -813,11 +848,15 @@ bool EnsureOutputBufferPool(MetalContext& context,
     context.pool_out_e_r = out_e_r;
     context.pool_out_f_l = out_f_l;
     context.pool_out_f_r = out_f_r;
-    context.pool_out_cv = out_cv;
     context.pool_noise_bytes = noise_bytes;
-    context.pool_compress_bytes = compress_bytes;
     ++context.pool_allocation_events;
     return true;
+}
+
+// One thread per oracle block of 8 elements.
+NSUInteger OracleBlockGridSize(uint64_t element_count)
+{
+    return static_cast<NSUInteger>((element_count + 7) / 8);
 }
 
 bool EnsureScanFlagsBuffer(MetalContext& context, size_t flags_bytes, std::string& error)
@@ -837,36 +876,6 @@ bool EnsureScanFlagsBuffer(MetalContext& context, size_t flags_bytes, std::strin
     context.pool_scan_flags_bytes = flags_bytes;
     ++context.pool_allocation_events;
     return true;
-}
-
-std::array<uint8_t, 32> ToCanonicalBytes(const uint256& value)
-{
-    std::array<uint8_t, 32> out;
-    for (size_t i = 0; i < out.size(); ++i) {
-        out[i] = value.data()[out.size() - 1 - i];
-    }
-    return out;
-}
-
-uint256 CanonicalBytesToUint256(const uint8_t* bytes)
-{
-    std::array<unsigned char, 32> internal;
-    for (size_t i = 0; i < internal.size(); ++i) {
-        internal[i] = bytes[internal.size() - 1 - i];
-    }
-    return uint256{Span<const unsigned char>{internal.data(), internal.size()}};
-}
-
-uint256 DeriveCompressionSeed(const uint256& sigma)
-{
-    const auto sigma_bytes = ToCanonicalBytes(sigma);
-    CSHA256 hasher;
-    hasher.Write(reinterpret_cast<const uint8_t*>(matmul::transcript::COMPRESS_TAG.data()), matmul::transcript::COMPRESS_TAG.size());
-    hasher.Write(sigma_bytes.data(), sigma_bytes.size());
-
-    uint8_t digest[CSHA256::OUTPUT_SIZE];
-    hasher.Finalize(digest);
-    return CanonicalBytesToUint256(digest);
 }
 
 } // namespace
@@ -894,8 +903,7 @@ MatMulInputGenerationProfile ProbeMatMulInputGenerationProfile()
     profile.pool_initialized = context.pool_out_e_l != nil &&
         context.pool_out_e_r != nil &&
         context.pool_out_f_l != nil &&
-        context.pool_out_f_r != nil &&
-        context.pool_out_cv != nil;
+        context.pool_out_f_r != nil;
     profile.allocation_events = context.pool_allocation_events;
     profile.reuse_events = context.pool_reuse_events;
     if (profile.reason.empty()) {
@@ -935,22 +943,18 @@ MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationR
     }
 
     const uint64_t noise_words64 = static_cast<uint64_t>(request.n) * request.r;
-    const uint64_t compress_words64 = static_cast<uint64_t>(request.b) * request.b;
-    if (noise_words64 > std::numeric_limits<uint32_t>::max() ||
-        compress_words64 > std::numeric_limits<uint32_t>::max()) {
+    if (noise_words64 > std::numeric_limits<uint32_t>::max()) {
         result.success = false;
         result.error = "input generation dimensions exceed supported bounds";
         return result;
     }
 
     const uint32_t noise_words = static_cast<uint32_t>(noise_words64);
-    const uint32_t compress_words = static_cast<uint32_t>(compress_words64);
 
     const uint256 seed_el = matmul::noise::DeriveNoiseSeed(matmul::noise::TAG_EL, request.sigma);
     const uint256 seed_er = matmul::noise::DeriveNoiseSeed(matmul::noise::TAG_ER, request.sigma);
     const uint256 seed_fl = matmul::noise::DeriveNoiseSeed(matmul::noise::TAG_FL, request.sigma);
     const uint256 seed_fr = matmul::noise::DeriveNoiseSeed(matmul::noise::TAG_FR, request.sigma);
-    const uint256 seed_cv = DeriveCompressionSeed(request.sigma);
 
     double encode_noise_us{0.0};
     double encode_compress_us{0.0};
@@ -959,10 +963,9 @@ MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationR
 
     @autoreleasepool {
         const size_t noise_bytes = static_cast<size_t>(noise_words) * sizeof(uint32_t);
-        const size_t compress_bytes = static_cast<size_t>(compress_words) * sizeof(uint32_t);
         std::lock_guard<std::mutex> pool_lock(context.pool_mutex);
 
-        if (!EnsureOutputBufferPool(context, noise_bytes, compress_bytes, result.error)) {
+        if (!EnsureOutputBufferPool(context, noise_bytes, result.error)) {
             result.success = false;
             return result;
         }
@@ -971,7 +974,6 @@ MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationR
         id<MTLBuffer> out_e_r = context.pool_out_e_r;
         id<MTLBuffer> out_f_l = context.pool_out_f_l;
         id<MTLBuffer> out_f_r = context.pool_out_f_r;
-        id<MTLBuffer> out_cv = context.pool_out_cv;
 
         id<MTLCommandBuffer> command = nil;
         if ([context.queue respondsToSelector:@selector(commandBufferWithUnretainedReferences)]) {
@@ -1009,32 +1011,12 @@ MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationR
         [noise_encoder setBuffer:out_f_l offset:0 atIndex:7];
         [noise_encoder setBuffer:out_f_r offset:0 atIndex:8];
         const NSUInteger noise_group_size = SelectThreadGroupSize(context.oracle_noise_pipeline, 256);
-        [noise_encoder dispatchThreads:MTLSizeMake(noise_words, 1, 1)
+        [noise_encoder dispatchThreads:MTLSizeMake(OracleBlockGridSize(noise_words), 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(noise_group_size, 1, 1)];
         [noise_encoder endEncoding];
         encode_noise_us = std::chrono::duration<double, std::micro>(
                               std::chrono::steady_clock::now() - encode_noise_start)
                               .count();
-
-        id<MTLComputeCommandEncoder> compress_encoder = [command computeCommandEncoder];
-        if (compress_encoder == nil) {
-            result.success = false;
-            result.error = "Failed to create Metal compress compute encoder";
-            return result;
-        }
-        const OracleParams compress_params{compress_words};
-        const auto encode_compress_start = std::chrono::steady_clock::now();
-        [compress_encoder setComputePipelineState:context.oracle_vector_pipeline];
-        [compress_encoder setBytes:&compress_params length:sizeof(compress_params) atIndex:0];
-        [compress_encoder setBytes:seed_cv.data() length:uint256::size() atIndex:1];
-        [compress_encoder setBuffer:out_cv offset:0 atIndex:2];
-        const NSUInteger compress_group_size = SelectThreadGroupSize(context.oracle_vector_pipeline, 256);
-        [compress_encoder dispatchThreads:MTLSizeMake(compress_words, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(compress_group_size, 1, 1)];
-        [compress_encoder endEncoding];
-        encode_compress_us = std::chrono::duration<double, std::micro>(
-                                 std::chrono::steady_clock::now() - encode_compress_start)
-                                 .count();
 
         const auto submit_wait_start = std::chrono::steady_clock::now();
         [command commit];
@@ -1055,13 +1037,14 @@ MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationR
         const auto* e_r_ptr = static_cast<const uint32_t*>(out_e_r.contents);
         const auto* f_l_ptr = static_cast<const uint32_t*>(out_f_l.contents);
         const auto* f_r_ptr = static_cast<const uint32_t*>(out_f_r.contents);
-        const auto* cv_ptr = static_cast<const uint32_t*>(out_cv.contents);
 
         result.noise_e_l.assign(e_l_ptr, e_l_ptr + noise_words);
         result.noise_e_r.assign(e_r_ptr, e_r_ptr + noise_words);
         result.noise_f_l.assign(f_l_ptr, f_l_ptr + noise_words);
         result.noise_f_r.assign(f_r_ptr, f_r_ptr + noise_words);
-        result.compress_vec.assign(cv_ptr, cv_ptr + compress_words);
+        // Not consensus since product digest v4; host-derived only for the
+        // solver's prepared-input shape check (see oracle_accel.h).
+        result.compress_vec = matmul::transcript::DeriveCompressionVector(request.sigma, request.b);
         result.success = true;
 
         {
@@ -1070,8 +1053,7 @@ MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationR
             context.profile.pool_initialized = context.pool_out_e_l != nil &&
                 context.pool_out_e_r != nil &&
                 context.pool_out_f_l != nil &&
-                context.pool_out_f_r != nil &&
-                context.pool_out_cv != nil;
+                context.pool_out_f_r != nil;
             ++context.profile.samples;
             context.profile.allocation_events = context.pool_allocation_events;
             context.profile.reuse_events = context.pool_reuse_events;
@@ -1081,9 +1063,84 @@ MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationR
             context.profile.last_gpu_generation_ms = gpu_generation_ms;
             context.profile.library_source =
                 context.using_precompiled_library ? "precompiled_metallib" : "inline_source_fallback";
-            context.profile.reason = "oracle_noise4_plus_compress";
+            context.profile.reason = "oracle_v2_noise4";
         }
 
+        return result;
+    }
+}
+
+MatMulOracleVectorResult GenerateOracleVectorGPUForTesting(const uint256& seed, uint32_t count)
+{
+    MatMulOracleVectorResult result;
+
+    MetalContext& context = GetContext();
+    context.EnsureReady();
+    if (!context.ready) {
+        result.available = false;
+        result.success = false;
+        result.error = context.error.empty() ? "Metal context initialization failed" : context.error;
+        return result;
+    }
+    result.available = true;
+    if (count == 0) {
+        result.success = true;
+        return result;
+    }
+
+    @autoreleasepool {
+        const size_t bytes = static_cast<size_t>(count) * sizeof(uint32_t);
+        id<MTLBuffer> out = [context.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (out == nil) {
+            result.success = false;
+            result.error = "Failed to allocate Metal oracle vector output buffer";
+            return result;
+        }
+
+        std::lock_guard<std::mutex> pool_lock(context.pool_mutex);
+        id<MTLCommandBuffer> command = [context.queue commandBuffer];
+        if (command == nil) {
+            result.success = false;
+            result.error = "Failed to create Metal oracle vector command buffer";
+            return result;
+        }
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        if (encoder == nil) {
+            result.success = false;
+            result.error = "Failed to create Metal oracle vector encoder";
+            return result;
+        }
+
+        struct OracleParams {
+            uint32_t count;
+        };
+        const OracleParams params{count};
+        [encoder setComputePipelineState:context.oracle_vector_pipeline];
+        [encoder setBytes:&params length:sizeof(params) atIndex:0];
+        [encoder setBytes:seed.data() length:uint256::size() atIndex:1];
+        [encoder setBuffer:out offset:0 atIndex:2];
+        const NSUInteger group_size = SelectThreadGroupSize(context.oracle_vector_pipeline, 256);
+        [encoder dispatchThreads:MTLSizeMake(OracleBlockGridSize(count), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(group_size, 1, 1)];
+        [encoder endEncoding];
+
+        [command commit];
+        [command waitUntilCompleted];
+        if (command.status != MTLCommandBufferStatusCompleted) {
+            NSString* description = command.error != nil ? [command.error localizedDescription] : @"unknown Metal command failure";
+            result.success = false;
+            result.error = [description UTF8String];
+            return result;
+        }
+
+        const auto* values = static_cast<const uint32_t*>(out.contents);
+        if (values == nullptr) {
+            result.success = false;
+            result.error = "Metal oracle vector output buffer has no contents";
+            return result;
+        }
+        result.values.assign(values, values + count);
+        result.success = true;
         return result;
     }
 }

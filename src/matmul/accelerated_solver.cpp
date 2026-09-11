@@ -51,20 +51,48 @@ uint256 ComputeDigestCpuFromPrepared(const Matrix& A,
     return result.transcript_hash;
 }
 
-// QTC O5: the v4 product-committed digest hashes every C' tile in full. The
-// Metal and CUDA digest kernels still implement the v3 linear compression (and
-// the v1 one-lane oracle), so until they are ported and parity-tested on
-// hardware, digest requests are served by the CPU reference path. This covers
-// TRANSCRIPT-scheme requests too (pre-activation regtest heights only), because
-// the GPU oracle kernels predate oracle v2.
-constexpr bool kGpuDigestKernelsPortedToV4 = false;
+// QTC O5: the v4 product-committed digest hashes every C' tile in full.
+//  * CUDA: ported (oracle v2 matrix generation, full A'B' GEMM, per-tile
+//    SHA-256; parity-tested against the CPU reference on hardware) -> available.
+//  * METAL: ported (oracle v2 base matrices + noise, full A'B' GEMM, per-tile
+//    SHA-256 on device, root + tagged SHA256d on the host via
+//    ComputeProductCommittedDigestFromTileHashes; parity-tested against the
+//    CPU reference on Apple M5, see matmul_metal_tests) -> available.
+//  * TRANSCRIPT scheme (pre-activation regtest heights only): CPU on every GPU
+//    backend; no GPU implements the legacy transcript any more.
+constexpr bool kCudaDigestKernelsPortedToV4 = true;
+constexpr bool kMetalDigestKernelsPortedToV4 = true;
 constexpr const char* kGpuDigestV4GateReason = "gpu_digest_kernels_not_ported_to_oracle_v2_product_digest_v4";
+constexpr const char* kGpuTranscriptSchemeGateReason = "gpu_transcript_scheme_not_accelerated_cpu_only";
 std::atomic_bool g_logged_v4_gpu_gate{false};
+std::atomic_bool g_logged_transcript_gpu_gate{false};
 
-bool GpuDigestPathAvailable(backend::Kind backend_kind)
+bool GpuDigestKernelsPortedToV4(backend::Kind backend_kind)
+{
+    switch (backend_kind) {
+    case backend::Kind::CUDA:
+        return kCudaDigestKernelsPortedToV4;
+    case backend::Kind::METAL:
+        return kMetalDigestKernelsPortedToV4;
+    case backend::Kind::CPU:
+        return true;
+    }
+    return false;
+}
+
+bool GpuDigestPathAvailable(backend::Kind backend_kind, DigestScheme digest_scheme, std::string* reason = nullptr)
 {
     if (backend_kind == backend::Kind::CPU) return true;
-    if (kGpuDigestKernelsPortedToV4) return true;
+    if (digest_scheme != DigestScheme::PRODUCT_COMMITTED) {
+        if (reason != nullptr) *reason = kGpuTranscriptSchemeGateReason;
+        if (!g_logged_transcript_gpu_gate.exchange(true)) {
+            LogPrintf("MATMUL: %s backend does not accelerate the legacy TRANSCRIPT digest scheme; using CPU path\n",
+                      backend::ToString(backend_kind));
+        }
+        return false;
+    }
+    if (GpuDigestKernelsPortedToV4(backend_kind)) return true;
+    if (reason != nullptr) *reason = kGpuDigestV4GateReason;
     if (!g_logged_v4_gpu_gate.exchange(true)) {
         LogPrintf("MATMUL: %s digest kernels not yet ported to oracle v2 / product digest v4; using CPU path\n",
                   backend::ToString(backend_kind));
@@ -77,13 +105,6 @@ qtc::metal::MatMulDigestMode ToMetalDigestMode(DigestScheme digest_scheme)
     return digest_scheme == DigestScheme::PRODUCT_COMMITTED
         ? qtc::metal::MatMulDigestMode::PRODUCT_COMMITTED
         : qtc::metal::MatMulDigestMode::TRANSCRIPT;
-}
-
-qtc::cuda::MatMulCompressedWordsMode ToCudaCompressedWordsMode(DigestScheme digest_scheme)
-{
-    return digest_scheme == DigestScheme::PRODUCT_COMMITTED
-        ? qtc::cuda::MatMulCompressedWordsMode::PRODUCT_FINAL_BLOCKS
-        : qtc::cuda::MatMulCompressedWordsMode::TRANSCRIPT_PREFIXES;
 }
 
 std::string DefaultBackendRequest()
@@ -436,6 +457,40 @@ std::vector<DigestResult> ComputeCudaDigestBatchFallbackResults(const std::vecto
     return results;
 }
 
+// The device finishes the v4 digest (root + outer SHA256d) when sigmas were
+// supplied; otherwise the N^2 tile hashes come back and the host finishes.
+uint256 FinishProductDigestFromCudaTileHashes(const qtc::cuda::MatMulProductTileHashBatchResult& cuda_result,
+                                              size_t index,
+                                              const uint256& sigma,
+                                              uint32_t n,
+                                              uint32_t transcript_block_size)
+{
+    if (!cuda_result.digests.empty()) {
+        return cuda_result.digests[index];
+    }
+    const Span<const uint256> tiles{
+        cuda_result.tile_hashes.data() + index * cuda_result.tiles_per_request,
+        cuda_result.tiles_per_request,
+    };
+    return transcript::ComputeProductCommittedDigestFromTileHashes(tiles, sigma, n, transcript_block_size);
+}
+
+bool CudaTileHashResultMatchesShape(const qtc::cuda::MatMulProductTileHashBatchResult& cuda_result,
+                                    uint32_t n,
+                                    uint32_t transcript_block_size,
+                                    size_t batch_size)
+{
+    const uint32_t blocks_per_axis = n / transcript_block_size;
+    const uint32_t expected_tiles = blocks_per_axis * blocks_per_axis;
+    if (cuda_result.tiles_per_request != expected_tiles) {
+        return false;
+    }
+    if (!cuda_result.digests.empty()) {
+        return cuda_result.digests.size() == batch_size;
+    }
+    return cuda_result.tile_hashes.size() == batch_size * expected_tiles;
+}
+
 std::vector<DigestResult> ComputeCudaDigestsPreparedBatch(const std::vector<CBlockHeader>& blocks,
                                                           const Matrix& A,
                                                           const Matrix& B,
@@ -448,8 +503,7 @@ std::vector<DigestResult> ComputeCudaDigestsPreparedBatch(const std::vector<CBlo
         return {};
     }
 
-    const auto capability = backend::CapabilityFor(backend::Kind::CUDA);
-    if (!capability.available) {
+    const auto fallback = [&](std::string error) {
         return ComputeCudaDigestBatchFallbackResults(
             blocks,
             A,
@@ -457,147 +511,103 @@ std::vector<DigestResult> ComputeCudaDigestsPreparedBatch(const std::vector<CBlo
             transcript_block_size,
             prepared_batch,
             digest_scheme,
-            capability.reason,
+            std::move(error),
             "cuda_batch_backend_fallback_to_cpu:");
+    };
+
+    const auto capability = backend::CapabilityFor(backend::Kind::CUDA);
+    if (!capability.available) {
+        return fallback(capability.reason);
+    }
+    if (digest_scheme != DigestScheme::PRODUCT_COMMITTED) {
+        return fallback(kGpuTranscriptSchemeGateReason);
     }
 
     try {
+        const uint32_t n = blocks.front().matmul_dim;
         bool all_cuda_generated{true};
         bool all_host_noise{true};
+        std::vector<uint256> sigmas;
+        sigmas.reserve(prepared_batch.size());
         for (const auto& prepared : prepared_batch) {
-            if (!PreparedInputsMatchShape(
-                    prepared,
-                    blocks.front().matmul_dim,
-                    transcript_block_size,
-                    noise_rank)) {
-                return ComputeCudaDigestBatchFallbackResults(
-                    blocks,
-                    A,
-                    B,
-                    transcript_block_size,
-                    prepared_batch,
-                    digest_scheme,
-                    "cuda_prepared_inputs_shape_mismatch",
-                    "cuda_batch_backend_fallback_to_cpu:");
+            if (!PreparedInputsMatchShape(prepared, n, transcript_block_size, noise_rank)) {
+                return fallback("cuda_prepared_inputs_shape_mismatch");
             }
             all_cuda_generated &= prepared.cuda_generated_inputs != nullptr;
-            all_host_noise &= prepared.noise.has_value();
+            all_host_noise &= PreparedInputsHaveHostNoise(prepared, n, noise_rank);
+            sigmas.push_back(prepared.sigma);
         }
 
-        qtc::cuda::MatMulCompressedWordsBatchResult cuda_result;
+        qtc::cuda::MatMulProductTileHashBatchResult cuda_result;
         if (all_cuda_generated) {
             std::vector<const qtc::cuda::MatMulGeneratedInputsDevice*> generated_inputs;
             generated_inputs.reserve(prepared_batch.size());
             for (const auto& prepared : prepared_batch) {
                 generated_inputs.push_back(prepared.cuda_generated_inputs.get());
             }
-            cuda_result = qtc::cuda::ComputeCompressedWordsLowRankDeviceBatchMultiDevice(
-                {
-                    .n = blocks.front().matmul_dim,
-                    .b = transcript_block_size,
-                    .r = noise_rank,
-                    .batch_size = static_cast<uint32_t>(prepared_batch.size()),
-                    .matrix_a = A.data(),
-                    .matrix_b = B.data(),
-                    .matrix_a_cache_key = &blocks.front().seed_a,
-                    .matrix_b_cache_key = &blocks.front().seed_b,
-                    .generated_inputs = generated_inputs.data(),
-                },
-                ToCudaCompressedWordsMode(digest_scheme));
+            cuda_result = qtc::cuda::ComputeProductTileHashesLowRankDeviceBatchMultiDevice({
+                .n = n,
+                .b = transcript_block_size,
+                .r = noise_rank,
+                .batch_size = static_cast<uint32_t>(prepared_batch.size()),
+                .matrix_a = A.data(),
+                .matrix_b = B.data(),
+                .matrix_a_cache_key = &blocks.front().seed_a,
+                .matrix_b_cache_key = &blocks.front().seed_b,
+                .generated_inputs = generated_inputs.data(),
+                .sigmas = sigmas.data(),
+            });
         } else if (all_host_noise) {
             std::vector<const field::Element*> noise_e_l_ptrs;
             std::vector<const field::Element*> noise_e_r_ptrs;
             std::vector<const field::Element*> noise_f_l_ptrs;
             std::vector<const field::Element*> noise_f_r_ptrs;
-            std::vector<const field::Element*> compress_ptrs;
             noise_e_l_ptrs.reserve(prepared_batch.size());
             noise_e_r_ptrs.reserve(prepared_batch.size());
             noise_f_l_ptrs.reserve(prepared_batch.size());
             noise_f_r_ptrs.reserve(prepared_batch.size());
-            compress_ptrs.reserve(prepared_batch.size());
             for (const auto& prepared : prepared_batch) {
                 noise_e_l_ptrs.push_back(prepared.noise->E_L.data());
                 noise_e_r_ptrs.push_back(prepared.noise->E_R.data());
                 noise_f_l_ptrs.push_back(prepared.noise->F_L.data());
                 noise_f_r_ptrs.push_back(prepared.noise->F_R.data());
-                compress_ptrs.push_back(prepared.compress_vec.data());
             }
-
-            cuda_result = qtc::cuda::ComputeCompressedWordsLowRankBatchMultiDevice(
-                {
-                    .n = blocks.front().matmul_dim,
-                    .b = transcript_block_size,
-                    .r = noise_rank,
-                    .batch_size = static_cast<uint32_t>(prepared_batch.size()),
-                    .matrix_a = A.data(),
-                    .matrix_b = B.data(),
-                    .matrix_a_cache_key = &blocks.front().seed_a,
-                    .matrix_b_cache_key = &blocks.front().seed_b,
-                    .noise_e_l = noise_e_l_ptrs.data(),
-                    .noise_e_r = noise_e_r_ptrs.data(),
-                    .noise_f_l = noise_f_l_ptrs.data(),
-                    .noise_f_r = noise_f_r_ptrs.data(),
-                    .compress_vec = compress_ptrs.data(),
-                },
-                ToCudaCompressedWordsMode(digest_scheme));
+            cuda_result = qtc::cuda::ComputeProductTileHashesLowRankBatchMultiDevice({
+                .n = n,
+                .b = transcript_block_size,
+                .r = noise_rank,
+                .batch_size = static_cast<uint32_t>(prepared_batch.size()),
+                .matrix_a = A.data(),
+                .matrix_b = B.data(),
+                .matrix_a_cache_key = &blocks.front().seed_a,
+                .matrix_b_cache_key = &blocks.front().seed_b,
+                .noise_e_l = noise_e_l_ptrs.data(),
+                .noise_e_r = noise_e_r_ptrs.data(),
+                .noise_f_l = noise_f_l_ptrs.data(),
+                .noise_f_r = noise_f_r_ptrs.data(),
+                .sigmas = sigmas.data(),
+            });
         } else {
-            return ComputeCudaDigestBatchFallbackResults(
-                blocks,
-                A,
-                B,
-                transcript_block_size,
-                prepared_batch,
-                digest_scheme,
-                "cuda_prepared_inputs_representation_mismatch",
-                "cuda_batch_backend_fallback_to_cpu:");
+            return fallback("cuda_prepared_inputs_representation_mismatch");
         }
 
         if (!cuda_result.success) {
-            const std::string cuda_error = cuda_result.error.empty() ? "cuda_batch_digest_failed" : cuda_result.error;
-            return ComputeCudaDigestBatchFallbackResults(
-                blocks,
-                A,
-                B,
-                transcript_block_size,
-                prepared_batch,
-                digest_scheme,
-                cuda_error,
-                "cuda_batch_backend_fallback_to_cpu:");
+            return fallback(cuda_result.error.empty() ? "cuda_batch_digest_failed" : cuda_result.error);
         }
-
-        const uint32_t expected_words_per_request =
-            digest_scheme == DigestScheme::PRODUCT_COMMITTED
-                ? (blocks.front().matmul_dim / transcript_block_size) * (blocks.front().matmul_dim / transcript_block_size)
-                : (blocks.front().matmul_dim / transcript_block_size) * (blocks.front().matmul_dim / transcript_block_size) *
-                    (blocks.front().matmul_dim / transcript_block_size);
-        if (cuda_result.words_per_request != expected_words_per_request ||
-            cuda_result.words.size() != static_cast<size_t>(prepared_batch.size()) * expected_words_per_request) {
-            return ComputeCudaDigestBatchFallbackResults(
-                blocks,
-                A,
-                B,
-                transcript_block_size,
-                prepared_batch,
-                digest_scheme,
-                "cuda_batch_digest_size_mismatch",
-                "cuda_batch_backend_fallback_to_cpu:");
+        if (!CudaTileHashResultMatchesShape(cuda_result, n, transcript_block_size, prepared_batch.size())) {
+            return fallback("cuda_batch_digest_size_mismatch");
         }
 
         std::vector<DigestResult> results;
         results.reserve(prepared_batch.size());
         for (size_t i = 0; i < prepared_batch.size(); ++i) {
-            const auto words = Span<const field::Element>{
-                cuda_result.words.data() + i * expected_words_per_request,
-                expected_words_per_request,
-            };
             DigestResult result;
-            result.digest = digest_scheme == DigestScheme::PRODUCT_COMMITTED
-                ? transcript::ComputeProductCommittedDigestFromWords(
-                      words,
-                      prepared_batch[i].sigma,
-                      blocks[i].matmul_dim,
-                      transcript_block_size)
-                : transcript::FinalizeTranscriptDigestFromWords(words);
+            result.digest = FinishProductDigestFromCudaTileHashes(
+                cuda_result,
+                i,
+                prepared_batch[i].sigma,
+                blocks[i].matmul_dim,
+                transcript_block_size);
             result.backend = backend::Kind::CUDA;
             result.accelerated = true;
             result.ok = true;
@@ -606,25 +616,9 @@ std::vector<DigestResult> ComputeCudaDigestsPreparedBatch(const std::vector<CBlo
         g_cuda_successes.fetch_add(results.size(), std::memory_order_relaxed);
         return results;
     } catch (const std::exception& e) {
-        return ComputeCudaDigestBatchFallbackResults(
-            blocks,
-            A,
-            B,
-            transcript_block_size,
-            prepared_batch,
-            digest_scheme,
-            std::string("cuda_batch_backend_exception:") + e.what(),
-            "cuda_batch_backend_fallback_to_cpu:");
+        return fallback(std::string("cuda_batch_backend_exception:") + e.what());
     } catch (...) {
-        return ComputeCudaDigestBatchFallbackResults(
-            blocks,
-            A,
-            B,
-            transcript_block_size,
-            prepared_batch,
-            digest_scheme,
-            "cuda_batch_backend_unknown_exception",
-            "cuda_batch_backend_fallback_to_cpu:");
+        return fallback("cuda_batch_backend_unknown_exception");
     }
 }
 
@@ -680,8 +674,7 @@ std::vector<DigestResult> ComputeCudaVariableBaseDigestsPreparedBatch(
         return {};
     }
 
-    const auto capability = backend::CapabilityFor(backend::Kind::CUDA);
-    if (!capability.available) {
+    const auto fallback = [&](std::string error) {
         return ComputeVariableBaseDigestBatchFallbackResults(
             blocks,
             transcript_block_size,
@@ -689,8 +682,16 @@ std::vector<DigestResult> ComputeCudaVariableBaseDigestsPreparedBatch(
             prepared_batch,
             digest_scheme,
             backend::Kind::CUDA,
-            capability.reason,
+            std::move(error),
             "cuda_variable_base_batch_backend_fallback_to_cpu:");
+    };
+
+    const auto capability = backend::CapabilityFor(backend::Kind::CUDA);
+    if (!capability.available) {
+        return fallback(capability.reason);
+    }
+    if (digest_scheme != DigestScheme::PRODUCT_COMMITTED) {
+        return fallback(kGpuTranscriptSchemeGateReason);
     }
 
     try {
@@ -699,152 +700,83 @@ std::vector<DigestResult> ComputeCudaVariableBaseDigestsPreparedBatch(
         std::vector<uint256> seed_b;
         std::vector<uint256> sigmas;
         std::vector<const qtc::cuda::MatMulGeneratedInputsDevice*> generated_inputs;
+        std::vector<const field::Element*> noise_e_l_ptrs;
+        std::vector<const field::Element*> noise_e_r_ptrs;
+        std::vector<const field::Element*> noise_f_l_ptrs;
+        std::vector<const field::Element*> noise_f_r_ptrs;
         seed_a.reserve(blocks.size());
         seed_b.reserve(blocks.size());
         sigmas.reserve(blocks.size());
         generated_inputs.reserve(prepared_batch.size());
+        noise_e_l_ptrs.reserve(prepared_batch.size());
+        noise_e_r_ptrs.reserve(prepared_batch.size());
+        noise_f_l_ptrs.reserve(prepared_batch.size());
+        noise_f_r_ptrs.reserve(prepared_batch.size());
 
+        bool all_cuda_generated{true};
+        bool all_host_noise{true};
         for (size_t i = 0; i < prepared_batch.size(); ++i) {
             const auto& block = blocks[i];
             const auto& prepared = prepared_batch[i];
             if (block.matmul_dim != n ||
                 !PreparedInputsMatchShape(prepared, n, transcript_block_size, noise_rank)) {
-                return ComputeVariableBaseDigestBatchFallbackResults(
-                    blocks,
-                    transcript_block_size,
-                    noise_rank,
-                    prepared_batch,
-                    digest_scheme,
-                    backend::Kind::CUDA,
-                    "cuda_variable_base_prepared_inputs_shape_mismatch",
-                    "cuda_variable_base_batch_backend_fallback_to_cpu:");
-            }
-            if (prepared.cuda_generated_inputs == nullptr) {
-                return ComputeVariableBaseDigestBatchFallbackResults(
-                    blocks,
-                    transcript_block_size,
-                    noise_rank,
-                    prepared_batch,
-                    digest_scheme,
-                    backend::Kind::CUDA,
-                    "cuda_variable_base_requires_device_generated_inputs",
-                    "cuda_variable_base_batch_backend_fallback_to_cpu:");
+                return fallback("cuda_variable_base_prepared_inputs_shape_mismatch");
             }
             seed_a.push_back(block.seed_a);
             seed_b.push_back(block.seed_b);
             sigmas.push_back(prepared.sigma);
-            generated_inputs.push_back(prepared.cuda_generated_inputs.get());
+            if (prepared.cuda_generated_inputs != nullptr) {
+                generated_inputs.push_back(prepared.cuda_generated_inputs.get());
+            } else {
+                all_cuda_generated = false;
+            }
+            if (PreparedInputsHaveHostNoise(prepared, n, noise_rank)) {
+                noise_e_l_ptrs.push_back(prepared.noise->E_L.data());
+                noise_e_r_ptrs.push_back(prepared.noise->E_R.data());
+                noise_f_l_ptrs.push_back(prepared.noise->F_L.data());
+                noise_f_r_ptrs.push_back(prepared.noise->F_R.data());
+            } else {
+                all_host_noise = false;
+            }
+        }
+        if (!all_cuda_generated && !all_host_noise) {
+            return fallback("cuda_variable_base_prepared_inputs_representation_mismatch");
         }
 
-        if (digest_scheme == DigestScheme::PRODUCT_COMMITTED) {
-            auto cuda_digest_result = qtc::cuda::ComputeProductDigestsLowRankVariableBaseDeviceBatchMultiDevice({
-                .n = n,
-                .b = transcript_block_size,
-                .r = noise_rank,
-                .batch_size = static_cast<uint32_t>(prepared_batch.size()),
-                .matrix_a_seeds = seed_a.data(),
-                .matrix_b_seeds = seed_b.data(),
-                .sigmas = sigmas.data(),
-                .generated_inputs = generated_inputs.data(),
-            });
-
-            if (!cuda_digest_result.success) {
-                const std::string cuda_error = cuda_digest_result.error.empty() ? "cuda_variable_base_product_digest_batch_failed" : cuda_digest_result.error;
-                return ComputeVariableBaseDigestBatchFallbackResults(
-                    blocks,
-                    transcript_block_size,
-                    noise_rank,
-                    prepared_batch,
-                    digest_scheme,
-                    backend::Kind::CUDA,
-                    cuda_error,
-                    "cuda_variable_base_batch_backend_fallback_to_cpu:");
-            }
-
-            if (cuda_digest_result.digests.size() != prepared_batch.size()) {
-                return ComputeVariableBaseDigestBatchFallbackResults(
-                    blocks,
-                    transcript_block_size,
-                    noise_rank,
-                    prepared_batch,
-                    digest_scheme,
-                    backend::Kind::CUDA,
-                    "cuda_variable_base_product_digest_batch_size_mismatch",
-                    "cuda_variable_base_batch_backend_fallback_to_cpu:");
-            }
-
-            std::vector<DigestResult> results;
-            results.reserve(prepared_batch.size());
-            for (size_t i = 0; i < prepared_batch.size(); ++i) {
-                DigestResult result;
-                result.digest = cuda_digest_result.digests[i];
-                result.backend = backend::Kind::CUDA;
-                result.accelerated = true;
-                result.ok = true;
-                results.push_back(std::move(result));
-            }
-            g_cuda_successes.fetch_add(results.size(), std::memory_order_relaxed);
-            return results;
-        }
-
-        auto cuda_result = qtc::cuda::ComputeCompressedWordsLowRankVariableBaseDeviceBatchMultiDevice(
-            {
-                .n = n,
-                .b = transcript_block_size,
-                .r = noise_rank,
-                .batch_size = static_cast<uint32_t>(prepared_batch.size()),
-                .matrix_a_seeds = seed_a.data(),
-                .matrix_b_seeds = seed_b.data(),
-                .generated_inputs = generated_inputs.data(),
-            },
-            ToCudaCompressedWordsMode(digest_scheme));
+        // Device-generated inputs (mainnet shape) win; otherwise the host noise
+        // is uploaded so that smaller shapes (regtest) stay on the GPU too.
+        const auto cuda_result = qtc::cuda::ComputeProductTileHashesLowRankVariableBaseBatchMultiDevice({
+            .n = n,
+            .b = transcript_block_size,
+            .r = noise_rank,
+            .batch_size = static_cast<uint32_t>(prepared_batch.size()),
+            .matrix_a_seeds = seed_a.data(),
+            .matrix_b_seeds = seed_b.data(),
+            .generated_inputs = all_cuda_generated ? generated_inputs.data() : nullptr,
+            .noise_e_l = all_cuda_generated ? nullptr : noise_e_l_ptrs.data(),
+            .noise_e_r = all_cuda_generated ? nullptr : noise_e_r_ptrs.data(),
+            .noise_f_l = all_cuda_generated ? nullptr : noise_f_l_ptrs.data(),
+            .noise_f_r = all_cuda_generated ? nullptr : noise_f_r_ptrs.data(),
+            .sigmas = sigmas.data(),
+        });
 
         if (!cuda_result.success) {
-            const std::string cuda_error = cuda_result.error.empty() ? "cuda_variable_base_batch_digest_failed" : cuda_result.error;
-            return ComputeVariableBaseDigestBatchFallbackResults(
-                blocks,
-                transcript_block_size,
-                noise_rank,
-                prepared_batch,
-                digest_scheme,
-                backend::Kind::CUDA,
-                cuda_error,
-                "cuda_variable_base_batch_backend_fallback_to_cpu:");
+            return fallback(cuda_result.error.empty() ? "cuda_variable_base_product_digest_batch_failed" : cuda_result.error);
         }
-
-        const uint32_t blocks_per_axis = n / transcript_block_size;
-        const uint32_t expected_words_per_request =
-            digest_scheme == DigestScheme::PRODUCT_COMMITTED
-                ? blocks_per_axis * blocks_per_axis
-                : blocks_per_axis * blocks_per_axis * blocks_per_axis;
-        if (cuda_result.words_per_request != expected_words_per_request ||
-            cuda_result.words.size() != static_cast<size_t>(prepared_batch.size()) * expected_words_per_request) {
-            return ComputeVariableBaseDigestBatchFallbackResults(
-                blocks,
-                transcript_block_size,
-                noise_rank,
-                prepared_batch,
-                digest_scheme,
-                backend::Kind::CUDA,
-                "cuda_variable_base_batch_digest_size_mismatch",
-                "cuda_variable_base_batch_backend_fallback_to_cpu:");
+        if (!CudaTileHashResultMatchesShape(cuda_result, n, transcript_block_size, prepared_batch.size())) {
+            return fallback("cuda_variable_base_product_digest_batch_size_mismatch");
         }
 
         std::vector<DigestResult> results;
         results.reserve(prepared_batch.size());
         for (size_t i = 0; i < prepared_batch.size(); ++i) {
-            const auto words = Span<const field::Element>{
-                cuda_result.words.data() + i * expected_words_per_request,
-                expected_words_per_request,
-            };
             DigestResult result;
-            result.digest = digest_scheme == DigestScheme::PRODUCT_COMMITTED
-                ? transcript::ComputeProductCommittedDigestFromWords(
-                      words,
-                      prepared_batch[i].sigma,
-                      blocks[i].matmul_dim,
-                      transcript_block_size)
-                : transcript::FinalizeTranscriptDigestFromWords(words);
+            result.digest = FinishProductDigestFromCudaTileHashes(
+                cuda_result,
+                i,
+                prepared_batch[i].sigma,
+                blocks[i].matmul_dim,
+                transcript_block_size);
             result.backend = backend::Kind::CUDA;
             result.accelerated = true;
             result.ok = true;
@@ -853,25 +785,9 @@ std::vector<DigestResult> ComputeCudaVariableBaseDigestsPreparedBatch(
         g_cuda_successes.fetch_add(results.size(), std::memory_order_relaxed);
         return results;
     } catch (const std::exception& e) {
-        return ComputeVariableBaseDigestBatchFallbackResults(
-            blocks,
-            transcript_block_size,
-            noise_rank,
-            prepared_batch,
-            digest_scheme,
-            backend::Kind::CUDA,
-            std::string("cuda_variable_base_batch_backend_exception:") + e.what(),
-            "cuda_variable_base_batch_backend_fallback_to_cpu:");
+        return fallback(std::string("cuda_variable_base_batch_backend_exception:") + e.what());
     } catch (...) {
-        return ComputeVariableBaseDigestBatchFallbackResults(
-            blocks,
-            transcript_block_size,
-            noise_rank,
-            prepared_batch,
-            digest_scheme,
-            backend::Kind::CUDA,
-            "cuda_variable_base_batch_backend_unknown_exception",
-            "cuda_variable_base_batch_backend_fallback_to_cpu:");
+        return fallback("cuda_variable_base_batch_backend_unknown_exception");
     }
 }
 
@@ -1448,6 +1364,10 @@ PreparedDigestInputs PrepareMatMulDigestInputsForBackend(const CBlockHeader& blo
 
                 if (generated.success) {
                     g_gpu_input_generation_successes.fetch_add(1, std::memory_order_relaxed);
+                    // The CUDA oracle no longer produces the v3 compression vector
+                    // (it is not part of the v4 digest); derive it on the host so
+                    // the prepared inputs keep the full host representation the
+                    // CPU transcript path and the shape checks expect.
                     return PreparedDigestInputs{
                         .sigma = sigma,
                         .noise = noise::NoisePair{
@@ -1456,7 +1376,7 @@ PreparedDigestInputs PrepareMatMulDigestInputsForBackend(const CBlockHeader& blo
                             .F_L = MatrixFromRowMajorWords(n, noise_rank, generated.noise_f_l),
                             .F_R = MatrixFromRowMajorWords(noise_rank, n, generated.noise_f_r),
                         },
-                        .compress_vec = generated.compress_vec,
+                        .compress_vec = transcript::DeriveCompressionVector(sigma, transcript_block_size),
                         .cuda_generated_inputs = nullptr,
                     };
                 }
@@ -1653,10 +1573,12 @@ DigestResult ComputeMatMulDigestPrepared(const CBlockHeader& block,
     result.backend = preferred_backend;
     g_digest_requests.fetch_add(1, std::memory_order_relaxed);
 
-    if (preferred_backend != backend::Kind::CPU && !GpuDigestPathAvailable(preferred_backend)) {
+    std::string gate_reason;
+    if (preferred_backend != backend::Kind::CPU &&
+        !GpuDigestPathAvailable(preferred_backend, digest_scheme, &gate_reason)) {
         // Report exactly like an unavailable-backend fallback so callers, stats and
         // tests observe a clean CPU fallback with a reason.
-        const std::string reason = kGpuDigestV4GateReason;
+        const std::string reason = gate_reason;
         std::string prefix;
         if (preferred_backend == backend::Kind::CUDA) {
             g_requested_cuda.fetch_add(1, std::memory_order_relaxed);
@@ -1737,56 +1659,47 @@ DigestResult ComputeMatMulDigestPrepared(const CBlockHeader& block,
                 return result;
             }
 
-            qtc::cuda::MatMulCompressedWordsBatchResult cuda_result;
-            if (prepared.cuda_generated_inputs != nullptr) {
+            qtc::cuda::MatMulProductTileHashBatchResult cuda_result;
+            if (digest_scheme != DigestScheme::PRODUCT_COMMITTED) {
+                cuda_result.error = kGpuTranscriptSchemeGateReason;
+            } else if (prepared.cuda_generated_inputs != nullptr) {
                 const qtc::cuda::MatMulGeneratedInputsDevice* generated_inputs[] = {prepared.cuda_generated_inputs.get()};
-                cuda_result = qtc::cuda::ComputeCompressedWordsLowRankDeviceBatch(
-                    {
-                        .n = block.matmul_dim,
-                        .b = transcript_block_size,
-                        .r = noise_rank,
-                        .batch_size = 1,
-                        .matrix_a = A.data(),
-                        .matrix_b = B.data(),
-                        .matrix_a_cache_key = &block.seed_a,
-                        .matrix_b_cache_key = &block.seed_b,
-                        .generated_inputs = generated_inputs,
-                    },
-                    ToCudaCompressedWordsMode(digest_scheme));
+                cuda_result = qtc::cuda::ComputeProductTileHashesLowRankDeviceBatch({
+                    .n = block.matmul_dim,
+                    .b = transcript_block_size,
+                    .r = noise_rank,
+                    .batch_size = 1,
+                    .matrix_a = A.data(),
+                    .matrix_b = B.data(),
+                    .matrix_a_cache_key = &block.seed_a,
+                    .matrix_b_cache_key = &block.seed_b,
+                    .generated_inputs = generated_inputs,
+                    .sigmas = &prepared.sigma,
+                });
             } else {
                 const field::Element* noise_e_l_ptrs[] = {prepared.noise->E_L.data()};
                 const field::Element* noise_e_r_ptrs[] = {prepared.noise->E_R.data()};
                 const field::Element* noise_f_l_ptrs[] = {prepared.noise->F_L.data()};
                 const field::Element* noise_f_r_ptrs[] = {prepared.noise->F_R.data()};
-                const field::Element* compress_ptrs[] = {prepared.compress_vec.data()};
-
-                cuda_result = qtc::cuda::ComputeCompressedWordsLowRankBatch(
-                    {
-                        .n = block.matmul_dim,
-                        .b = transcript_block_size,
-                        .r = noise_rank,
-                        .batch_size = 1,
-                        .matrix_a = A.data(),
-                        .matrix_b = B.data(),
-                        .matrix_a_cache_key = &block.seed_a,
-                        .matrix_b_cache_key = &block.seed_b,
-                        .noise_e_l = noise_e_l_ptrs,
-                        .noise_e_r = noise_e_r_ptrs,
-                        .noise_f_l = noise_f_l_ptrs,
-                        .noise_f_r = noise_f_r_ptrs,
-                        .compress_vec = compress_ptrs,
-                    },
-                    ToCudaCompressedWordsMode(digest_scheme));
+                cuda_result = qtc::cuda::ComputeProductTileHashesLowRankBatch({
+                    .n = block.matmul_dim,
+                    .b = transcript_block_size,
+                    .r = noise_rank,
+                    .batch_size = 1,
+                    .matrix_a = A.data(),
+                    .matrix_b = B.data(),
+                    .matrix_a_cache_key = &block.seed_a,
+                    .matrix_b_cache_key = &block.seed_b,
+                    .noise_e_l = noise_e_l_ptrs,
+                    .noise_e_r = noise_e_r_ptrs,
+                    .noise_f_l = noise_f_l_ptrs,
+                    .noise_f_r = noise_f_r_ptrs,
+                    .sigmas = &prepared.sigma,
+                });
             }
 
             if (cuda_result.success) {
-                const uint32_t blocks_per_axis = block.matmul_dim / transcript_block_size;
-                const uint32_t expected_words =
-                    digest_scheme == DigestScheme::PRODUCT_COMMITTED
-                        ? blocks_per_axis * blocks_per_axis
-                        : blocks_per_axis * blocks_per_axis * blocks_per_axis;
-                if (cuda_result.words_per_request != expected_words ||
-                    cuda_result.words.size() != expected_words) {
+                if (!CudaTileHashResultMatchesShape(cuda_result, block.matmul_dim, transcript_block_size, 1)) {
                     const std::string cuda_error = "cuda_digest_size_mismatch";
                     LogBackendFallbackOnce(g_logged_cuda_fallback, "CUDA", cuda_error);
                     RecordCudaFallback(cuda_error);
@@ -1803,14 +1716,12 @@ DigestResult ComputeMatMulDigestPrepared(const CBlockHeader& block,
                     return result;
                 }
 
-                const auto words = Span<const field::Element>{cuda_result.words.data(), cuda_result.words.size()};
-                result.digest = digest_scheme == DigestScheme::PRODUCT_COMMITTED
-                    ? transcript::ComputeProductCommittedDigestFromWords(
-                          words,
-                          prepared.sigma,
-                          block.matmul_dim,
-                          transcript_block_size)
-                    : transcript::FinalizeTranscriptDigestFromWords(words);
+                result.digest = FinishProductDigestFromCudaTileHashes(
+                    cuda_result,
+                    0,
+                    prepared.sigma,
+                    block.matmul_dim,
+                    transcript_block_size);
                 g_cuda_successes.fetch_add(1, std::memory_order_relaxed);
                 result.backend = backend::Kind::CUDA;
                 result.accelerated = true;
@@ -2026,7 +1937,8 @@ DigestBatchSubmission SubmitMatMulDigestPreparedBatchForMining(const std::vector
     state->digest_scheme = digest_scheme;
     state->prepared_batch = &prepared_batch;
     state->preferred_backend = preferred_backend;
-    const bool gpu_digest_available = GpuDigestPathAvailable(preferred_backend);
+    std::string gate_reason;
+    const bool gpu_digest_available = GpuDigestPathAvailable(preferred_backend, digest_scheme, &gate_reason);
 
     if (blocks.empty()) {
         submission.submitted = true;
@@ -2057,7 +1969,7 @@ DigestBatchSubmission SubmitMatMulDigestPreparedBatchForMining(const std::vector
             transcript_block_size,
             prepared_batch,
             digest_scheme,
-            kGpuDigestV4GateReason,
+            gate_reason,
             "cuda_batch_backend_fallback_to_cpu:");
         submission.backend = backend::Kind::CPU;
         submission.submitted = true;
@@ -2557,7 +2469,9 @@ std::vector<DigestResult> ComputeMatMulDigestPreparedVariableBaseBatchForMining(
         return results;
     }
 
-    if (preferred_backend != backend::Kind::CPU && !GpuDigestPathAvailable(preferred_backend)) {
+    std::string gate_reason;
+    if (preferred_backend != backend::Kind::CPU &&
+        !GpuDigestPathAvailable(preferred_backend, digest_scheme, &gate_reason)) {
         g_digest_requests.fetch_add(blocks.size(), std::memory_order_relaxed);
         if (preferred_backend == backend::Kind::CUDA) {
             g_requested_cuda.fetch_add(blocks.size(), std::memory_order_relaxed);
@@ -2571,7 +2485,7 @@ std::vector<DigestResult> ComputeMatMulDigestPreparedVariableBaseBatchForMining(
             prepared_batch,
             digest_scheme,
             preferred_backend,
-            kGpuDigestV4GateReason,
+            gate_reason,
             preferred_backend == backend::Kind::METAL
                 ? "metal_variable_base_batch_backend_fallback_to_cpu:"
                 : "cuda_variable_base_batch_backend_fallback_to_cpu:");

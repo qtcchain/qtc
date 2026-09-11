@@ -24,10 +24,16 @@ struct MatMulInputGenerationRequest {
 struct MatMulInputGenerationResult {
     bool available{false};
     bool success{false};
+    /** Oracle-v2 noise operands generated on the device (bit-identical to
+     *  matmul::noise::Generate). */
     std::vector<matmul::field::Element> noise_e_l;
     std::vector<matmul::field::Element> noise_e_r;
     std::vector<matmul::field::Element> noise_f_l;
     std::vector<matmul::field::Element> noise_f_r;
+    /** Not consensus since product digest v4 and no longer generated on the
+     *  device; filled on the host (matmul::transcript::DeriveCompressionVector)
+     *  only so the solver's prepared-input shape check keeps passing until it
+     *  drops the field. */
     std::vector<matmul::field::Element> compress_vec;
     std::string error;
 };
@@ -39,11 +45,19 @@ struct MatMulInputGenerationProfile {
     uint64_t allocation_events{0};
     uint64_t reuse_events{0};
     double last_encode_noise_us{0.0};
+    /** Always 0 since v4: no compression-vector dispatch remains. */
     double last_encode_compress_us{0.0};
     double last_submit_wait_us{0.0};
     double last_gpu_generation_ms{0.0};
     std::string library_source;
     std::string reason;
+};
+
+struct MatMulOracleVectorResult {
+    bool available{false};
+    bool success{false};
+    std::vector<matmul::field::Element> values;
+    std::string error;
 };
 
 struct MatMulNonceSeedPreHashScanRequest {
@@ -71,6 +85,9 @@ struct MatMulNonceSeedPreHashScanResult {
 
 MatMulInputGenerationProfile ProbeMatMulInputGenerationProfile();
 MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationRequest& request);
+/** values[i] = matmul::field::from_oracle(seed, i) for i in [0, count),
+ *  computed on the device with the oracle-v2 kernel (test/diagnostic hook). */
+MatMulOracleVectorResult GenerateOracleVectorGPUForTesting(const uint256& seed, uint32_t count);
 MatMulNonceSeedPreHashScanResult ScanMatMulNonceSeedPreHashGPU(
     const MatMulNonceSeedPreHashScanRequest& request);
 

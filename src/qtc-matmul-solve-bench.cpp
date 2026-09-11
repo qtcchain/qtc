@@ -8,6 +8,7 @@
 #include <cuda/matmul_accel.h>
 #include <matmul/backend_capabilities.h>
 #include <matmul/accelerated_solver.h>
+#include <matmul/matrix.h>
 #include <metal/matmul_accel.h>
 #include <pow.h>
 #include <primitives/block.h>
@@ -64,6 +65,7 @@ struct Options {
     std::optional<std::string> pool_slots_override;
     std::optional<std::string> solver_threads_override;
     std::optional<bool> skip_matmul_validation_override;
+    std::optional<uint32_t> digest_batch_bench;
 };
 
 std::optional<uint64_t> ParseUintArg(std::string_view text)
@@ -110,7 +112,8 @@ void PrintUsage(std::ostream& out)
         << " [--skip-matmul-validation <0|1>]"
         << " [--async <0|1>] [--gpu-inputs <0|1>]"
         << " [--batch-size <count>] [--digest-slice-size <count>] [--prefetch-depth <count>] [--prepare-workers <count>]"
-        << " [--pool-slots <count>] [--solver-threads <count>]" << std::endl;
+        << " [--pool-slots <count>] [--solver-threads <count>]"
+        << " [--digest-batch-bench <batch>]" << std::endl;
 }
 
 bool ParseArgs(int argc, char* argv[], Options& options)
@@ -337,6 +340,14 @@ bool ParseArgs(int argc, char* argv[], Options& options)
                     options.solver_threads_override = std::string{value};
                     return true;
                 })) return false;
+        } else if (arg == "--digest-batch-bench" || arg.rfind("--digest-batch-bench=", 0) == 0) {
+            consumed = true;
+            if (!parse_kv("--digest-batch-bench", [&](std::string_view value) {
+                    uint32_t parsed{0};
+                    if (!parse_uint32("--digest-batch-bench", value, parsed)) return false;
+                    options.digest_batch_bench = parsed;
+                    return true;
+                })) return false;
         }
 
         if (!consumed) {
@@ -523,6 +534,132 @@ IterationResult RunSolveIteration(const Options& options, const Consensus::Param
     return result;
 }
 
+// Direct digest-pipeline benchmark (QTC O5 product digest v4): times the
+// variable-base mining batch path (per-header seeds -> prepared inputs ->
+// ComputeMatMulDigestPreparedVariableBaseBatchForMining) without the nonce
+// pre-hash scan, so attempts/s reflects the digest cost the solver pays per
+// candidate. The first digest of every iteration is spot-checked against the
+// CPU reference so a silently wrong backend cannot post a good number.
+UniValue RunDigestBatchBench(const Options& options)
+{
+    const uint32_t batch = std::max<uint32_t>(1U, *options.digest_batch_bench);
+    const auto selection = matmul::accelerated::ResolveMiningBackendFromEnvironment();
+    const auto backend = selection.active;
+    constexpr auto kScheme = matmul::accelerated::DigestScheme::PRODUCT_COMMITTED;
+
+    std::vector<CBlockHeader> headers;
+    headers.reserve(batch);
+    const arith_uint256 seed_a_base = UintToArith256(
+        ParseUint256("6410ee507c58dca3d22f950385d38fdd5fba9dd2e424b2657a2410e92d23dc63"));
+    const arith_uint256 seed_b_base = UintToArith256(
+        ParseUint256("7f165f0361461f69e2442a31fec8c26d2d95928cae37cb1673cd14fbba25f03c"));
+    uint64_t nonce_cursor{1};
+    const auto rebuild_headers = [&]() {
+        headers.clear();
+        for (uint32_t i = 0; i < batch; ++i) {
+            CBlockHeader header = BuildCandidateHeader(options.n, options.nbits, nonce_cursor);
+            header.seed_a = ArithToUint256(seed_a_base + arith_uint256(nonce_cursor));
+            header.seed_b = ArithToUint256(seed_b_base + arith_uint256(nonce_cursor));
+            headers.push_back(header);
+            ++nonce_cursor;
+        }
+    };
+
+    std::vector<double> attempts_per_sec_total;
+    std::vector<double> attempts_per_sec_digest_only;
+    std::vector<double> prepare_s_values;
+    std::vector<double> digest_s_values;
+    uint64_t fallbacks{0};
+    uint64_t failures{0};
+    uint64_t mismatches{0};
+    uint64_t spot_checks{0};
+
+    matmul::accelerated::ResetMatMulBackendRuntimeStats();
+    for (uint32_t iteration = 0; iteration < options.iterations + 1U; ++iteration) {
+        rebuild_headers();
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto prepared = matmul::accelerated::PrepareMatMulDigestInputsBatchForBackend(
+            headers, options.b, options.r, backend, kScheme);
+        const auto t1 = std::chrono::steady_clock::now();
+        const auto results = matmul::accelerated::ComputeMatMulDigestPreparedVariableBaseBatchForMining(
+            headers, options.b, options.r, prepared, backend, kScheme);
+        const auto t2 = std::chrono::steady_clock::now();
+        if (iteration == 0) {
+            continue; // warm-up: pool slots, pinned staging, device buffers
+        }
+
+        const double prepare_s = std::chrono::duration<double>(t1 - t0).count();
+        const double digest_s = std::chrono::duration<double>(t2 - t1).count();
+        prepare_s_values.push_back(prepare_s);
+        digest_s_values.push_back(digest_s);
+        attempts_per_sec_total.push_back(static_cast<double>(batch) / (prepare_s + digest_s));
+        attempts_per_sec_digest_only.push_back(static_cast<double>(batch) / digest_s);
+        for (const auto& result : results) {
+            if (!result.ok) ++failures;
+            if (result.backend != backend) ++fallbacks;
+        }
+
+        if (!results.empty() && results.front().ok) {
+            const matmul::Matrix A = matmul::FromSeed(headers.front().seed_a, options.n);
+            const matmul::Matrix B = matmul::FromSeed(headers.front().seed_b, options.n);
+            const uint256 cpu_digest = matmul::accelerated::ComputeDigestCpuFromPreparedInputs(
+                A, B, prepared.front(), options.b, kScheme);
+            ++spot_checks;
+            if (cpu_digest != results.front().digest) ++mismatches;
+        }
+    }
+
+    UniValue output(UniValue::VOBJ);
+    UniValue options_obj(UniValue::VOBJ);
+    options_obj.pushKV("mode", "digest_batch_bench");
+    options_obj.pushKV("iterations", options.iterations);
+    options_obj.pushKV("batch", batch);
+    options_obj.pushKV("n", options.n);
+    options_obj.pushKV("b", options.b);
+    options_obj.pushKV("r", options.r);
+    options_obj.pushKV("digest_scheme", "product_committed_v4");
+    output.pushKV("options", std::move(options_obj));
+    output.pushKV("requested_backend", matmul::backend::ToString(selection.requested));
+    output.pushKV("active_backend", matmul::backend::ToString(backend));
+    output.pushKV("backend_selection_reason", selection.reason);
+    output.pushKV("attempts_per_sec_including_prepare", SummarizeSeries(attempts_per_sec_total));
+    output.pushKV("attempts_per_sec_digest_only", SummarizeSeries(attempts_per_sec_digest_only));
+    output.pushKV("prepare_s_per_batch", SummarizeSeries(prepare_s_values));
+    output.pushKV("digest_s_per_batch", SummarizeSeries(digest_s_values));
+    output.pushKV("failures", failures);
+    output.pushKV("backend_fallbacks", fallbacks);
+    output.pushKV("cpu_spot_checks", spot_checks);
+    output.pushKV("cpu_spot_check_mismatches", mismatches);
+
+    const auto backend_runtime = matmul::accelerated::ProbeMatMulBackendRuntimeStats();
+    UniValue backend_obj(UniValue::VOBJ);
+    backend_obj.pushKV("digest_requests", backend_runtime.digest_requests);
+    backend_obj.pushKV("cuda_successes", backend_runtime.cuda_successes);
+    backend_obj.pushKV("cuda_fallbacks_to_cpu", backend_runtime.cuda_fallbacks_to_cpu);
+    backend_obj.pushKV("last_cuda_fallback_error", backend_runtime.last_cuda_fallback_error);
+    backend_obj.pushKV("gpu_input_generation_successes", backend_runtime.gpu_input_generation_successes);
+    backend_obj.pushKV("gpu_input_generation_failures", backend_runtime.gpu_input_generation_failures);
+    output.pushKV("backend_runtime_stats", std::move(backend_obj));
+
+    const auto cuda_profiling_stats = qtc::cuda::ProbeMatMulProfilingStats();
+    UniValue cuda_profiling_obj(UniValue::VOBJ);
+    cuda_profiling_obj.pushKV("available", cuda_profiling_stats.available);
+    cuda_profiling_obj.pushKV("samples", cuda_profiling_stats.samples);
+    cuda_profiling_obj.pushKV("last_batch_size", cuda_profiling_stats.last_batch_size);
+    cuda_profiling_obj.pushKV("last_mode", cuda_profiling_stats.last_mode);
+    cuda_profiling_obj.pushKV("last_total_wall_ms", cuda_profiling_stats.last_total_wall_ms);
+    cuda_profiling_obj.pushKV("last_gpu_build_us", cuda_profiling_stats.last_gpu_build_us);
+    cuda_profiling_obj.pushKV("last_gpu_gemm_us", cuda_profiling_stats.last_gpu_gemm_us);
+    cuda_profiling_obj.pushKV("last_gpu_tile_hash_us", cuda_profiling_stats.last_gpu_tile_hash_us);
+    cuda_profiling_obj.pushKV("last_gpu_copy_us", cuda_profiling_stats.last_gpu_copy_us);
+    cuda_profiling_obj.pushKV("last_submit_d2h_us", cuda_profiling_stats.last_submit_d2h_us);
+    cuda_profiling_obj.pushKV("last_stream_sync_us", cuda_profiling_stats.last_stream_sync_us);
+    cuda_profiling_obj.pushKV("last_stream_wait_event_us", cuda_profiling_stats.last_stream_wait_event_us);
+    cuda_profiling_obj.pushKV("last_used_pinned_host_staging", cuda_profiling_stats.last_used_pinned_host_staging);
+    output.pushKV("cuda_profiling_stats", std::move(cuda_profiling_obj));
+    return output;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -550,6 +687,11 @@ int main(int argc, char* argv[])
     ScopedEnvOverride pool_slots_env("QTC_MATMUL_METAL_POOL_SLOTS", options.pool_slots_override);
     ScopedEnvOverride cuda_pool_slots_env("QTC_MATMUL_CUDA_POOL_SLOTS", options.pool_slots_override);
     ScopedEnvOverride solver_threads_env("QTC_MATMUL_SOLVER_THREADS", options.solver_threads_override);
+
+    if (options.digest_batch_bench.has_value()) {
+        std::cout << RunDigestBatchBench(options).write(2) << std::endl;
+        return 0;
+    }
 
     ArgsManager args;
     auto consensus = CreateChainParams(args, ChainType::REGTEST)->GetConsensus();
@@ -795,6 +937,10 @@ int main(int argc, char* argv[])
         cuda_profiling_obj.pushKV("last_used_device_prepared_inputs", cuda_profiling_stats.last_used_device_prepared_inputs);
         cuda_profiling_obj.pushKV("last_used_pinned_host_staging", cuda_profiling_stats.last_used_pinned_host_staging);
         cuda_profiling_obj.pushKV("last_base_matrix_cache_hit", cuda_profiling_stats.last_base_matrix_cache_hit);
+        cuda_profiling_obj.pushKV("last_gpu_build_us", cuda_profiling_stats.last_gpu_build_us);
+        cuda_profiling_obj.pushKV("last_gpu_gemm_us", cuda_profiling_stats.last_gpu_gemm_us);
+        cuda_profiling_obj.pushKV("last_gpu_tile_hash_us", cuda_profiling_stats.last_gpu_tile_hash_us);
+        cuda_profiling_obj.pushKV("last_gpu_copy_us", cuda_profiling_stats.last_gpu_copy_us);
         cuda_profiling_obj.pushKV("last_mode", cuda_profiling_stats.last_mode);
         cuda_profiling_obj.pushKV("reason", cuda_profiling_stats.reason);
         output.pushKV("cuda_profiling_stats", std::move(cuda_profiling_obj));

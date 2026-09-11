@@ -39,12 +39,28 @@
 
 namespace {
 
+// Verbatim copy of src/metal/matmul_accel_kernels.metal (spliced by the
+// maintainer; keep the two in sync -- the .metal file is the source of truth
+// and the precompiled metallib, when present, is built from it).
 constexpr const char* KERNEL_SOURCE = R"METAL(
 #include <metal_stdlib>
 using namespace metal;
 
+// QTC MatMul proof-of-work Metal kernels.
+//
+// Consensus references (device output must stay bit-identical):
+//   * oracle v2          -> src/matmul/field.cpp (from_oracle / from_oracle_block)
+//   * product digest v4  -> src/matmul/transcript.cpp (HashProductTile,
+//                           HashProductTileHashes, FinalizeProductCommittedDigestFromHash)
+//
+// The device produces the perturbed operands A' = A + E_L*E_R, B' = B + F_L*F_R,
+// the full product C' = A'*B' over GF(2^31-1), and the N*N per-tile SHA-256
+// hashes of C' (row-major LE32 elements, b*b elements per tile). The root hash
+// over the tile hashes and the tagged outer SHA256d are finished on the host.
+
 constant uint MODULUS = 0x7fffffffu;
 constant uint MAX_BLOCK_ELEMENTS = 256u;
+constant uint PRODUCT_TILE_DIM = 16u;
 constant uint FC_SPEC_N [[function_constant(0)]];
 constant uint FC_SPEC_B [[function_constant(1)]];
 constant uint FC_SPEC_R [[function_constant(2)]];
@@ -57,9 +73,9 @@ struct KernelParams {
     uint N;
 };
 
-struct HashParams {
-    uint compressed_words;
-};
+// ---------------------------------------------------------------------------
+// GF(2^31 - 1) arithmetic (mirrors matmul::field)
+// ---------------------------------------------------------------------------
 
 inline uint reduce64(ulong x)
 {
@@ -85,36 +101,9 @@ inline uint mul_mod(uint a, uint b)
     return reduce64((ulong)a * (ulong)b);
 }
 
-inline uint dot_step(uint acc, uint a, uint b)
-{
-    return reduce64((ulong)acc + ((ulong)a * (ulong)b));
-}
-
-inline uint reduce_simdgroup_add_mod(uint value, uint simd_size)
-{
-    for (uint offset = simd_size >> 1u; offset > 0u; offset >>= 1u) {
-        value = add_mod(value, simd_shuffle_xor(value, offset));
-    }
-    return value;
-}
-
-inline uint reduce_threadgroup_add_mod(threadgroup uint* values, uint tid, uint count)
-{
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint active = count;
-    while (active > 1u) {
-        const uint half_count = active >> 1u;
-        if (tid < half_count) {
-            values[tid] = add_mod(values[tid], values[tid + half_count]);
-        }
-        if ((active & 1u) != 0u && tid == 0u) {
-            values[0] = add_mod(values[0], values[active - 1u]);
-        }
-        active = half_count;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return values[0];
-}
+// ---------------------------------------------------------------------------
+// SHA-256
+// ---------------------------------------------------------------------------
 
 inline uint rotr(uint x, uint n)
 {
@@ -162,6 +151,18 @@ constant uint SHA256_K[64] = {
     0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
 };
 
+inline void sha256_init(thread uint state[8])
+{
+    state[0] = 0x6a09e667u;
+    state[1] = 0xbb67ae85u;
+    state[2] = 0x3c6ef372u;
+    state[3] = 0xa54ff53au;
+    state[4] = 0x510e527fu;
+    state[5] = 0x9b05688cu;
+    state[6] = 0x1f83d9abu;
+    state[7] = 0x5be0cd19u;
+}
+
 inline void sha256_compress(thread uint state[8], thread uint w[64])
 {
     for (uint t = 16; t < 64; ++t) {
@@ -200,142 +201,14 @@ inline void sha256_compress(thread uint state[8], thread uint w[64])
     state[7] += h;
 }
 
-inline uint MessageByteAt(device const uint* compressed, uint64_t msg_len_bytes, uint64_t total_bytes, uint64_t offset)
-{
-    if (offset < msg_len_bytes) {
-        const uint64_t word_index = offset >> 2;
-        const uint lane = (uint)(offset & 3u);
-        const uint word = compressed[word_index];
-        return (word >> (lane * 8u)) & 0xffu;
-    }
-
-    if (offset == msg_len_bytes) {
-        return 0x80u;
-    }
-
-    if (offset >= (total_bytes - 8u)) {
-        const uint64_t bit_len = msg_len_bytes * 8u;
-        const uint shift = (uint)((total_bytes - 1u - offset) * 8u);
-        return (uint)((bit_len >> shift) & 0xffu);
-    }
-
-    return 0u;
-}
-
-inline uint FinalEllMessageByteAt(device const uint* compressed, uint N, uint64_t msg_len_bytes, uint64_t total_bytes, uint64_t offset)
-{
-    if (offset < msg_len_bytes) {
-        const uint64_t word_index = offset >> 2;
-        const uint lane = (uint)(offset & 3u);
-        const uint64_t physical_index = word_index * (uint64_t)N + (uint64_t)(N - 1u);
-        const uint word = compressed[physical_index];
-        return (word >> (lane * 8u)) & 0xffu;
-    }
-
-    if (offset == msg_len_bytes) {
-        return 0x80u;
-    }
-
-    if (offset >= (total_bytes - 8u)) {
-        const uint64_t bit_len = msg_len_bytes * 8u;
-        const uint shift = (uint)((total_bytes - 1u - offset) * 8u);
-        return (uint)((bit_len >> shift) & 0xffu);
-    }
-
-    return 0u;
-}
-
-inline void sha256_stream_words(device const uint* compressed, uint words, thread uint out_state[8])
-{
-    out_state[0] = 0x6a09e667u;
-    out_state[1] = 0xbb67ae85u;
-    out_state[2] = 0x3c6ef372u;
-    out_state[3] = 0xa54ff53au;
-    out_state[4] = 0x510e527fu;
-    out_state[5] = 0x9b05688cu;
-    out_state[6] = 0x1f83d9abu;
-    out_state[7] = 0x5be0cd19u;
-
-    const uint64_t msg_len_bytes = (uint64_t)words * 4u;
-    const uint64_t total_blocks = (msg_len_bytes + 9u + 63u) / 64u;
-    const uint64_t total_bytes = total_blocks * 64u;
-
-    thread uint w[64];
-    for (uint64_t block = 0; block < total_blocks; ++block) {
-        const uint64_t base = block * 64u;
-        for (uint i = 0; i < 16; ++i) {
-            const uint64_t off = base + (uint64_t)i * 4u;
-            const uint b0 = MessageByteAt(compressed, msg_len_bytes, total_bytes, off + 0u);
-            const uint b1 = MessageByteAt(compressed, msg_len_bytes, total_bytes, off + 1u);
-            const uint b2 = MessageByteAt(compressed, msg_len_bytes, total_bytes, off + 2u);
-            const uint b3 = MessageByteAt(compressed, msg_len_bytes, total_bytes, off + 3u);
-            w[i] = (b0 << 24u) | (b1 << 16u) | (b2 << 8u) | b3;
-        }
-        sha256_compress(out_state, w);
-    }
-}
-
-inline void sha256_stream_final_ell_words(device const uint* compressed, uint N, uint words, thread uint out_state[8])
-{
-    out_state[0] = 0x6a09e667u;
-    out_state[1] = 0xbb67ae85u;
-    out_state[2] = 0x3c6ef372u;
-    out_state[3] = 0xa54ff53au;
-    out_state[4] = 0x510e527fu;
-    out_state[5] = 0x9b05688cu;
-    out_state[6] = 0x1f83d9abu;
-    out_state[7] = 0x5be0cd19u;
-
-    const uint64_t msg_len_bytes = (uint64_t)words * 4u;
-    const uint64_t total_blocks = (msg_len_bytes + 9u + 63u) / 64u;
-    const uint64_t total_bytes = total_blocks * 64u;
-
-    thread uint w[64];
-    for (uint64_t block = 0; block < total_blocks; ++block) {
-        const uint64_t base = block * 64u;
-        for (uint i = 0; i < 16; ++i) {
-            const uint64_t off = base + (uint64_t)i * 4u;
-            const uint b0 = FinalEllMessageByteAt(compressed, N, msg_len_bytes, total_bytes, off + 0u);
-            const uint b1 = FinalEllMessageByteAt(compressed, N, msg_len_bytes, total_bytes, off + 1u);
-            const uint b2 = FinalEllMessageByteAt(compressed, N, msg_len_bytes, total_bytes, off + 2u);
-            const uint b3 = FinalEllMessageByteAt(compressed, N, msg_len_bytes, total_bytes, off + 3u);
-            w[i] = (b0 << 24u) | (b1 << 16u) | (b2 << 8u) | b3;
-        }
-        sha256_compress(out_state, w);
-    }
-}
-
-inline void sha256_double_digest(thread uint first_state[8], thread uint out_state[8])
-{
-    out_state[0] = 0x6a09e667u;
-    out_state[1] = 0xbb67ae85u;
-    out_state[2] = 0x3c6ef372u;
-    out_state[3] = 0xa54ff53au;
-    out_state[4] = 0x510e527fu;
-    out_state[5] = 0x9b05688cu;
-    out_state[6] = 0x1f83d9abu;
-    out_state[7] = 0x5be0cd19u;
-
-    thread uint w[64];
-    for (uint i = 0; i < 8; ++i) {
-        w[i] = first_state[i];
-    }
-    w[8] = 0x80000000u;
-    for (uint i = 9; i < 15; ++i) {
-        w[i] = 0u;
-    }
-    w[15] = 256u;
-    sha256_compress(out_state, w);
-}
-
-inline void set_oracle_byte(thread uint w[64], uint offset, uint byte)
+inline void set_msg_byte(thread uint w[64], uint offset, uint byte)
 {
     const uint word_index = offset >> 2u;
     const uint shift = (3u - (offset & 3u)) * 8u;
     w[word_index] |= (byte & 0xffu) << shift;
 }
 
-inline uint oracle_bswap32(uint x)
+inline uint bswap32(uint x)
 {
     return ((x & 0x000000ffu) << 24u) |
            ((x & 0x0000ff00u) << 8u) |
@@ -343,10 +216,21 @@ inline uint oracle_bswap32(uint x)
            ((x & 0xff000000u) >> 24u);
 }
 
-inline uint oracle_candidate_from_seed_and_index(constant uchar* seed_internal,
-                                                 uint index,
-                                                 bool with_retry,
-                                                 uint retry)
+// ---------------------------------------------------------------------------
+// Oracle v2 (matmul::field::from_oracle / from_oracle_block)
+//
+//   block = index >> 3, lane = index & 7
+//   H = SHA-256(seed_canonical || LE32(block) [|| LE32(retry) if retry > 0])
+//   candidate = LE32(H[4*lane .. 4*lane+3]) & 0x7FFFFFFF
+//   candidate == 0x7FFFFFFF is rejected; retry 1..255 re-hash with the SAME lane.
+//   After 256 rejections: LE32(SHA-256(seed_canonical || LE32(block) ||
+//   "oracle-fallback")[lane]) mod M31.
+//
+// `seed_internal` is the uint256 internal byte order; the canonical seed
+// bytes are its reverse (seed.data()[31 - i]).
+// ---------------------------------------------------------------------------
+
+inline void oracle_block_state(constant uchar* seed_internal, uint block, uint retry, thread uint state[8])
 {
     thread uint w[64];
     for (uint i = 0; i < 64; ++i) {
@@ -354,40 +238,38 @@ inline uint oracle_candidate_from_seed_and_index(constant uchar* seed_internal,
     }
 
     for (uint i = 0; i < 32; ++i) {
-        set_oracle_byte(w, i, seed_internal[31u - i]);
+        set_msg_byte(w, i, seed_internal[31u - i]);
     }
 
-    set_oracle_byte(w, 32u, index & 0xffu);
-    set_oracle_byte(w, 33u, (index >> 8u) & 0xffu);
-    set_oracle_byte(w, 34u, (index >> 16u) & 0xffu);
-    set_oracle_byte(w, 35u, (index >> 24u) & 0xffu);
+    set_msg_byte(w, 32u, block & 0xffu);
+    set_msg_byte(w, 33u, (block >> 8u) & 0xffu);
+    set_msg_byte(w, 34u, (block >> 16u) & 0xffu);
+    set_msg_byte(w, 35u, (block >> 24u) & 0xffu);
 
     uint message_len = 36u;
-    if (with_retry) {
-        set_oracle_byte(w, 36u, retry & 0xffu);
-        set_oracle_byte(w, 37u, (retry >> 8u) & 0xffu);
-        set_oracle_byte(w, 38u, (retry >> 16u) & 0xffu);
-        set_oracle_byte(w, 39u, (retry >> 24u) & 0xffu);
+    if (retry > 0u) {
+        set_msg_byte(w, 36u, retry & 0xffu);
+        set_msg_byte(w, 37u, (retry >> 8u) & 0xffu);
+        set_msg_byte(w, 38u, (retry >> 16u) & 0xffu);
+        set_msg_byte(w, 39u, (retry >> 24u) & 0xffu);
         message_len = 40u;
     }
 
-    set_oracle_byte(w, message_len, 0x80u);
+    set_msg_byte(w, message_len, 0x80u);
     w[15] = message_len * 8u;
 
-    thread uint state[8];
-    state[0] = 0x6a09e667u;
-    state[1] = 0xbb67ae85u;
-    state[2] = 0x3c6ef372u;
-    state[3] = 0xa54ff53au;
-    state[4] = 0x510e527fu;
-    state[5] = 0x9b05688cu;
-    state[6] = 0x1f83d9abu;
-    state[7] = 0x5be0cd19u;
+    sha256_init(state);
     sha256_compress(state, w);
-    return oracle_bswap32(state[0]) & MODULUS;
 }
 
-inline uint oracle_fallback_candidate(constant uchar* seed_internal, uint index)
+inline uint oracle_lane_candidate(thread const uint state[8], uint lane)
+{
+    // state[lane] holds hash bytes 4*lane..4*lane+3 big-endian; LE32 of those
+    // bytes is the byte-swapped word.
+    return bswap32(state[lane]) & MODULUS;
+}
+
+inline uint oracle_fallback_lane(constant uchar* seed_internal, uint block, uint lane)
 {
     thread uint w[64];
     for (uint i = 0; i < 64; ++i) {
@@ -395,50 +277,57 @@ inline uint oracle_fallback_candidate(constant uchar* seed_internal, uint index)
     }
 
     for (uint i = 0; i < 32; ++i) {
-        set_oracle_byte(w, i, seed_internal[31u - i]);
+        set_msg_byte(w, i, seed_internal[31u - i]);
     }
 
-    set_oracle_byte(w, 32u, index & 0xffu);
-    set_oracle_byte(w, 33u, (index >> 8u) & 0xffu);
-    set_oracle_byte(w, 34u, (index >> 16u) & 0xffu);
-    set_oracle_byte(w, 35u, (index >> 24u) & 0xffu);
+    set_msg_byte(w, 32u, block & 0xffu);
+    set_msg_byte(w, 33u, (block >> 8u) & 0xffu);
+    set_msg_byte(w, 34u, (block >> 16u) & 0xffu);
+    set_msg_byte(w, 35u, (block >> 24u) & 0xffu);
 
     const uchar fallback_tag[15] = {
         'o', 'r', 'a', 'c', 'l', 'e', '-', 'f', 'a', 'l', 'l', 'b', 'a', 'c', 'k'
     };
     for (uint i = 0; i < 15; ++i) {
-        set_oracle_byte(w, 36u + i, fallback_tag[i]);
+        set_msg_byte(w, 36u + i, fallback_tag[i]);
     }
 
-    set_oracle_byte(w, 51u, 0x80u);
+    set_msg_byte(w, 51u, 0x80u);
     w[15] = 51u * 8u;
 
     thread uint state[8];
-    state[0] = 0x6a09e667u;
-    state[1] = 0xbb67ae85u;
-    state[2] = 0x3c6ef372u;
-    state[3] = 0xa54ff53au;
-    state[4] = 0x510e527fu;
-    state[5] = 0x9b05688cu;
-    state[6] = 0x1f83d9abu;
-    state[7] = 0x5be0cd19u;
+    sha256_init(state);
     sha256_compress(state, w);
-    return oracle_bswap32(state[0]) % MODULUS;
+    return bswap32(state[lane]) % MODULUS;
 }
 
-inline uint oracle_from_seed(constant uchar* seed_internal, uint index)
+inline uint oracle_lane_with_retries(constant uchar* seed_internal, uint block, uint lane, uint first_retry)
 {
-    for (uint retry = 0; retry < 256; ++retry) {
-        const uint candidate = retry == 0
-            ? oracle_candidate_from_seed_and_index(seed_internal, index, false, 0u)
-            : oracle_candidate_from_seed_and_index(seed_internal, index, true, retry);
+    for (uint retry = first_retry; retry < 256u; ++retry) {
+        thread uint state[8];
+        oracle_block_state(seed_internal, block, retry, state);
+        const uint candidate = oracle_lane_candidate(state, lane);
         if (candidate < MODULUS) {
             return candidate;
         }
     }
-    return oracle_fallback_candidate(seed_internal, index);
+    return oracle_fallback_lane(seed_internal, block, lane);
 }
 
+// All eight lanes of one oracle block (== from_oracle(seed, 8*block + lane)).
+inline void oracle_fill_block(constant uchar* seed_internal, uint block, thread uint out[8])
+{
+    thread uint state[8];
+    oracle_block_state(seed_internal, block, 0u, state);
+    for (uint lane = 0; lane < 8u; ++lane) {
+        const uint candidate = oracle_lane_candidate(state, lane);
+        out[lane] = candidate < MODULUS
+            ? candidate
+            : oracle_lane_with_retries(seed_internal, block, lane, 1u);
+    }
+}
+
+// One thread per oracle block (8 elements). Grid = ceil(n*n / 8).
 kernel void generate_base_matrix_from_seed(
     constant KernelParams& p [[buffer(0)]],
     constant uchar* seed_internal [[buffer(1)]],
@@ -446,11 +335,23 @@ kernel void generate_base_matrix_from_seed(
     uint gid [[thread_position_in_grid]])
 {
     const uint nn = p.n * p.n;
-    if (gid >= nn) {
+    const uint base = gid * 8u;
+    if (base >= nn) {
         return;
     }
-    output[gid] = oracle_from_seed(seed_internal, gid);
+    thread uint lanes[8];
+    oracle_fill_block(seed_internal, gid, lanes);
+    for (uint lane = 0; lane < 8u; ++lane) {
+        const uint index = base + lane;
+        if (index < nn) {
+            output[index] = lanes[lane];
+        }
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Perturbed operands: A' = A + E_L*E_R, B' = B + F_L*F_R
+// ---------------------------------------------------------------------------
 
 kernel void build_perturbed(
     constant KernelParams& p [[buffer(0)]],
@@ -486,122 +387,6 @@ kernel void build_perturbed(
 
     a_prime[gid] = add_mod(matrix_a[gid], e_acc);
     b_prime[gid] = add_mod(matrix_b[gid], f_acc);
-}
-
-kernel void build_prefix(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* a_prime [[buffer(1)]],
-    device const uint* b_prime [[buffer(2)]],
-    device uint* c_prefix [[buffer(3)]],
-    uint gid [[thread_position_in_grid]])
-{
-    const uint nn = p.n * p.n;
-    if (gid >= nn) {
-        return;
-    }
-
-    const uint row = gid / p.n;
-    const uint col = gid - row * p.n;
-
-    uint c_acc = 0;
-    for (uint ell = 0; ell < p.N; ++ell) {
-        const uint k_base = ell * p.b;
-
-        uint product = 0;
-        for (uint k = 0; k < p.b; ++k) {
-            const uint a = a_prime[row * p.n + (k_base + k)];
-            const uint b = b_prime[(k_base + k) * p.n + col];
-            product = dot_step(product, a, b);
-        }
-
-        c_acc = add_mod(c_acc, product);
-        c_prefix[ell * nn + gid] = c_acc;
-    }
-}
-
-kernel void fused_final_compress(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* a_prime [[buffer(1)]],
-    device const uint* b_prime [[buffer(2)]],
-    device const uint* compress_vec [[buffer(3)]],
-    device uint* compressed [[buffer(4)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint simd_size [[threads_per_simdgroup]],
-    uint2 tgid [[threadgroup_position_in_grid]])
-{
-    const uint block_elements = p.b * p.b;
-    if (block_elements == 0 || block_elements > MAX_BLOCK_ELEMENTS || tid >= block_elements) {
-        return;
-    }
-
-    const uint tile_i = tgid.y;
-    const uint tile_j = tgid.x;
-    if (tile_i >= p.N || tile_j >= p.N) {
-        return;
-    }
-
-    const uint br = tid / p.b;
-    const uint bc = tid - br * p.b;
-    const uint row = tile_i * p.b + br;
-    const uint col = tile_j * p.b + bc;
-
-    threadgroup uint weighted_terms[MAX_BLOCK_ELEMENTS];
-    const uint weight = compress_vec[tid];
-    uint c_acc = 0;
-    for (uint ell = 0; ell < p.N; ++ell) {
-        const uint k_base = ell * p.b;
-
-        uint product = 0;
-        for (uint k = 0; k < p.b; ++k) {
-            const uint a = a_prime[row * p.n + (k_base + k)];
-            const uint b = b_prime[(k_base + k) * p.n + col];
-            product = dot_step(product, a, b);
-        }
-
-        c_acc = add_mod(c_acc, product);
-    }
-
-    weighted_terms[tid] = mul_mod(c_acc, weight);
-    const uint reduced = reduce_threadgroup_add_mod(weighted_terms, tid, block_elements);
-    if (tid == 0u) {
-        compressed[tile_i * p.N + tile_j] = reduced;
-    }
-}
-
-kernel void compress_prefix(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* c_prefix [[buffer(1)]],
-    device const uint* compress_vec [[buffer(2)]],
-    device uint* compressed [[buffer(3)]],
-    uint gid [[thread_position_in_grid]])
-{
-    const uint n3 = p.N * p.N * p.N;
-    if (gid >= n3) {
-        return;
-    }
-
-    const uint i = gid / (p.N * p.N);
-    const uint rem = gid - i * (p.N * p.N);
-    const uint j = rem / p.N;
-    const uint ell = rem - j * p.N;
-
-    const uint row_base = i * p.b;
-    const uint col_base = j * p.b;
-    const uint nn = p.n * p.n;
-
-    uint acc = 0;
-    uint v_idx = 0;
-    for (uint br = 0; br < p.b; ++br) {
-        const uint row = row_base + br;
-        for (uint bc = 0; bc < p.b; ++bc) {
-            const uint col = col_base + bc;
-            const uint value = c_prefix[ell * nn + row * p.n + col];
-            const uint weight = compress_vec[v_idx++];
-            acc = dot_step(acc, value, weight);
-        }
-    }
-
-    compressed[gid] = acc;
 }
 
 kernel void build_perturbed_specialized(
@@ -646,284 +431,33 @@ kernel void build_perturbed_specialized(
     b_prime[gid] = add_mod(matrix_b[gid], f_acc);
 }
 
-kernel void build_prefix_specialized(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* a_prime [[buffer(1)]],
-    device const uint* b_prime [[buffer(2)]],
-    device uint* c_prefix [[buffer(3)]],
-    uint gid [[thread_position_in_grid]])
+// ---------------------------------------------------------------------------
+// Product C' = A' * B' (full matrix, row-major). The result is exact modulo
+// 2^31-1 whatever the accumulation order, so every kernel below is consensus
+// equivalent to matmul::Matrix::operator*.
+//
+// Four 62-bit products plus a reduced carry fit in 64 bits:
+//   2^31 + 4 * (2^31 - 1)^2 < 2^64
+// ---------------------------------------------------------------------------
+
+inline ulong dot4_accumulate(ulong acc, uint a, uint b, thread uint& pending)
 {
-    const uint n = FC_SPEC_N;
-    const uint b = FC_SPEC_B;
-    const uint N = FC_SPEC_NBLOCKS;
-    if (p.n != n || p.b != b || p.N != N) {
-        return;
+    acc += (ulong)a * (ulong)b;
+    if (++pending == 4u) {
+        acc = reduce64(acc);
+        pending = 0u;
     }
-
-    const uint nn = n * n;
-    if (gid >= nn) {
-        return;
-    }
-
-    const uint row = gid / n;
-    const uint col = gid - row * n;
-
-    uint c_acc = 0;
-    for (uint ell = 0; ell < FC_SPEC_NBLOCKS; ++ell) {
-        const uint k_base = ell * b;
-
-        uint product = 0;
-        for (uint k = 0; k < FC_SPEC_B; ++k) {
-            const uint a = a_prime[row * n + (k_base + k)];
-            const uint b_val = b_prime[(k_base + k) * n + col];
-            product = dot_step(product, a, b_val);
-        }
-
-        c_acc = add_mod(c_acc, product);
-        c_prefix[ell * nn + gid] = c_acc;
-    }
+    return acc;
 }
 
-kernel void fused_final_compress_specialized(
+// One threadgroup per b x b output tile, one thread per element. Works for any
+// b with b*b <= MAX_BLOCK_ELEMENTS and any n divisible by b.
+kernel void build_product(
     constant KernelParams& p [[buffer(0)]],
     device const uint* a_prime [[buffer(1)]],
     device const uint* b_prime [[buffer(2)]],
-    device const uint* compress_vec [[buffer(3)]],
-    device uint* compressed [[buffer(4)]],
+    device uint* c_prime [[buffer(3)]],
     uint tid [[thread_index_in_threadgroup]],
-    uint simd_size [[threads_per_simdgroup]],
-    uint2 tgid [[threadgroup_position_in_grid]])
-{
-    const uint n = FC_SPEC_N;
-    const uint b = FC_SPEC_B;
-    const uint N = FC_SPEC_NBLOCKS;
-    if (p.n != n || p.b != b || p.N != N) {
-        return;
-    }
-
-    const uint block_elements = FC_SPEC_B * FC_SPEC_B;
-    if (block_elements == 0 || block_elements > MAX_BLOCK_ELEMENTS || tid >= block_elements) {
-        return;
-    }
-
-    const uint tile_i = tgid.y;
-    const uint tile_j = tgid.x;
-    if (tile_i >= N || tile_j >= N) {
-        return;
-    }
-
-    const uint br = tid / b;
-    const uint bc = tid - br * b;
-    const uint row = tile_i * b + br;
-    const uint col = tile_j * b + bc;
-
-    threadgroup uint weighted_terms[MAX_BLOCK_ELEMENTS];
-    const uint weight = compress_vec[tid];
-    uint c_acc = 0;
-    for (uint ell = 0; ell < FC_SPEC_NBLOCKS; ++ell) {
-        const uint k_base = ell * b;
-
-        uint product = 0;
-        for (uint k = 0; k < FC_SPEC_B; ++k) {
-            const uint a = a_prime[row * n + (k_base + k)];
-            const uint b_val = b_prime[(k_base + k) * n + col];
-            product = dot_step(product, a, b_val);
-        }
-
-        c_acc = add_mod(c_acc, product);
-    }
-
-    weighted_terms[tid] = mul_mod(c_acc, weight);
-    const uint reduced = reduce_threadgroup_add_mod(weighted_terms, tid, block_elements);
-    if (tid == 0u) {
-        compressed[tile_i * N + tile_j] = reduced;
-    }
-}
-
-kernel void compress_prefix_specialized(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* c_prefix [[buffer(1)]],
-    device const uint* compress_vec [[buffer(2)]],
-    device uint* compressed [[buffer(3)]],
-    uint gid [[thread_position_in_grid]])
-{
-    const uint n = FC_SPEC_N;
-    const uint b = FC_SPEC_B;
-    const uint N = FC_SPEC_NBLOCKS;
-    if (p.n != n || p.b != b || p.N != N) {
-        return;
-    }
-
-    const uint n3 = N * N * N;
-    if (gid >= n3) {
-        return;
-    }
-
-    const uint i = gid / (N * N);
-    const uint rem = gid - i * (N * N);
-    const uint j = rem / N;
-    const uint ell = rem - j * N;
-
-    const uint row_base = i * b;
-    const uint col_base = j * b;
-    const uint nn = n * n;
-
-    uint acc = 0;
-    uint v_idx = 0;
-    for (uint br = 0; br < FC_SPEC_B; ++br) {
-        const uint row = row_base + br;
-        for (uint bc = 0; bc < FC_SPEC_B; ++bc) {
-            const uint col = col_base + bc;
-            const uint value = c_prefix[ell * nn + row * n + col];
-            const uint weight = compress_vec[v_idx++];
-            acc = dot_step(acc, value, weight);
-        }
-    }
-
-    compressed[gid] = acc;
-}
-
-kernel void fused_prefix_compress_specialized(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* a_prime [[buffer(1)]],
-    device const uint* b_prime [[buffer(2)]],
-    device const uint* compress_vec [[buffer(3)]],
-    device uint* compressed [[buffer(4)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint simd_size [[threads_per_simdgroup]],
-    uint2 tgid [[threadgroup_position_in_grid]])
-{
-    const uint n = FC_SPEC_N;
-    const uint b = FC_SPEC_B;
-    const uint N = FC_SPEC_NBLOCKS;
-    if (p.n != n || p.b != b || p.N != N) {
-        return;
-    }
-
-    const uint block_elements = FC_SPEC_B * FC_SPEC_B;
-    if (block_elements == 0 || block_elements > MAX_BLOCK_ELEMENTS || tid >= block_elements) {
-        return;
-    }
-
-    const uint tile_i = tgid.y;
-    const uint tile_j = tgid.x;
-    if (tile_i >= N || tile_j >= N) {
-        return;
-    }
-
-    const uint br = tid / b;
-    const uint bc = tid - br * b;
-    const uint row = tile_i * b + br;
-    const uint col = tile_j * b + bc;
-
-    threadgroup uint weighted_terms[MAX_BLOCK_ELEMENTS];
-    const uint weight = compress_vec[tid];
-    uint c_acc = 0;
-
-    for (uint ell = 0; ell < FC_SPEC_NBLOCKS; ++ell) {
-        const uint k_base = ell * b;
-
-        uint product = 0;
-        for (uint k = 0; k < FC_SPEC_B; ++k) {
-            const uint a = a_prime[row * n + (k_base + k)];
-            const uint b_val = b_prime[(k_base + k) * n + col];
-            product = dot_step(product, a, b_val);
-        }
-
-        c_acc = add_mod(c_acc, product);
-        weighted_terms[tid] = mul_mod(c_acc, weight);
-        const uint reduced = reduce_threadgroup_add_mod(weighted_terms, tid, block_elements);
-        if (tid == 0u) {
-            compressed[(tile_i * N + tile_j) * N + ell] = reduced;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
-
-inline uint block_dot_product_manual(constant KernelParams& p,
-                                     device const uint* a_prime,
-                                     device const uint* b_prime,
-                                     threadgroup uint tile_a[16][16],
-                                     threadgroup uint tile_b[16][16],
-                                     uint row,
-                                     uint col,
-                                     uint ell,
-                                     uint2 tid)
-{
-    const uint k_base = ell * p.b;
-
-    uint a_value = 0;
-    uint b_value = 0;
-    if (tid.x < p.b && tid.y < p.b) {
-        a_value = a_prime[row * p.n + (k_base + tid.x)];
-        b_value = b_prime[(k_base + tid.y) * p.n + col];
-    }
-    tile_a[tid.y][tid.x] = a_value;
-    tile_b[tid.y][tid.x] = b_value;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint product = 0;
-    for (uint k = 0; k < p.b; ++k) {
-        const uint a = tile_a[tid.y][k];
-        const uint b = tile_b[k][tid.x];
-        product = dot_step(product, a, b);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return product;
-}
-
-inline uint block_dot_product_prepared(constant KernelParams& p,
-                                       device const uint* a_prime,
-                                       device const uint* b_prime,
-                                       threadgroup uint tile_a[16][16],
-                                       threadgroup uint tile_b[16][16],
-                                       uint row,
-                                       uint col,
-                                       uint ell,
-                                       uint2 tid)
-{
-#if defined(__METAL_VERSION__) && (__METAL_VERSION__ >= 400) && defined(QTC_ENABLE_COOPERATIVE_TENSOR_INT_EXPERIMENT)
-    // Cooperative integer tensors are not yet enabled for this path.
-    return block_dot_product_manual(p, a_prime, b_prime, tile_a, tile_b, row, col, ell, tid);
-#else
-    return block_dot_product_manual(p, a_prime, b_prime, tile_a, tile_b, row, col, ell, tid);
-#endif
-}
-
-kernel void build_prefix_tiled(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* a_prime [[buffer(1)]],
-    device const uint* b_prime [[buffer(2)]],
-    device uint* c_prefix [[buffer(3)]],
-    uint2 gid [[thread_position_in_grid]],
-    uint2 tid [[thread_position_in_threadgroup]])
-{
-    const uint row = gid.y;
-    const uint col = gid.x;
-    if (row >= p.n || col >= p.n) {
-        return;
-    }
-
-    threadgroup uint tile_a[16][16];
-    threadgroup uint tile_b[16][16];
-
-    uint c_acc = 0;
-    for (uint ell = 0; ell < p.N; ++ell) {
-        const uint product = block_dot_product_prepared(p, a_prime, b_prime, tile_a, tile_b, row, col, ell, tid);
-
-        c_acc = add_mod(c_acc, product);
-        c_prefix[ell * (p.n * p.n) + row * p.n + col] = c_acc;
-    }
-}
-
-kernel void fused_prefix_compress(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* a_prime [[buffer(1)]],
-    device const uint* b_prime [[buffer(2)]],
-    device const uint* compress_vec [[buffer(3)]],
-    device uint* compressed [[buffer(4)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint simd_size [[threads_per_simdgroup]],
     uint2 tgid [[threadgroup_position_in_grid]])
 {
     const uint block_elements = p.b * p.b;
@@ -942,81 +476,159 @@ kernel void fused_prefix_compress(
     const uint row = tile_i * p.b + br;
     const uint col = tile_j * p.b + bc;
 
-    threadgroup uint weighted_terms[MAX_BLOCK_ELEMENTS];
-    const uint weight = compress_vec[tid];
-    uint c_acc = 0;
+    ulong acc = 0;
+    uint pending = 0;
+    for (uint k = 0; k < p.n; ++k) {
+        acc = dot4_accumulate(acc, a_prime[row * p.n + k], b_prime[k * p.n + col], pending);
+    }
+    c_prime[row * p.n + col] = reduce64(acc);
+}
 
-    for (uint ell = 0; ell < p.N; ++ell) {
-        const uint k_base = ell * p.b;
+kernel void build_product_specialized(
+    constant KernelParams& p [[buffer(0)]],
+    device const uint* a_prime [[buffer(1)]],
+    device const uint* b_prime [[buffer(2)]],
+    device uint* c_prime [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]])
+{
+    const uint n = FC_SPEC_N;
+    const uint b = FC_SPEC_B;
+    const uint N = FC_SPEC_NBLOCKS;
+    if (p.n != n || p.b != b || p.N != N) {
+        return;
+    }
 
-        uint product = 0;
-        for (uint k = 0; k < p.b; ++k) {
-            const uint a = a_prime[row * p.n + (k_base + k)];
-            const uint b = b_prime[(k_base + k) * p.n + col];
-            product = dot_step(product, a, b);
+    const uint block_elements = FC_SPEC_B * FC_SPEC_B;
+    if (block_elements == 0 || block_elements > MAX_BLOCK_ELEMENTS || tid >= block_elements) {
+        return;
+    }
+
+    const uint tile_i = tgid.y;
+    const uint tile_j = tgid.x;
+    if (tile_i >= N || tile_j >= N) {
+        return;
+    }
+
+    const uint br = tid / b;
+    const uint bc = tid - br * b;
+    const uint row = tile_i * b + br;
+    const uint col = tile_j * b + bc;
+
+    ulong acc = 0;
+    uint pending = 0;
+    for (uint ell = 0; ell < FC_SPEC_NBLOCKS; ++ell) {
+        const uint k_base = ell * b;
+        for (uint k = 0; k < FC_SPEC_B; ++k) {
+            acc = dot4_accumulate(acc, a_prime[row * n + (k_base + k)], b_prime[(k_base + k) * n + col], pending);
         }
+    }
+    c_prime[row * n + col] = reduce64(acc);
+}
 
-        c_acc = add_mod(c_acc, product);
-        weighted_terms[tid] = mul_mod(c_acc, weight);
-        const uint reduced = reduce_threadgroup_add_mod(weighted_terms, tid, block_elements);
-        if (tid == 0u) {
-            compressed[(tile_i * p.N + tile_j) * p.N + ell] = reduced;
+// 16x16 threadgroup-memory tiled variant: requires n % 16 == 0 (independent of
+// the transcript block size b). Grid = (n/16, n/16) threadgroups of 16x16.
+kernel void build_product_tiled(
+    constant KernelParams& p [[buffer(0)]],
+    device const uint* a_prime [[buffer(1)]],
+    device const uint* b_prime [[buffer(2)]],
+    device uint* c_prime [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]])
+{
+    const uint n = p.n;
+    if ((n % PRODUCT_TILE_DIM) != 0u) {
+        return;
+    }
+    const uint row = gid.y;
+    const uint col = gid.x;
+    if (row >= n || col >= n) {
+        return;
+    }
+
+    threadgroup uint tile_a[PRODUCT_TILE_DIM][PRODUCT_TILE_DIM];
+    threadgroup uint tile_b[PRODUCT_TILE_DIM][PRODUCT_TILE_DIM];
+
+    ulong acc = 0;
+    uint pending = 0;
+    const uint k_tiles = n / PRODUCT_TILE_DIM;
+    for (uint kt = 0; kt < k_tiles; ++kt) {
+        const uint k_base = kt * PRODUCT_TILE_DIM;
+        tile_a[tid.y][tid.x] = a_prime[row * n + (k_base + tid.x)];
+        tile_b[tid.y][tid.x] = b_prime[(k_base + tid.y) * n + col];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < PRODUCT_TILE_DIM; ++k) {
+            acc = dot4_accumulate(acc, tile_a[tid.y][k], tile_b[k][tid.x], pending);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    c_prime[row * n + col] = reduce64(acc);
 }
 
-kernel void transcript_sha256(
-    device const uint* compressed [[buffer(0)]],
-    constant HashParams& hp [[buffer(1)]],
-    device uchar* hash_output [[buffer(2)]],
+// ---------------------------------------------------------------------------
+// Product digest v4 tile hashes: one thread per b x b tile of C'. The message
+// is the tile's elements row-major as LE32 (4*b*b bytes); output is the raw
+// 32-byte SHA-256 digest at tile_hashes[32 * (tile_i * N + tile_j)].
+// (matmul::transcript::HashProductTile)
+// ---------------------------------------------------------------------------
+
+kernel void hash_product_tiles(
+    constant KernelParams& p [[buffer(0)]],
+    device const uint* c_prime [[buffer(1)]],
+    device uchar* tile_hashes [[buffer(2)]],
     uint gid [[thread_position_in_grid]])
 {
-    if (gid != 0) {
+    const uint tile_count = p.N * p.N;
+    if (gid >= tile_count) {
         return;
     }
 
-    thread uint first_state[8];
-    sha256_stream_words(compressed, hp.compressed_words, first_state);
+    const uint tile_i = gid / p.N;
+    const uint tile_j = gid - tile_i * p.N;
+    const uint row_base = tile_i * p.b;
+    const uint col_base = tile_j * p.b;
 
-    thread uint final_state[8];
-    sha256_double_digest(first_state, final_state);
+    const uint msg_len_bytes = p.b * p.b * 4u;
+    const uint total_blocks = (msg_len_bytes + 9u + 63u) / 64u;
+    const uint total_bytes = total_blocks * 64u;
+    const ulong bit_len = (ulong)msg_len_bytes * 8u;
 
+    thread uint state[8];
+    sha256_init(state);
+
+    thread uint w[64];
+    for (uint block = 0; block < total_blocks; ++block) {
+        for (uint i = 0; i < 16; ++i) {
+            const uint off = block * 64u + i * 4u;
+            uint word = 0u;
+            if (off < msg_len_bytes) {
+                const uint element = off >> 2u;
+                const uint er = element / p.b;
+                const uint ec = element - er * p.b;
+                // LE32 bytes of the element form a big-endian message word.
+                word = bswap32(c_prime[(row_base + er) * p.n + (col_base + ec)]);
+            } else if (off == msg_len_bytes) {
+                word = 0x80000000u;
+            } else if (off == total_bytes - 8u) {
+                word = (uint)(bit_len >> 32u);
+            } else if (off == total_bytes - 4u) {
+                word = (uint)(bit_len & 0xffffffffu);
+            }
+            w[i] = word;
+        }
+        sha256_compress(state, w);
+    }
+
+    device uchar* out = tile_hashes + gid * 32u;
     for (uint i = 0; i < 8; ++i) {
-        const uint word = final_state[i];
-        hash_output[i * 4 + 0] = (uchar)((word >> 24u) & 0xffu);
-        hash_output[i * 4 + 1] = (uchar)((word >> 16u) & 0xffu);
-        hash_output[i * 4 + 2] = (uchar)((word >> 8u) & 0xffu);
-        hash_output[i * 4 + 3] = (uchar)(word & 0xffu);
+        const uint word = state[i];
+        out[i * 4u + 0u] = (uchar)((word >> 24u) & 0xffu);
+        out[i * 4u + 1u] = (uchar)((word >> 16u) & 0xffu);
+        out[i * 4u + 2u] = (uchar)((word >> 8u) & 0xffu);
+        out[i * 4u + 3u] = (uchar)(word & 0xffu);
     }
 }
-
-kernel void product_compressed_sha256(
-    device const uint* compressed [[buffer(0)]],
-    constant KernelParams& kp [[buffer(1)]],
-    device uchar* hash_output [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid != 0) {
-        return;
-    }
-
-    const uint final_words = kp.N * kp.N;
-    thread uint first_state[8];
-    sha256_stream_final_ell_words(compressed, kp.N, final_words, first_state);
-
-    thread uint final_state[8];
-    sha256_double_digest(first_state, final_state);
-
-    for (uint i = 0; i < 8; ++i) {
-        const uint word = final_state[i];
-        hash_output[i * 4 + 0] = (uchar)((word >> 24u) & 0xffu);
-        hash_output[i * 4 + 1] = (uchar)((word >> 16u) & 0xffu);
-        hash_output[i * 4 + 2] = (uchar)((word >> 8u) & 0xffu);
-        hash_output[i * 4 + 3] = (uchar)(word & 0xffu);
-    }
-}
-
 )METAL";
 
 void AppendUniquePath(std::vector<std::string>& paths, const char* path)
@@ -1069,6 +681,10 @@ constexpr uint32_t FC_INDEX_B = 1;
 constexpr uint32_t FC_INDEX_R = 2;
 constexpr uint32_t FC_INDEX_NBLOCKS = 3;
 
+constexpr uint32_t MAX_BLOCK_ELEMENTS = 256;
+constexpr uint32_t PRODUCT_TILE_DIM = 16;
+constexpr size_t TILE_HASH_BYTES = 32;
+
 struct SpecializedKernelShape {
     uint32_t n;
     uint32_t b;
@@ -1080,7 +696,7 @@ struct SpecializedKernelShape {
 constexpr std::array<SpecializedKernelShape, 3> SPECIALIZED_KERNEL_SHAPES{{
     {512, 16, 8, 32, "mainnet_512_16_8"},
     {256, 8, 4, 32, "testnet_256_8_4"},
-    {64, 4, 2, 16, "regtest_64_4_2"},
+    {64, 8, 4, 8, "regtest_64_8_4"},
 }};
 
 // Keep the default auto pool conservative enough for Apple Silicon mining while
@@ -1092,10 +708,7 @@ constexpr uint32_t MAX_METAL_POOL_SLOT_COUNT{8};
 struct SpecializedKernelPipelines {
     SpecializedKernelShape shape{};
     id<MTLComputePipelineState> build_perturbed_pipeline{nil};
-    id<MTLComputePipelineState> build_prefix_pipeline{nil};
-    id<MTLComputePipelineState> fused_final_compress_pipeline{nil};
-    id<MTLComputePipelineState> compress_prefix_pipeline{nil};
-    id<MTLComputePipelineState> fused_prefix_compress_pipeline{nil};
+    id<MTLComputePipelineState> build_product_pipeline{nil};
     bool available{false};
 };
 
@@ -1313,31 +926,38 @@ bool ShouldPrewarmMetalPoolSlots()
     return ParseTruthyEnv("QTC_MATMUL_METAL_POOL_PREWARM", true);
 }
 
+// Buffer footprint of one pool slot for a given (n, b, r) shape. Batch
+// submissions request batch_size multiples of the per-attempt sizes.
+struct PoolRequirements {
+    uint32_t n{0};
+    uint32_t b{0};
+    uint32_t r{0};
+    size_t matrix_bytes{0};
+    size_t noise_bytes{0};
+    size_t c_prime_bytes{0};
+    size_t tile_hash_bytes{0};
+};
+
 struct MetalPoolSlot {
     id<MTLCommandQueue> queue{nil};
     id<MTLBuffer> params_buffer{nil};
-    id<MTLBuffer> hash_params_buffer{nil};
     id<MTLBuffer> matrix_a_stage_buffer{nil};
     id<MTLBuffer> matrix_b_stage_buffer{nil};
     id<MTLBuffer> e_l_buffer{nil};
     id<MTLBuffer> e_r_buffer{nil};
     id<MTLBuffer> f_l_buffer{nil};
     id<MTLBuffer> f_r_buffer{nil};
-    id<MTLBuffer> compress_buffer{nil};
     id<MTLBuffer> a_prime_buffer{nil};
     id<MTLBuffer> b_prime_buffer{nil};
-    id<MTLBuffer> prefix_buffer{nil};
-    id<MTLBuffer> compressed_buffer{nil};
-    id<MTLBuffer> transcript_hash_buffer{nil};
+    id<MTLBuffer> c_prime_buffer{nil};
+    id<MTLBuffer> tile_hash_buffer{nil};
     uint32_t n{0};
     uint32_t b{0};
     uint32_t r{0};
     size_t matrix_bytes{0};
     size_t noise_bytes{0};
-    size_t compress_bytes{0};
-    size_t prefix_bytes{0};
-    size_t compressed_bytes{0};
-    size_t hash_bytes{0};
+    size_t c_prime_bytes{0};
+    size_t tile_hash_bytes{0};
     bool in_use{false};
 };
 
@@ -1347,13 +967,9 @@ struct MetalContext {
     id<MTLDevice> device{nil};
     id<MTLComputePipelineState> generate_base_matrix_pipeline{nil};
     id<MTLComputePipelineState> build_perturbed_pipeline{nil};
-    id<MTLComputePipelineState> build_prefix_pipeline{nil};
-    id<MTLComputePipelineState> fused_final_compress_pipeline{nil};
-    id<MTLComputePipelineState> compress_prefix_pipeline{nil};
-    id<MTLComputePipelineState> build_prefix_tiled_pipeline{nil};
-    id<MTLComputePipelineState> fused_prefix_compress_pipeline{nil};
-    id<MTLComputePipelineState> transcript_sha256_pipeline{nil};
-    id<MTLComputePipelineState> product_compressed_sha256_pipeline{nil};
+    id<MTLComputePipelineState> build_product_pipeline{nil};
+    id<MTLComputePipelineState> build_product_tiled_pipeline{nil};
+    id<MTLComputePipelineState> hash_product_tiles_pipeline{nil};
     std::array<SpecializedKernelPipelines, SPECIALIZED_KERNEL_SHAPES.size()> specialized_pipelines{};
     uint32_t specialized_pipeline_count{0};
     std::string specialized_pipeline_reason;
@@ -1432,134 +1048,36 @@ struct MetalContext {
                 return;
             }
 
-            id<MTLFunction> generate_base_matrix_function = [library newFunctionWithName:@"generate_base_matrix_from_seed"];
-            if (generate_base_matrix_function == nil) {
-                error = "Failed to load Metal kernel function: generate_base_matrix_from_seed";
-                return;
-            }
+            auto make_pipeline = [&](NSString* function_name) -> id<MTLComputePipelineState> {
+                id<MTLFunction> function = [library newFunctionWithName:function_name];
+                if (function == nil) {
+                    error = std::string("Failed to load Metal kernel function: ") + [function_name UTF8String];
+                    return nil;
+                }
+                NSError* pipeline_error = nil;
+                id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&pipeline_error];
+                if (pipeline == nil) {
+                    error = pipeline_error != nil
+                        ? [[pipeline_error localizedDescription] UTF8String]
+                        : std::string("Failed to create Metal pipeline: ") + [function_name UTF8String];
+                }
+                return pipeline;
+            };
 
-            NSError* pipeline_error = nil;
-            generate_base_matrix_pipeline = [device newComputePipelineStateWithFunction:generate_base_matrix_function error:&pipeline_error];
-            if (generate_base_matrix_pipeline == nil) {
-                error = pipeline_error != nil ? [[pipeline_error localizedDescription] UTF8String]
-                                              : "Failed to create generate_base_matrix_from_seed pipeline";
-                return;
-            }
+            generate_base_matrix_pipeline = make_pipeline(@"generate_base_matrix_from_seed");
+            if (generate_base_matrix_pipeline == nil) return;
+            build_perturbed_pipeline = make_pipeline(@"build_perturbed");
+            if (build_perturbed_pipeline == nil) return;
+            build_product_pipeline = make_pipeline(@"build_product");
+            if (build_product_pipeline == nil) return;
+            build_product_tiled_pipeline = make_pipeline(@"build_product_tiled");
+            if (build_product_tiled_pipeline == nil) return;
+            hash_product_tiles_pipeline = make_pipeline(@"hash_product_tiles");
+            if (hash_product_tiles_pipeline == nil) return;
 
-            id<MTLFunction> build_perturbed_function = [library newFunctionWithName:@"build_perturbed"];
-            if (build_perturbed_function == nil) {
-                error = "Failed to load Metal kernel function: build_perturbed";
-                return;
-            }
-
-            build_perturbed_pipeline = [device newComputePipelineStateWithFunction:build_perturbed_function error:&pipeline_error];
-            if (build_perturbed_pipeline == nil) {
-                error = pipeline_error != nil ? [[pipeline_error localizedDescription] UTF8String]
-                                              : "Failed to create build_perturbed pipeline";
-                return;
-            }
-
-            id<MTLFunction> build_prefix_function = [library newFunctionWithName:@"build_prefix"];
-            if (build_prefix_function == nil) {
-                error = "Failed to load Metal kernel function: build_prefix";
-                return;
-            }
-
-            pipeline_error = nil;
-            build_prefix_pipeline = [device newComputePipelineStateWithFunction:build_prefix_function error:&pipeline_error];
-            if (build_prefix_pipeline == nil) {
-                error = pipeline_error != nil ? [[pipeline_error localizedDescription] UTF8String]
-                                              : "Failed to create build_prefix pipeline";
-                return;
-            }
-
-            id<MTLFunction> fused_final_compress_function = [library newFunctionWithName:@"fused_final_compress"];
-            if (fused_final_compress_function == nil) {
-                error = "Failed to load Metal kernel function: fused_final_compress";
-                return;
-            }
-
-            pipeline_error = nil;
-            fused_final_compress_pipeline = [device newComputePipelineStateWithFunction:fused_final_compress_function error:&pipeline_error];
-            if (fused_final_compress_pipeline == nil) {
-                error = pipeline_error != nil ? [[pipeline_error localizedDescription] UTF8String]
-                                              : "Failed to create fused_final_compress pipeline";
-                return;
-            }
-
-            id<MTLFunction> compress_prefix_function = [library newFunctionWithName:@"compress_prefix"];
-            if (compress_prefix_function == nil) {
-                error = "Failed to load Metal kernel function: compress_prefix";
-                return;
-            }
-
-            pipeline_error = nil;
-            compress_prefix_pipeline = [device newComputePipelineStateWithFunction:compress_prefix_function error:&pipeline_error];
-            if (compress_prefix_pipeline == nil) {
-                error = pipeline_error != nil ? [[pipeline_error localizedDescription] UTF8String]
-                                              : "Failed to create compress_prefix pipeline";
-                return;
-            }
-
-            id<MTLFunction> build_prefix_tiled_function = [library newFunctionWithName:@"build_prefix_tiled"];
-            if (build_prefix_tiled_function == nil) {
-                error = "Failed to load Metal kernel function: build_prefix_tiled";
-                return;
-            }
-
-            pipeline_error = nil;
-            build_prefix_tiled_pipeline = [device newComputePipelineStateWithFunction:build_prefix_tiled_function error:&pipeline_error];
-            if (build_prefix_tiled_pipeline == nil) {
-                error = pipeline_error != nil ? [[pipeline_error localizedDescription] UTF8String]
-                                              : "Failed to create build_prefix_tiled pipeline";
-                return;
-            }
-
-            id<MTLFunction> fused_prefix_compress_function = [library newFunctionWithName:@"fused_prefix_compress"];
-            if (fused_prefix_compress_function == nil) {
-                error = "Failed to load Metal kernel function: fused_prefix_compress";
-                return;
-            }
-
-            pipeline_error = nil;
-            fused_prefix_compress_pipeline = [device newComputePipelineStateWithFunction:fused_prefix_compress_function error:&pipeline_error];
-            if (fused_prefix_compress_pipeline == nil) {
-                error = pipeline_error != nil ? [[pipeline_error localizedDescription] UTF8String]
-                                              : "Failed to create fused_prefix_compress pipeline";
-                return;
-            }
-
-            id<MTLFunction> transcript_sha256_function = [library newFunctionWithName:@"transcript_sha256"];
-            if (transcript_sha256_function == nil) {
-                error = "Failed to load Metal kernel function: transcript_sha256";
-                return;
-            }
-
-            pipeline_error = nil;
-            transcript_sha256_pipeline = [device newComputePipelineStateWithFunction:transcript_sha256_function error:&pipeline_error];
-            if (transcript_sha256_pipeline == nil) {
-                error = pipeline_error != nil ? [[pipeline_error localizedDescription] UTF8String]
-                                              : "Failed to create transcript_sha256 pipeline";
-                return;
-            }
-
-            id<MTLFunction> product_compressed_sha256_function = [library newFunctionWithName:@"product_compressed_sha256"];
-            if (product_compressed_sha256_function == nil) {
-                error = "Failed to load Metal kernel function: product_compressed_sha256";
-                return;
-            }
-
-            pipeline_error = nil;
-            product_compressed_sha256_pipeline = [device newComputePipelineStateWithFunction:product_compressed_sha256_function error:&pipeline_error];
-            if (product_compressed_sha256_pipeline == nil) {
-                error = pipeline_error != nil ? [[pipeline_error localizedDescription] UTF8String]
-                                              : "Failed to create product_compressed_sha256 pipeline";
-                return;
-            }
-
-            auto make_specialized_function = [&](NSString* function_name,
+            auto make_specialized_pipeline = [&](NSString* function_name,
                                                  const SpecializedKernelShape& shape,
-                                                 std::string& out_error) -> id<MTLFunction> {
+                                                 std::string& out_error) -> id<MTLComputePipelineState> {
                 MTLFunctionConstantValues* values = [[MTLFunctionConstantValues alloc] init];
                 const uint32_t n = shape.n;
                 const uint32_t b = shape.b;
@@ -1575,15 +1093,6 @@ struct MetalContext {
                 if (function == nil) {
                     out_error = fn_error != nil ? [[fn_error localizedDescription] UTF8String]
                                                 : "Failed to create specialized Metal function";
-                }
-                return function;
-            };
-
-            auto make_specialized_pipeline = [&](NSString* function_name,
-                                                 const SpecializedKernelShape& shape,
-                                                 std::string& out_error) -> id<MTLComputePipelineState> {
-                id<MTLFunction> function = make_specialized_function(function_name, shape, out_error);
-                if (function == nil) {
                     return nil;
                 }
 
@@ -1610,27 +1119,9 @@ struct MetalContext {
                     continue;
                 }
 
-                entry.build_prefix_pipeline = make_specialized_pipeline(@"build_prefix_specialized", entry.shape, local_error);
-                if (entry.build_prefix_pipeline == nil) {
-                    specialized_pipeline_reason = local_error.empty() ? "build_prefix_specialized_unavailable" : local_error;
-                    continue;
-                }
-
-                entry.fused_final_compress_pipeline = make_specialized_pipeline(@"fused_final_compress_specialized", entry.shape, local_error);
-                if (entry.fused_final_compress_pipeline == nil) {
-                    specialized_pipeline_reason = local_error.empty() ? "fused_final_compress_specialized_unavailable" : local_error;
-                    continue;
-                }
-
-                entry.compress_prefix_pipeline = make_specialized_pipeline(@"compress_prefix_specialized", entry.shape, local_error);
-                if (entry.compress_prefix_pipeline == nil) {
-                    specialized_pipeline_reason = local_error.empty() ? "compress_prefix_specialized_unavailable" : local_error;
-                    continue;
-                }
-
-                entry.fused_prefix_compress_pipeline = make_specialized_pipeline(@"fused_prefix_compress_specialized", entry.shape, local_error);
-                if (entry.fused_prefix_compress_pipeline == nil) {
-                    specialized_pipeline_reason = local_error.empty() ? "fused_prefix_compress_specialized_unavailable" : local_error;
+                entry.build_product_pipeline = make_specialized_pipeline(@"build_product_specialized", entry.shape, local_error);
+                if (entry.build_product_pipeline == nil) {
+                    specialized_pipeline_reason = local_error.empty() ? "build_product_specialized_unavailable" : local_error;
                     continue;
                 }
 
@@ -1669,167 +1160,104 @@ const SpecializedKernelPipelines* FindSpecializedPipelines(const MetalContext& c
     return nullptr;
 }
 
-bool IsPoolSlotInitialized(const MetalPoolSlot& slot, bool require_prefix_buffer)
+bool IsPoolSlotInitialized(const MetalPoolSlot& slot)
 {
     return slot.params_buffer != nil &&
-        slot.hash_params_buffer != nil &&
         slot.matrix_a_stage_buffer != nil &&
         slot.matrix_b_stage_buffer != nil &&
         slot.e_l_buffer != nil &&
         slot.e_r_buffer != nil &&
         slot.f_l_buffer != nil &&
         slot.f_r_buffer != nil &&
-        slot.compress_buffer != nil &&
         slot.a_prime_buffer != nil &&
         slot.b_prime_buffer != nil &&
-        (!require_prefix_buffer || slot.prefix_buffer != nil) &&
-        slot.compressed_buffer != nil &&
-        slot.transcript_hash_buffer != nil;
+        slot.c_prime_buffer != nil &&
+        slot.tile_hash_buffer != nil;
 }
 
-bool DoesPoolSlotSatisfyRequest(const MetalPoolSlot& slot,
-                                const qtc::metal::MatMulDigestRequest& request,
-                                size_t matrix_bytes,
-                                size_t noise_bytes,
-                                size_t compress_bytes,
-                                size_t prefix_bytes,
-                                size_t compressed_bytes,
-                                size_t hash_bytes,
-                                bool require_prefix_buffer)
+bool DoesPoolSlotSatisfyRequest(const MetalPoolSlot& slot, const PoolRequirements& req)
 {
-    return IsPoolSlotInitialized(slot, require_prefix_buffer) &&
-        slot.n == request.n &&
-        slot.b == request.b &&
-        slot.r == request.r &&
-        slot.matrix_bytes >= matrix_bytes &&
-        slot.noise_bytes >= noise_bytes &&
-        slot.compress_bytes >= compress_bytes &&
-        (!require_prefix_buffer || slot.prefix_bytes >= prefix_bytes) &&
-        slot.compressed_bytes >= compressed_bytes &&
-        slot.hash_bytes >= hash_bytes;
+    return IsPoolSlotInitialized(slot) &&
+        slot.n == req.n &&
+        slot.b == req.b &&
+        slot.r == req.r &&
+        slot.matrix_bytes >= req.matrix_bytes &&
+        slot.noise_bytes >= req.noise_bytes &&
+        slot.c_prime_bytes >= req.c_prime_bytes &&
+        slot.tile_hash_bytes >= req.tile_hash_bytes;
 }
 
 bool AllocateBufferPoolSlot(MetalContext& context,
                             MetalPoolSlot& slot,
-                            size_t matrix_bytes,
-                            size_t noise_bytes,
-                            size_t compress_bytes,
-                            size_t prefix_bytes,
-                            size_t compressed_bytes,
-                            size_t hash_bytes,
-                            bool require_prefix_buffer,
+                            const PoolRequirements& req,
                             std::string& error)
 {
     id<MTLBuffer> params_buffer = [context.device newBufferWithLength:sizeof(uint32_t) * 4
                                                                options:MTLResourceStorageModeShared];
-    id<MTLBuffer> hash_params_buffer = [context.device newBufferWithLength:sizeof(uint32_t)
-                                                                    options:MTLResourceStorageModeShared];
-    id<MTLBuffer> matrix_a_stage_buffer = [context.device newBufferWithLength:matrix_bytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> matrix_b_stage_buffer = [context.device newBufferWithLength:matrix_bytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> e_l_buffer = [context.device newBufferWithLength:noise_bytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> e_r_buffer = [context.device newBufferWithLength:noise_bytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> f_l_buffer = [context.device newBufferWithLength:noise_bytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> f_r_buffer = [context.device newBufferWithLength:noise_bytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> compress_buffer = [context.device newBufferWithLength:compress_bytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> a_prime_buffer = [context.device newBufferWithLength:matrix_bytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b_prime_buffer = [context.device newBufferWithLength:matrix_bytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> prefix_buffer = require_prefix_buffer
-        ? [context.device newBufferWithLength:prefix_bytes options:MTLResourceStorageModeShared]
-        : slot.prefix_buffer;
-    id<MTLBuffer> compressed_buffer = [context.device newBufferWithLength:compressed_bytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> transcript_hash_buffer = [context.device newBufferWithLength:hash_bytes options:MTLResourceStorageModeShared];
-    if (params_buffer == nil || hash_params_buffer == nil || matrix_a_stage_buffer == nil || matrix_b_stage_buffer == nil ||
+    id<MTLBuffer> matrix_a_stage_buffer = [context.device newBufferWithLength:req.matrix_bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> matrix_b_stage_buffer = [context.device newBufferWithLength:req.matrix_bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> e_l_buffer = [context.device newBufferWithLength:req.noise_bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> e_r_buffer = [context.device newBufferWithLength:req.noise_bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> f_l_buffer = [context.device newBufferWithLength:req.noise_bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> f_r_buffer = [context.device newBufferWithLength:req.noise_bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> a_prime_buffer = [context.device newBufferWithLength:req.matrix_bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> b_prime_buffer = [context.device newBufferWithLength:req.matrix_bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> c_prime_buffer = [context.device newBufferWithLength:req.c_prime_bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> tile_hash_buffer = [context.device newBufferWithLength:req.tile_hash_bytes options:MTLResourceStorageModeShared];
+    if (params_buffer == nil || matrix_a_stage_buffer == nil || matrix_b_stage_buffer == nil ||
         e_l_buffer == nil || e_r_buffer == nil || f_l_buffer == nil || f_r_buffer == nil ||
-        compress_buffer == nil || a_prime_buffer == nil || b_prime_buffer == nil ||
-        (require_prefix_buffer && prefix_buffer == nil) ||
-        compressed_buffer == nil || transcript_hash_buffer == nil) {
+        a_prime_buffer == nil || b_prime_buffer == nil || c_prime_buffer == nil || tile_hash_buffer == nil) {
         error = "Failed to allocate Metal buffer pool slot for MatMul digest";
         return false;
     }
 
     slot.params_buffer = params_buffer;
-    slot.hash_params_buffer = hash_params_buffer;
     slot.matrix_a_stage_buffer = matrix_a_stage_buffer;
     slot.matrix_b_stage_buffer = matrix_b_stage_buffer;
     slot.e_l_buffer = e_l_buffer;
     slot.e_r_buffer = e_r_buffer;
     slot.f_l_buffer = f_l_buffer;
     slot.f_r_buffer = f_r_buffer;
-    slot.compress_buffer = compress_buffer;
     slot.a_prime_buffer = a_prime_buffer;
     slot.b_prime_buffer = b_prime_buffer;
-    slot.prefix_buffer = prefix_buffer;
-    slot.compressed_buffer = compressed_buffer;
-    slot.transcript_hash_buffer = transcript_hash_buffer;
-    slot.matrix_bytes = matrix_bytes;
-    slot.noise_bytes = noise_bytes;
-    slot.compress_bytes = compress_bytes;
-    slot.prefix_bytes = require_prefix_buffer ? prefix_bytes : slot.prefix_bytes;
-    slot.compressed_bytes = compressed_bytes;
-    slot.hash_bytes = hash_bytes;
+    slot.c_prime_buffer = c_prime_buffer;
+    slot.tile_hash_buffer = tile_hash_buffer;
+    slot.matrix_bytes = req.matrix_bytes;
+    slot.noise_bytes = req.noise_bytes;
+    slot.c_prime_bytes = req.c_prime_bytes;
+    slot.tile_hash_bytes = req.tile_hash_bytes;
     return true;
 }
 
 bool EnsureBufferPoolSlot(MetalContext& context,
                           MetalPoolSlot& slot,
-                          const qtc::metal::MatMulDigestRequest& request,
-                          size_t matrix_bytes,
-                          size_t noise_bytes,
-                          size_t compress_bytes,
-                          size_t prefix_bytes,
-                          size_t compressed_bytes,
-                          size_t hash_bytes,
-                          bool require_prefix_buffer,
+                          const PoolRequirements& req,
                           std::string& error)
 {
-    if (DoesPoolSlotSatisfyRequest(slot,
-                                   request,
-                                   matrix_bytes,
-                                   noise_bytes,
-                                   compress_bytes,
-                                   prefix_bytes,
-                                   compressed_bytes,
-                                   hash_bytes,
-                                   require_prefix_buffer)) {
+    if (DoesPoolSlotSatisfyRequest(slot, req)) {
         ++context.pool_reuse_events;
-        context.pool_last_n = request.n;
-        context.pool_last_b = request.b;
-        context.pool_last_r = request.r;
+        context.pool_last_n = req.n;
+        context.pool_last_b = req.b;
+        context.pool_last_r = req.r;
         return true;
     }
 
-    if (!AllocateBufferPoolSlot(context,
-                                slot,
-                                matrix_bytes,
-                                noise_bytes,
-                                compress_bytes,
-                                prefix_bytes,
-                                compressed_bytes,
-                                hash_bytes,
-                                require_prefix_buffer,
-                                error)) {
+    if (!AllocateBufferPoolSlot(context, slot, req, error)) {
         return false;
     }
-    slot.n = request.n;
-    slot.b = request.b;
-    slot.r = request.r;
-    context.pool_last_n = request.n;
-    context.pool_last_b = request.b;
-    context.pool_last_r = request.r;
+    slot.n = req.n;
+    slot.b = req.b;
+    slot.r = req.r;
+    context.pool_last_n = req.n;
+    context.pool_last_b = req.b;
+    context.pool_last_r = req.r;
     ++context.pool_allocation_events;
     return true;
 }
 
 void PrewarmAvailableBufferPoolSlots(MetalContext& context,
-                                     const qtc::metal::MatMulDigestRequest& request,
-                                     size_t selected_slot_index,
-                                     size_t matrix_bytes,
-                                     size_t noise_bytes,
-                                     size_t compress_bytes,
-                                     size_t prefix_bytes,
-                                     size_t compressed_bytes,
-                                     size_t hash_bytes,
-                                     bool require_prefix_buffer)
+                                     const PoolRequirements& req,
+                                     size_t selected_slot_index)
 {
     if (!ShouldPrewarmMetalPoolSlots() || context.pool_slots.size() <= 1) {
         return;
@@ -1842,30 +1270,11 @@ void PrewarmAvailableBufferPoolSlots(MetalContext& context,
         }
 
         auto& slot = context.pool_slots[slot_index];
-        if (slot.in_use ||
-            DoesPoolSlotSatisfyRequest(slot,
-                                       request,
-                                       matrix_bytes,
-                                       noise_bytes,
-                                       compress_bytes,
-                                       prefix_bytes,
-                                       compressed_bytes,
-                                       hash_bytes,
-                                       require_prefix_buffer)) {
+        if (slot.in_use || DoesPoolSlotSatisfyRequest(slot, req)) {
             continue;
         }
 
-        if (!EnsureBufferPoolSlot(context,
-                                  slot,
-                                  request,
-                                  matrix_bytes,
-                                  noise_bytes,
-                                  compress_bytes,
-                                  prefix_bytes,
-                                  compressed_bytes,
-                                  hash_bytes,
-                                  require_prefix_buffer,
-                                  ignored_error)) {
+        if (!EnsureBufferPoolSlot(context, slot, req, ignored_error)) {
             return;
         }
     }
@@ -1926,8 +1335,8 @@ struct AsyncDigestSubmissionState {
     std::optional<BufferPoolLease> lease;
     CFMutableArrayRef retained_inputs{nullptr};
     double encode_build_perturbed_us{0.0};
-    double encode_fused_prefix_compress_us{0.0};
-    double encode_transcript_sha256_us{0.0};
+    double encode_product_us{0.0};
+    double encode_tile_hash_us{0.0};
     double submit_wait_us{0.0};
     double gpu_execution_ms{0.0};
     double cpu_finalize_us{0.0};
@@ -1943,30 +1352,21 @@ struct AsyncDigestSubmissionState {
 };
 
 struct AsyncSingleDigestState final : public AsyncDigestSubmissionState<qtc::metal::MatMulDigestResult> {
-    bool use_legacy_pipeline{false};
-    bool use_product_digest{false};
     uint32_t n{0};
     uint32_t b{0};
     uint32_t N{0};
     uint256 sigma;
-    uint64_t compressed_words{0};
-    id<MTLBuffer> a_prime_buffer{nil};
-    id<MTLBuffer> b_prime_buffer{nil};
-    id<MTLBuffer> prefix_buffer{nil};
-    id<MTLBuffer> compressed_buffer{nil};
-    id<MTLBuffer> transcript_hash_buffer{nil};
+    id<MTLBuffer> tile_hash_buffer{nil};
 };
 
 struct AsyncBatchDigestState final : public AsyncDigestSubmissionState<qtc::metal::MatMulDigestBatchResult> {
     uint32_t batch_size{0};
-    bool use_product_digest{false};
     uint32_t n{0};
     uint32_t b{0};
     uint32_t N{0};
-    uint64_t compressed_words{0};
+    size_t tile_hash_bytes_per_item{0};
     std::vector<uint256> sigmas;
-    id<MTLBuffer> compressed_buffer{nil};
-    id<MTLBuffer> transcript_hash_buffer{nil};
+    id<MTLBuffer> tile_hash_buffer{nil};
 };
 
 CFMutableArrayRef CreateRetainedInputArray(CFIndex capacity)
@@ -1982,79 +1382,37 @@ void RetainTemporaryInputBuffer(CFMutableArrayRef array, id<MTLBuffer> buffer)
     CFArrayAppendValue(array, (__bridge const void*)buffer);
 }
 
-id<MTLBuffer> WrapSharedNoCopyBuffer(id<MTLDevice> device, const void* bytes, size_t length);
-
-bool FinalizeProductCommittedDigestFromFinalSliceBuffer(id<MTLBuffer> compressed_buffer,
-                                                        size_t word_offset,
-                                                        uint32_t blocks_per_axis,
-                                                        uint32_t n,
-                                                        uint32_t b,
-                                                        const uint256& sigma,
-                                                        uint256& out_digest,
-                                                        std::string& error)
+// Host side of the v4 digest: root = SHA-256(tile hashes in row-major tile
+// order), digest = SHA256d(tag || sigma || root || LE32(n) || LE32(b)).
+bool FinalizeProductDigestFromTileHashBytes(const unsigned char* tile_hash_bytes,
+                                            uint32_t blocks_per_axis,
+                                            uint32_t n,
+                                            uint32_t b,
+                                            const uint256& sigma,
+                                            uint256& out_digest,
+                                            std::string& error)
 {
-    if (compressed_buffer == nil) {
-        error = "product digest finalize missing Metal compressed buffer";
+    if (tile_hash_bytes == nullptr) {
+        error = "product digest finalize missing Metal tile hash buffer contents";
         return false;
     }
-    const auto* const compressed_words = static_cast<const matmul::field::Element*>(compressed_buffer.contents);
-    if (compressed_words == nullptr) {
-        error = "product digest finalize missing Metal compressed buffer contents";
+    if (blocks_per_axis == 0) {
+        error = "product digest finalize requires non-zero blocks_per_axis";
         return false;
     }
 
     try {
-        if (blocks_per_axis == 0) {
-            error = "product digest finalize requires non-zero blocks_per_axis";
-            return false;
+        const size_t tile_count = static_cast<size_t>(blocks_per_axis) * blocks_per_axis;
+        std::vector<uint256> tile_hashes;
+        tile_hashes.reserve(tile_count);
+        for (size_t tile = 0; tile < tile_count; ++tile) {
+            tile_hashes.emplace_back(Span<const unsigned char>{
+                tile_hash_bytes + tile * TILE_HASH_BYTES,
+                TILE_HASH_BYTES,
+            });
         }
-        const size_t final_word_count = static_cast<size_t>(blocks_per_axis) * blocks_per_axis;
-        const size_t final_ell = static_cast<size_t>(blocks_per_axis - 1);
-        std::vector<matmul::field::Element> final_words;
-        final_words.reserve(final_word_count);
-        for (size_t word_index = 0; word_index < final_word_count; ++word_index) {
-            final_words.push_back(
-                compressed_words[word_offset + (word_index * static_cast<size_t>(blocks_per_axis)) + final_ell]);
-        }
-        out_digest = matmul::transcript::ComputeProductCommittedDigestFromWords(
-            Span<const matmul::field::Element>{final_words.data(), final_words.size()},
-            sigma,
-            n,
-            b);
-        return true;
-    } catch (const std::exception& e) {
-        error = e.what();
-        return false;
-    }
-}
-
-bool FinalizeProductCommittedDigestFromContiguousWordsBuffer(id<MTLBuffer> compressed_buffer,
-                                                             size_t word_offset,
-                                                             uint32_t blocks_per_axis,
-                                                             uint32_t n,
-                                                             uint32_t b,
-                                                             const uint256& sigma,
-                                                             uint256& out_digest,
-                                                             std::string& error)
-{
-    if (compressed_buffer == nil) {
-        error = "product digest finalize missing Metal compressed buffer";
-        return false;
-    }
-    const auto* const compressed_words = static_cast<const matmul::field::Element*>(compressed_buffer.contents);
-    if (compressed_words == nullptr) {
-        error = "product digest finalize missing Metal compressed buffer contents";
-        return false;
-    }
-
-    try {
-        if (blocks_per_axis == 0) {
-            error = "product digest finalize requires non-zero blocks_per_axis";
-            return false;
-        }
-        const size_t final_word_count = static_cast<size_t>(blocks_per_axis) * blocks_per_axis;
-        out_digest = matmul::transcript::ComputeProductCommittedDigestFromWords(
-            Span<const matmul::field::Element>{compressed_words + word_offset, final_word_count},
+        out_digest = matmul::transcript::ComputeProductCommittedDigestFromTileHashes(
+            Span<const uint256>{tile_hashes.data(), tile_hashes.size()},
             sigma,
             n,
             b);
@@ -2092,8 +1450,8 @@ void FinalizeAsyncSubmissionState(const std::shared_ptr<State>& state,
         state->context->profiling_stats.capture_supported = state->context->capture_supported;
         ++state->context->profiling_stats.samples;
         state->context->profiling_stats.last_encode_build_perturbed_us = state->encode_build_perturbed_us;
-        state->context->profiling_stats.last_encode_fused_prefix_compress_us = state->encode_fused_prefix_compress_us;
-        state->context->profiling_stats.last_encode_transcript_sha256_us = state->encode_transcript_sha256_us;
+        state->context->profiling_stats.last_encode_fused_prefix_compress_us = state->encode_product_us;
+        state->context->profiling_stats.last_encode_transcript_sha256_us = state->encode_tile_hash_us;
         state->context->profiling_stats.last_submit_wait_us = state->submit_wait_us;
         state->context->profiling_stats.last_gpu_execution_ms = state->gpu_execution_ms;
         state->context->profiling_stats.last_cpu_finalize_us = state->cpu_finalize_us;
@@ -2110,14 +1468,7 @@ void FinalizeAsyncSubmissionState(const std::shared_ptr<State>& state,
 }
 
 std::optional<BufferPoolLease> AcquireBufferPoolLease(MetalContext& context,
-                                                      const qtc::metal::MatMulDigestRequest& request,
-                                                      size_t matrix_bytes,
-                                                      size_t noise_bytes,
-                                                      size_t compress_bytes,
-                                                      size_t prefix_bytes,
-                                                      size_t compressed_bytes,
-                                                      size_t hash_bytes,
-                                                      bool require_prefix_buffer,
+                                                      const PoolRequirements& req,
                                                       std::string& error)
 {
     std::unique_lock<std::mutex> lock(context.pool_mutex);
@@ -2140,30 +1491,11 @@ std::optional<BufferPoolLease> AcquireBufferPoolLease(MetalContext& context,
             if (slot.in_use) {
                 continue;
             }
-            if (!EnsureBufferPoolSlot(context,
-                                      slot,
-                                      request,
-                                      matrix_bytes,
-                                      noise_bytes,
-                                      compress_bytes,
-                                      prefix_bytes,
-                                      compressed_bytes,
-                                      hash_bytes,
-                                      require_prefix_buffer,
-                                      error)) {
+            if (!EnsureBufferPoolSlot(context, slot, req, error)) {
                 return std::nullopt;
             }
 
-            PrewarmAvailableBufferPoolSlots(context,
-                                            request,
-                                            slot_index,
-                                            matrix_bytes,
-                                            noise_bytes,
-                                            compress_bytes,
-                                            prefix_bytes,
-                                            compressed_bytes,
-                                            hash_bytes,
-                                            require_prefix_buffer);
+            PrewarmAvailableBufferPoolSlots(context, req, slot_index);
 
             slot.in_use = true;
             ++context.pool_active_slots;
@@ -2184,14 +1516,17 @@ std::optional<BufferPoolLease> AcquireBufferPoolLease(MetalContext& context,
     }
 }
 
+struct ShapeParams {
+    uint32_t N{0};
+    uint64_t matrix_words{0};
+    uint64_t noise_words{0};
+    uint64_t tile_count{0};
+};
+
 bool BuildKernelParamsForShape(uint32_t n_in,
                                uint32_t b_in,
                                uint32_t r_in,
-                               uint32_t& out_N,
-                               uint64_t& out_matrix_words,
-                               uint64_t& out_noise_words,
-                               uint64_t& out_prefix_words,
-                               uint64_t& out_compressed_words,
+                               ShapeParams& out,
                                std::string& error)
 {
     if (n_in == 0 || b_in == 0 || r_in == 0) {
@@ -2206,58 +1541,47 @@ bool BuildKernelParamsForShape(uint32_t n_in,
         error = "matrix dimension must be divisible by transcript block size";
         return false;
     }
-    if ((static_cast<uint64_t>(b_in) * b_in) > 256) {
-        error = "transcript block size exceeds fused kernel threadgroup capacity";
+    if ((static_cast<uint64_t>(b_in) * b_in) > MAX_BLOCK_ELEMENTS) {
+        error = "transcript block size exceeds product tile threadgroup capacity";
         return false;
     }
 
     const uint64_t n = n_in;
-    const uint64_t b = b_in;
-    const uint64_t N = n / b;
-
-    if (N > std::numeric_limits<uint32_t>::max()) {
-        error = "invalid block decomposition";
-        return false;
-    }
-
+    const uint64_t N = n / b_in;
     const uint64_t matrix_words = n * n;
     const uint64_t noise_words = n * r_in;
-    const uint64_t prefix_words = N * matrix_words;
-    const uint64_t compressed_words = N * N * N;
+    const uint64_t tile_count = N * N;
 
     if (matrix_words > std::numeric_limits<uint32_t>::max() ||
-        prefix_words > std::numeric_limits<uint32_t>::max() ||
-        compressed_words > std::numeric_limits<uint32_t>::max()) {
+        tile_count > std::numeric_limits<uint32_t>::max()) {
         error = "matrix dimensions exceed supported Metal launch bounds";
         return false;
     }
 
-    out_N = static_cast<uint32_t>(N);
-    out_matrix_words = matrix_words;
-    out_noise_words = noise_words;
-    out_prefix_words = prefix_words;
-    out_compressed_words = compressed_words;
+    out.N = static_cast<uint32_t>(N);
+    out.matrix_words = matrix_words;
+    out.noise_words = noise_words;
+    out.tile_count = tile_count;
+    return true;
+}
+
+bool ValidateDigestMode(qtc::metal::MatMulDigestMode mode, std::string& error)
+{
+    if (mode != qtc::metal::MatMulDigestMode::PRODUCT_COMMITTED) {
+        error = "metal_transcript_digest_mode_unsupported_since_product_digest_v4_use_cpu";
+        return false;
+    }
     return true;
 }
 
 bool BuildKernelParams(const qtc::metal::MatMulDigestRequest& request,
-                       uint32_t& out_N,
-                       uint64_t& out_matrix_words,
-                       uint64_t& out_noise_words,
-                       uint64_t& out_prefix_words,
-                       uint64_t& out_compressed_words,
+                       ShapeParams& out,
                        std::string& error)
 {
-    if (!BuildKernelParamsForShape(
-            request.n,
-            request.b,
-            request.r,
-            out_N,
-            out_matrix_words,
-            out_noise_words,
-            out_prefix_words,
-            out_compressed_words,
-            error)) {
+    if (!ValidateDigestMode(request.digest_mode, error)) {
+        return false;
+    }
+    if (!BuildKernelParamsForShape(request.n, request.b, request.r, out, error)) {
         return false;
     }
 
@@ -2272,13 +1596,32 @@ bool BuildKernelParams(const qtc::metal::MatMulDigestRequest& request,
     }
 
     if (request.noise_e_l == nullptr || request.noise_e_r == nullptr ||
-        request.noise_f_l == nullptr || request.noise_f_r == nullptr ||
-        request.compress_vec == nullptr) {
+        request.noise_f_l == nullptr || request.noise_f_r == nullptr) {
         error = "missing MatMul input buffer";
         return false;
     }
 
     return true;
+}
+
+PoolRequirements MakePoolRequirements(uint32_t n,
+                                      uint32_t b,
+                                      uint32_t r,
+                                      const ShapeParams& shape,
+                                      uint32_t batch_multiplier)
+{
+    const size_t matrix_bytes = static_cast<size_t>(shape.matrix_words) * sizeof(uint32_t);
+    const size_t noise_bytes = static_cast<size_t>(shape.noise_words) * sizeof(uint32_t);
+    const size_t tile_hash_bytes = static_cast<size_t>(shape.tile_count) * TILE_HASH_BYTES;
+    return PoolRequirements{
+        .n = n,
+        .b = b,
+        .r = r,
+        .matrix_bytes = matrix_bytes * batch_multiplier,
+        .noise_bytes = noise_bytes * batch_multiplier,
+        .c_prime_bytes = matrix_bytes * batch_multiplier,
+        .tile_hash_bytes = tile_hash_bytes * batch_multiplier,
+    };
 }
 
 NSUInteger SelectThreadGroupSize(id<MTLComputePipelineState> pipeline, NSUInteger preferred)
@@ -2386,6 +1729,36 @@ bool EncodeComputeThreadgroupsBindings(id<MTLCommandBuffer> command,
     return true;
 }
 
+template <size_t N>
+bool EncodeCompute2DTiles(id<MTLCommandBuffer> command,
+                          id<MTLComputePipelineState> pipeline,
+                          NSUInteger tiles_per_axis,
+                          NSUInteger tile_dim,
+                          const std::array<BufferBinding, N>& bindings,
+                          std::string& error)
+{
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    if (encoder == nil) {
+        error = "Failed to create Metal compute encoder";
+        return false;
+    }
+
+    [encoder setComputePipelineState:pipeline];
+    SetEncoderBindings(encoder, bindings);
+
+    const NSUInteger max_threads = std::max<NSUInteger>(pipeline.maxTotalThreadsPerThreadgroup, 1);
+    if (tile_dim * tile_dim > max_threads) {
+        [encoder endEncoding];
+        error = "Requested 2D threadgroup size exceeds pipeline limit";
+        return false;
+    }
+
+    [encoder dispatchThreadgroups:MTLSizeMake(tiles_per_axis, tiles_per_axis, 1)
+            threadsPerThreadgroup:MTLSizeMake(tile_dim, tile_dim, 1)];
+    [encoder endEncoding];
+    return true;
+}
+
 id<MTLCommandBuffer> CreatePerformanceCommandBuffer(id<MTLCommandQueue> queue)
 {
     if (queue == nil) {
@@ -2397,40 +1770,6 @@ id<MTLCommandBuffer> CreatePerformanceCommandBuffer(id<MTLCommandQueue> queue)
     return [queue commandBufferWithUnretainedReferences];
 }
 
-using MetalTranscriptPipelineMode = qtc::metal::detail::TranscriptPipelineMode;
-
-MetalTranscriptPipelineMode ResolveMetalTranscriptPipelineMode()
-{
-    return qtc::metal::detail::ParseTranscriptPipelineEnv(
-        std::getenv("QTC_MATMUL_METAL_PIPELINE"));
-}
-
-bool ShouldUseLegacyTranscriptPipeline(const qtc::metal::MatMulDigestRequest& request, const MetalContext& context)
-{
-    const bool legacy_available = context.build_prefix_pipeline != nil && context.compress_prefix_pipeline != nil;
-    const bool fused_available = context.fused_prefix_compress_pipeline != nil && context.transcript_sha256_pipeline != nil;
-
-    if (request.digest_mode == qtc::metal::MatMulDigestMode::PRODUCT_COMMITTED) {
-        return false;
-    }
-
-    switch (ResolveMetalTranscriptPipelineMode()) {
-    case MetalTranscriptPipelineMode::LEGACY:
-        return legacy_available;
-    case MetalTranscriptPipelineMode::FUSED:
-        return !fused_available && legacy_available;
-    case MetalTranscriptPipelineMode::AUTO:
-        // Prefer the legacy GPU-compute + CPU-finalize path for consensus safety: it produces the
-        // same bytes as the canonical CPU MatMul transcript that block validation checks. The fused
-        // GPU-hash transcript path is not byte-exact for small transcript fixtures, so a miner using
-        // it could stamp a digest the network's CPU validators reject. It is retained only behind
-        // the explicit QTC_MATMUL_METAL_PIPELINE=fused override.
-        return legacy_available;
-    }
-
-    return false;
-}
-
 using FunctionConstantSpecializationMode = qtc::metal::detail::FunctionConstantMode;
 
 FunctionConstantSpecializationMode ResolveFunctionConstantSpecializationMode()
@@ -2439,7 +1778,7 @@ FunctionConstantSpecializationMode ResolveFunctionConstantSpecializationMode()
         std::getenv("QTC_MATMUL_METAL_FUNCTION_CONSTANTS"));
 }
 
-bool ShouldUseFunctionConstantSpecialization(uint32_t n, bool use_legacy_pipeline)
+bool ShouldUseFunctionConstantSpecialization(uint32_t n)
 {
     switch (ResolveFunctionConstantSpecializationMode()) {
     case FunctionConstantSpecializationMode::ENABLED:
@@ -2447,27 +1786,199 @@ bool ShouldUseFunctionConstantSpecialization(uint32_t n, bool use_legacy_pipelin
     case FunctionConstantSpecializationMode::DISABLED:
         return false;
     case FunctionConstantSpecializationMode::AUTO:
-        // Host profiling shows mixed specialization behavior by transcript path.
-        // Legacy prefix/compress benefits for production sizes, while fused+GPU-hash
-        // still regresses for n=512 on M1-class devices.
-        if (use_legacy_pipeline) {
-            if (n >= 256) return true;
-            return n <= 64;
-        }
-        if (n == 512) return false;
-        if (n == 256) return true;
+        // Compile-time (n, b, N) let the compiler fully unroll the b-wide inner
+        // product loop for the production and regtest shapes.
+        if (n >= 256) return true;
         return n <= 64;
     }
     return false;
 }
 
+enum class ProductKernelMode {
+    AUTO,
+    TILED,
+    SIMPLE,
+};
+
+ProductKernelMode ResolveProductKernelMode()
+{
+    const char* env = std::getenv("QTC_MATMUL_METAL_PRODUCT_KERNEL");
+    if (env == nullptr || env[0] == '\0') {
+        return ProductKernelMode::AUTO;
+    }
+    const std::string value{env};
+    if (value == "tiled") return ProductKernelMode::TILED;
+    if (value == "simple") return ProductKernelMode::SIMPLE;
+    return ProductKernelMode::AUTO;
+}
+
+// Pipeline selection for one attempt. Every candidate produces bit-identical
+// C' (exact modular arithmetic); the choice is purely a performance one.
+struct ProductPipelineSelection {
+    id<MTLComputePipelineState> build_perturbed{nil};
+    id<MTLComputePipelineState> build_product{nil};
+    bool tiled{false};
+};
+
+ProductPipelineSelection SelectProductPipelines(const MetalContext& context,
+                                                uint32_t n,
+                                                uint32_t b,
+                                                uint32_t r,
+                                                uint32_t N)
+{
+    ProductPipelineSelection selection;
+    selection.build_perturbed = context.build_perturbed_pipeline;
+    selection.build_product = context.build_product_pipeline;
+
+    const SpecializedKernelPipelines* specialized = nullptr;
+    if (ShouldUseFunctionConstantSpecialization(n)) {
+        specialized = FindSpecializedPipelines(context, n, b, r, N);
+    }
+    if (specialized != nullptr) {
+        if (specialized->build_perturbed_pipeline != nil) {
+            selection.build_perturbed = specialized->build_perturbed_pipeline;
+        }
+        if (specialized->build_product_pipeline != nil) {
+            selection.build_product = specialized->build_product_pipeline;
+        }
+    }
+
+    const bool tiled_supported = context.build_product_tiled_pipeline != nil && (n % PRODUCT_TILE_DIM) == 0;
+    switch (ResolveProductKernelMode()) {
+    case ProductKernelMode::TILED:
+        selection.tiled = tiled_supported;
+        break;
+    case ProductKernelMode::SIMPLE:
+        selection.tiled = false;
+        break;
+    case ProductKernelMode::AUTO:
+        // Measured on Apple M5 at n=512/b=16/r=8: the per-element kernel with
+        // function-constant specialization (~965 attempts/s) edges out the
+        // 16x16 threadgroup-memory GEMM (~915 attempts/s); both are within
+        // noise of each other and produce identical C'. Keep the tiled kernel
+        // selectable via QTC_MATMUL_METAL_PRODUCT_KERNEL=tiled.
+        selection.tiled = false;
+        break;
+    }
+    if (selection.tiled) {
+        selection.build_product = context.build_product_tiled_pipeline;
+    }
+    return selection;
+}
+
+// Encodes C' = A' * B' and the v4 per-tile hashes. a_prime/b_prime/c_prime are
+// n*n word regions; tile_hashes is N*N*32 bytes.
+bool EncodeProductAndTileHashes(id<MTLCommandBuffer> command,
+                                const MetalContext& context,
+                                const ProductPipelineSelection& selection,
+                                id<MTLBuffer> params_buffer,
+                                const BufferBinding& a_prime,
+                                const BufferBinding& b_prime,
+                                const BufferBinding& c_prime,
+                                const BufferBinding& tile_hashes,
+                                uint32_t n,
+                                uint32_t b,
+                                uint32_t N,
+                                double& encode_product_us,
+                                double& encode_tile_hash_us,
+                                std::string& error)
+{
+    const std::array<BufferBinding, 4> product_bindings{{
+        {params_buffer, 0},
+        a_prime,
+        b_prime,
+        c_prime,
+    }};
+    const auto encode_product_start = std::chrono::steady_clock::now();
+    bool encoded{false};
+    if (selection.tiled) {
+        encoded = EncodeCompute2DTiles(command,
+                                       selection.build_product,
+                                       static_cast<NSUInteger>(n / PRODUCT_TILE_DIM),
+                                       PRODUCT_TILE_DIM,
+                                       product_bindings,
+                                       error);
+    } else {
+        encoded = EncodeComputeThreadgroupsBindings(command,
+                                                    selection.build_product,
+                                                    static_cast<NSUInteger>(N),
+                                                    static_cast<NSUInteger>(N),
+                                                    static_cast<NSUInteger>(b) * b,
+                                                    product_bindings,
+                                                    error);
+    }
+    if (!encoded) {
+        return false;
+    }
+    encode_product_us += std::chrono::duration<double, std::micro>(
+                             std::chrono::steady_clock::now() - encode_product_start)
+                             .count();
+
+    const std::array<BufferBinding, 3> hash_bindings{{
+        {params_buffer, 0},
+        c_prime,
+        tile_hashes,
+    }};
+    const auto encode_hash_start = std::chrono::steady_clock::now();
+    if (!EncodeComputeBindings(command,
+                               context.hash_product_tiles_pipeline,
+                               static_cast<NSUInteger>(N) * N,
+                               256,
+                               hash_bindings,
+                               error)) {
+        return false;
+    }
+    encode_tile_hash_us += std::chrono::duration<double, std::micro>(
+                               std::chrono::steady_clock::now() - encode_hash_start)
+                               .count();
+    return true;
+}
+
+NSUInteger OracleBlockGridSize(uint64_t element_count)
+{
+    return static_cast<NSUInteger>((element_count + 7) / 8);
+}
+
+bool EncodeGenerateBaseMatrix(id<MTLCommandBuffer> command,
+                              const MetalContext& context,
+                              id<MTLBuffer> params_buffer,
+                              id<MTLBuffer> seed_buffer,
+                              size_t seed_offset,
+                              id<MTLBuffer> output_buffer,
+                              size_t output_offset,
+                              uint64_t matrix_words,
+                              std::string& error)
+{
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    if (encoder == nil) {
+        error = "Failed to create Metal base matrix generation encoder";
+        return false;
+    }
+    [encoder setComputePipelineState:context.generate_base_matrix_pipeline];
+    [encoder setBuffer:params_buffer offset:0 atIndex:0];
+    [encoder setBuffer:seed_buffer offset:static_cast<NSUInteger>(seed_offset) atIndex:1];
+    [encoder setBuffer:output_buffer offset:static_cast<NSUInteger>(output_offset) atIndex:2];
+    const NSUInteger group_size = SelectThreadGroupSize(context.generate_base_matrix_pipeline, 256);
+    [encoder dispatchThreads:MTLSizeMake(OracleBlockGridSize(matrix_words), 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(group_size, 1, 1)];
+    [encoder endEncoding];
+    return true;
+}
+
+struct KernelParamsHost {
+    uint32_t n;
+    uint32_t b;
+    uint32_t r;
+    uint32_t N;
+};
+
 } // namespace
 
 namespace qtc::metal {
 
-bool ShouldUseFunctionConstantSpecializationPolicy(uint32_t n, bool use_legacy_pipeline)
+bool ShouldUseFunctionConstantSpecializationPolicy(uint32_t n, bool /*legacy_unused*/)
 {
-    return ShouldUseFunctionConstantSpecialization(n, use_legacy_pipeline);
+    return ShouldUseFunctionConstantSpecialization(n);
 }
 
 MatMulAccelerationProbe ProbeMatMulDigestAcceleration()
@@ -2627,12 +2138,7 @@ MatMulGeneratedBaseMatrixResult GenerateBaseMatrixFromSeedForTesting(uint32_t n,
     const uint32_t matrix_words = static_cast<uint32_t>(matrix_words64);
     const size_t matrix_bytes = static_cast<size_t>(matrix_words) * sizeof(matmul::field::Element);
 
-    struct KernelParams {
-        uint32_t n;
-        uint32_t b;
-        uint32_t r;
-        uint32_t N;
-    } params{n, 1, 1, n};
+    const KernelParamsHost params{n, 1, 1, n};
 
     @autoreleasepool {
         id<MTLBuffer> output_buffer = [context.device newBufferWithLength:matrix_bytes
@@ -2663,7 +2169,7 @@ MatMulGeneratedBaseMatrixResult GenerateBaseMatrixFromSeedForTesting(uint32_t n,
         [encoder setBytes:seed.data() length:uint256::size() atIndex:1];
         [encoder setBuffer:output_buffer offset:0 atIndex:2];
         const NSUInteger group_size = SelectThreadGroupSize(context.generate_base_matrix_pipeline, 256);
-        [encoder dispatchThreads:MTLSizeMake(matrix_words, 1, 1)
+        [encoder dispatchThreads:MTLSizeMake(OracleBlockGridSize(matrix_words), 1, 1)
             threadsPerThreadgroup:MTLSizeMake(group_size, 1, 1)];
         [encoder endEncoding];
 
@@ -2686,10 +2192,10 @@ MatMulGeneratedBaseMatrixResult GenerateBaseMatrixFromSeedForTesting(uint32_t n,
     }
 }
 
-MatMulVariableBaseProductWordsResult GenerateVariableBaseProductWordsForTesting(
-    const MatMulVariableBaseProductWordsRequest& request)
+MatMulVariableBaseProductResult GenerateVariableBaseProductForTesting(
+    const MatMulVariableBaseProductRequest& request)
 {
-    MatMulVariableBaseProductWordsResult result;
+    MatMulVariableBaseProductResult result;
 
     MetalContext& context = GetContext();
     if (!context.ready) {
@@ -2701,58 +2207,23 @@ MatMulVariableBaseProductWordsResult GenerateVariableBaseProductWordsForTesting(
     result.available = true;
 
     if (request.noise_e_l == nullptr || request.noise_e_r == nullptr ||
-        request.noise_f_l == nullptr || request.noise_f_r == nullptr ||
-        request.compress_vec == nullptr) {
-        result.error = "invalid variable-base product words request: missing input pointer";
+        request.noise_f_l == nullptr || request.noise_f_r == nullptr) {
+        result.error = "invalid variable-base product request: missing input pointer";
         return result;
     }
 
-    uint32_t N{0};
-    uint64_t matrix_words{0};
-    uint64_t noise_words{0};
-    uint64_t prefix_words{0};
-    uint64_t compressed_words{0};
-    if (!BuildKernelParamsForShape(
-            request.n,
-            request.b,
-            request.r,
-            N,
-            matrix_words,
-            noise_words,
-            prefix_words,
-            compressed_words,
-            result.error)) {
+    ShapeParams shape;
+    if (!BuildKernelParamsForShape(request.n, request.b, request.r, shape, result.error)) {
         return result;
     }
-    (void)prefix_words;
-    (void)compressed_words;
-
-    struct KernelParams {
-        uint32_t n;
-        uint32_t b;
-        uint32_t r;
-        uint32_t N;
-    } params{request.n, request.b, request.r, N};
-
-    const SpecializedKernelPipelines* specialized = nullptr;
-    if (ShouldUseFunctionConstantSpecialization(request.n, /*use_legacy_pipeline=*/true)) {
-        specialized = FindSpecializedPipelines(context, request.n, request.b, request.r, N);
-    }
-    id<MTLComputePipelineState> build_perturbed_pipeline =
-        (specialized != nullptr && specialized->build_perturbed_pipeline != nil)
-            ? specialized->build_perturbed_pipeline
-            : context.build_perturbed_pipeline;
-    id<MTLComputePipelineState> fused_final_compress_pipeline =
-        (specialized != nullptr && specialized->fused_final_compress_pipeline != nil)
-            ? specialized->fused_final_compress_pipeline
-            : context.fused_final_compress_pipeline;
+    const uint32_t N = shape.N;
+    const KernelParamsHost params{request.n, request.b, request.r, N};
+    const ProductPipelineSelection selection = SelectProductPipelines(context, request.n, request.b, request.r, N);
 
     @autoreleasepool {
-        const size_t matrix_bytes = static_cast<size_t>(matrix_words) * sizeof(uint32_t);
-        const size_t noise_bytes = static_cast<size_t>(noise_words) * sizeof(uint32_t);
-        const size_t compress_bytes = static_cast<size_t>(request.b) * request.b * sizeof(uint32_t);
-        const size_t product_words = static_cast<size_t>(N) * N;
-        const size_t product_bytes = product_words * sizeof(uint32_t);
+        const size_t matrix_bytes = static_cast<size_t>(shape.matrix_words) * sizeof(uint32_t);
+        const size_t noise_bytes = static_cast<size_t>(shape.noise_words) * sizeof(uint32_t);
+        const size_t tile_hash_bytes = static_cast<size_t>(shape.tile_count) * TILE_HASH_BYTES;
 
         id<MTLBuffer> params_buffer = [context.device newBufferWithLength:sizeof(params)
                                                                    options:MTLResourceStorageModeShared];
@@ -2770,17 +2241,17 @@ MatMulVariableBaseProductWordsResult GenerateVariableBaseProductWordsForTesting(
                                                                options:MTLResourceStorageModeShared];
         id<MTLBuffer> f_r_buffer = [context.device newBufferWithLength:noise_bytes
                                                                options:MTLResourceStorageModeShared];
-        id<MTLBuffer> compress_buffer = [context.device newBufferWithLength:compress_bytes
-                                                                    options:MTLResourceStorageModeShared];
         id<MTLBuffer> a_prime_buffer = [context.device newBufferWithLength:matrix_bytes
                                                                    options:MTLResourceStorageModeShared];
         id<MTLBuffer> b_prime_buffer = [context.device newBufferWithLength:matrix_bytes
                                                                    options:MTLResourceStorageModeShared];
-        id<MTLBuffer> product_buffer = [context.device newBufferWithLength:product_bytes
+        id<MTLBuffer> c_prime_buffer = [context.device newBufferWithLength:matrix_bytes
                                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> tile_hash_buffer = [context.device newBufferWithLength:tile_hash_bytes
+                                                                     options:MTLResourceStorageModeShared];
         if (params_buffer == nil || seed_buffer == nil || matrix_a_buffer == nil || matrix_b_buffer == nil ||
             e_l_buffer == nil || e_r_buffer == nil || f_l_buffer == nil || f_r_buffer == nil ||
-            compress_buffer == nil || a_prime_buffer == nil || b_prime_buffer == nil || product_buffer == nil) {
+            a_prime_buffer == nil || b_prime_buffer == nil || c_prime_buffer == nil || tile_hash_buffer == nil) {
             result.error = "failed to allocate Metal variable-base product diagnostic buffers";
             return result;
         }
@@ -2793,7 +2264,6 @@ MatMulVariableBaseProductWordsResult GenerateVariableBaseProductWordsForTesting(
         std::memcpy(e_r_buffer.contents, request.noise_e_r, noise_bytes);
         std::memcpy(f_l_buffer.contents, request.noise_f_l, noise_bytes);
         std::memcpy(f_r_buffer.contents, request.noise_f_r, noise_bytes);
-        std::memcpy(compress_buffer.contents, request.compress_vec, compress_bytes);
 
         id<MTLCommandBuffer> command = CreatePerformanceCommandBuffer(context.pool_slots.empty()
             ? nil
@@ -2806,29 +2276,13 @@ MatMulVariableBaseProductWordsResult GenerateVariableBaseProductWordsForTesting(
             return result;
         }
 
-        auto encode_generate_base = [&](size_t seed_offset,
-                                        id<MTLBuffer> output_buffer) -> bool {
-            id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-            if (encoder == nil) {
-                result.error = "failed to create Metal variable-base product diagnostic generation encoder";
-                return false;
-            }
-            [encoder setComputePipelineState:context.generate_base_matrix_pipeline];
-            [encoder setBuffer:params_buffer offset:0 atIndex:0];
-            [encoder setBuffer:seed_buffer offset:static_cast<NSUInteger>(seed_offset) atIndex:1];
-            [encoder setBuffer:output_buffer offset:0 atIndex:2];
-            const NSUInteger group_size = SelectThreadGroupSize(context.generate_base_matrix_pipeline, 256);
-            [encoder dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(matrix_words), 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(group_size, 1, 1)];
-            [encoder endEncoding];
-            return true;
-        };
-        if (!encode_generate_base(0, matrix_a_buffer) ||
-            !encode_generate_base(uint256::size(), matrix_b_buffer)) {
+        std::string encode_error;
+        if (!EncodeGenerateBaseMatrix(command, context, params_buffer, seed_buffer, 0, matrix_a_buffer, 0, shape.matrix_words, encode_error) ||
+            !EncodeGenerateBaseMatrix(command, context, params_buffer, seed_buffer, uint256::size(), matrix_b_buffer, 0, shape.matrix_words, encode_error)) {
+            result.error = encode_error;
             return result;
         }
 
-        std::string encode_error;
         const std::array<BufferBinding, 9> build_bindings{{
             {params_buffer, 0},
             {matrix_a_buffer, 0},
@@ -2841,8 +2295,8 @@ MatMulVariableBaseProductWordsResult GenerateVariableBaseProductWordsForTesting(
             {b_prime_buffer, 0},
         }};
         if (!EncodeComputeBindings(command,
-                                   build_perturbed_pipeline,
-                                   static_cast<NSUInteger>(matrix_words),
+                                   selection.build_perturbed,
+                                   static_cast<NSUInteger>(shape.matrix_words),
                                    256,
                                    build_bindings,
                                    encode_error)) {
@@ -2850,20 +2304,22 @@ MatMulVariableBaseProductWordsResult GenerateVariableBaseProductWordsForTesting(
             return result;
         }
 
-        const std::array<BufferBinding, 5> compress_bindings{{
-            {params_buffer, 0},
-            {a_prime_buffer, 0},
-            {b_prime_buffer, 0},
-            {compress_buffer, 0},
-            {product_buffer, 0},
-        }};
-        if (!EncodeComputeThreadgroupsBindings(command,
-                                               fused_final_compress_pipeline,
-                                               static_cast<NSUInteger>(N),
-                                               static_cast<NSUInteger>(N),
-                                               static_cast<NSUInteger>(request.b) * request.b,
-                                               compress_bindings,
-                                               encode_error)) {
+        double encode_product_us{0.0};
+        double encode_tile_hash_us{0.0};
+        if (!EncodeProductAndTileHashes(command,
+                                        context,
+                                        selection,
+                                        params_buffer,
+                                        BufferBinding{a_prime_buffer, 0},
+                                        BufferBinding{b_prime_buffer, 0},
+                                        BufferBinding{c_prime_buffer, 0},
+                                        BufferBinding{tile_hash_buffer, 0},
+                                        request.n,
+                                        request.b,
+                                        N,
+                                        encode_product_us,
+                                        encode_tile_hash_us,
+                                        encode_error)) {
             result.error = encode_error;
             return result;
         }
@@ -2880,18 +2336,27 @@ MatMulVariableBaseProductWordsResult GenerateVariableBaseProductWordsForTesting(
         const auto* matrix_b_words = static_cast<const matmul::field::Element*>(matrix_b_buffer.contents);
         const auto* a_prime_words = static_cast<const matmul::field::Element*>(a_prime_buffer.contents);
         const auto* b_prime_words = static_cast<const matmul::field::Element*>(b_prime_buffer.contents);
-        const auto* product_words_ptr = static_cast<const matmul::field::Element*>(product_buffer.contents);
+        const auto* c_prime_words = static_cast<const matmul::field::Element*>(c_prime_buffer.contents);
+        const auto* tile_hash_bytes_ptr = static_cast<const unsigned char*>(tile_hash_buffer.contents);
         if (matrix_a_words == nullptr || matrix_b_words == nullptr ||
-            a_prime_words == nullptr || b_prime_words == nullptr || product_words_ptr == nullptr) {
+            a_prime_words == nullptr || b_prime_words == nullptr ||
+            c_prime_words == nullptr || tile_hash_bytes_ptr == nullptr) {
             result.error = "Metal variable-base product diagnostic output buffer has no contents";
             return result;
         }
 
-        result.matrix_a.assign(matrix_a_words, matrix_a_words + matrix_words);
-        result.matrix_b.assign(matrix_b_words, matrix_b_words + matrix_words);
-        result.a_prime.assign(a_prime_words, a_prime_words + matrix_words);
-        result.b_prime.assign(b_prime_words, b_prime_words + matrix_words);
-        result.product_words.assign(product_words_ptr, product_words_ptr + product_words);
+        result.matrix_a.assign(matrix_a_words, matrix_a_words + shape.matrix_words);
+        result.matrix_b.assign(matrix_b_words, matrix_b_words + shape.matrix_words);
+        result.a_prime.assign(a_prime_words, a_prime_words + shape.matrix_words);
+        result.b_prime.assign(b_prime_words, b_prime_words + shape.matrix_words);
+        result.c_prime.assign(c_prime_words, c_prime_words + shape.matrix_words);
+        result.tile_hashes.reserve(static_cast<size_t>(shape.tile_count));
+        for (uint64_t tile = 0; tile < shape.tile_count; ++tile) {
+            result.tile_hashes.emplace_back(Span<const unsigned char>{
+                tile_hash_bytes_ptr + static_cast<size_t>(tile) * TILE_HASH_BYTES,
+                TILE_HASH_BYTES,
+            });
+        }
         result.success = true;
         return result;
     }
@@ -2917,7 +2382,7 @@ MatMulBufferPoolStats ProbeMatMulBufferPool()
     stats.inflight_submissions = context.pool_inflight_submissions;
     stats.peak_inflight_submissions = context.pool_peak_inflight_submissions;
     stats.initialized = std::any_of(context.pool_slots.begin(), context.pool_slots.end(), [](const MetalPoolSlot& slot) {
-        return IsPoolSlotInitialized(slot, /*require_prefix_buffer=*/false) || IsPoolSlotInitialized(slot, /*require_prefix_buffer=*/true);
+        return IsPoolSlotInitialized(slot);
     });
     stats.allocation_events = context.pool_allocation_events;
     stats.reuse_events = context.pool_reuse_events;
@@ -2943,8 +2408,8 @@ MatMulDispatchConfig ProbeMatMulDispatchConfig()
     config.available = true;
 
     config.build_perturbed_threads = SelectThreadGroupSize(context.build_perturbed_pipeline, 256);
-    config.build_prefix_threads = SelectThreadGroupSize(context.build_prefix_tiled_pipeline, 256);
-    config.compress_prefix_threads = SelectThreadGroupSize(context.fused_prefix_compress_pipeline, 256);
+    config.build_prefix_threads = SelectThreadGroupSize(context.build_product_pipeline, 256);
+    config.compress_prefix_threads = SelectThreadGroupSize(context.hash_product_tiles_pipeline, 256);
     config.reason = "dispatch_probe_ok";
     return config;
 }
@@ -2961,23 +2426,23 @@ MatMulKernelProfile ProbeMatMulKernelProfile()
     }
 
     profile.available = true;
-    profile.tiled_build_prefix = context.build_prefix_tiled_pipeline != nil;
-    profile.fused_prefix_compress = context.fused_prefix_compress_pipeline != nil;
-    profile.gpu_transcript_hash = context.transcript_sha256_pipeline != nil;
+    profile.tiled_build_prefix = context.build_product_tiled_pipeline != nil;
+    profile.fused_prefix_compress = context.build_product_pipeline != nil;
+    profile.gpu_transcript_hash = context.hash_product_tiles_pipeline != nil;
     profile.function_constant_specialization = context.specialized_pipeline_count > 0;
     profile.cooperative_tensor_prepared = true;
     profile.cooperative_tensor_active = false;
     profile.uses_prefix_buffer = false;
     profile.specialized_shape_count = context.specialized_pipeline_count;
-    profile.build_prefix_threadgroup_width = 16;
-    profile.build_prefix_threadgroup_height = 16;
-    profile.fused_prefix_threadgroup_threads = SelectThreadGroupSize(context.fused_prefix_compress_pipeline, 256);
+    profile.build_prefix_threadgroup_width = PRODUCT_TILE_DIM;
+    profile.build_prefix_threadgroup_height = PRODUCT_TILE_DIM;
+    profile.fused_prefix_threadgroup_threads = SelectThreadGroupSize(context.build_product_pipeline, 256);
     profile.specialization_reason = context.specialized_pipeline_reason;
     profile.cooperative_tensor_reason = "simdgroup_uint32_reduce_active_integer_cooperative_tensor_unavailable";
     profile.library_source = context.using_precompiled_library ? "precompiled_metallib" : "inline_source_fallback";
     profile.reason = profile.function_constant_specialization
-        ? "tiled_fused_gpuhash_pipeline_with_function_constants"
-        : "tiled_fused_gpuhash_pipeline";
+        ? "product_digest_v4_gemm_gpu_tile_hash_host_root_pipeline_with_function_constants"
+        : "product_digest_v4_gemm_gpu_tile_hash_host_root_pipeline";
     return profile;
 }
 
@@ -3028,68 +2493,23 @@ MatMulDigestSubmission SubmitCanonicalTranscriptDigest(const MatMulDigestRequest
     }
     submission.available = true;
 
-    uint32_t N{0};
-    uint64_t matrix_words{0};
-    uint64_t noise_words{0};
-    uint64_t prefix_words{0};
-    uint64_t compressed_words{0};
-    if (!BuildKernelParams(request, N, matrix_words, noise_words, prefix_words, compressed_words, submission.error)) {
+    ShapeParams shape;
+    if (!BuildKernelParams(request, shape, submission.error)) {
         return submission;
     }
-
-    struct KernelParams {
-        uint32_t n;
-        uint32_t b;
-        uint32_t r;
-        uint32_t N;
-    } params{request.n, request.b, request.r, N};
-    struct HashParams {
-        uint32_t compressed_words;
-    } hash_params{static_cast<uint32_t>(compressed_words)};
-    const bool use_product_digest = request.digest_mode == MatMulDigestMode::PRODUCT_COMMITTED;
-    const bool use_legacy_pipeline = use_product_digest || ShouldUseLegacyTranscriptPipeline(request, context);
-    const SpecializedKernelPipelines* specialized = nullptr;
-    if (ShouldUseFunctionConstantSpecialization(request.n, use_legacy_pipeline || use_product_digest)) {
-        specialized = FindSpecializedPipelines(context, request.n, request.b, request.r, N);
-    }
-    id<MTLComputePipelineState> build_perturbed_pipeline =
-        (specialized != nullptr && specialized->build_perturbed_pipeline != nil)
-            ? specialized->build_perturbed_pipeline
-            : context.build_perturbed_pipeline;
-    id<MTLComputePipelineState> build_prefix_pipeline =
-        (specialized != nullptr && specialized->build_prefix_pipeline != nil)
-            ? specialized->build_prefix_pipeline
-            : context.build_prefix_pipeline;
-    id<MTLComputePipelineState> compress_prefix_pipeline =
-        (specialized != nullptr && specialized->compress_prefix_pipeline != nil)
-            ? specialized->compress_prefix_pipeline
-            : context.compress_prefix_pipeline;
-    id<MTLComputePipelineState> fused_prefix_compress_pipeline =
-        (specialized != nullptr && specialized->fused_prefix_compress_pipeline != nil)
-            ? specialized->fused_prefix_compress_pipeline
-            : context.fused_prefix_compress_pipeline;
+    const uint32_t N = shape.N;
+    const KernelParamsHost params{request.n, request.b, request.r, N};
+    const ProductPipelineSelection selection = SelectProductPipelines(context, request.n, request.b, request.r, N);
 
     auto state = std::make_shared<AsyncSingleDigestState>();
     state->result.available = true;
 
     @autoreleasepool {
-        const size_t matrix_bytes = matrix_words * sizeof(uint32_t);
-        const size_t noise_bytes = noise_words * sizeof(uint32_t);
-        const size_t compress_bytes = static_cast<size_t>(request.b) * request.b * sizeof(uint32_t);
-        const size_t prefix_bytes = prefix_words * sizeof(uint32_t);
-        const size_t compressed_bytes = compressed_words * sizeof(uint32_t);
-        constexpr size_t hash_bytes = 32;
+        const PoolRequirements pool_req = MakePoolRequirements(request.n, request.b, request.r, shape, 1);
+        const size_t matrix_bytes = pool_req.matrix_bytes;
+        const size_t noise_bytes = pool_req.noise_bytes;
 
-        auto pool_lease = AcquireBufferPoolLease(context,
-                                                 request,
-                                                 matrix_bytes,
-                                                 noise_bytes,
-                                                 compress_bytes,
-                                                 prefix_bytes,
-                                                 compressed_bytes,
-                                                 hash_bytes,
-                                                 /*require_prefix_buffer=*/use_legacy_pipeline,
-                                                 submission.error);
+        auto pool_lease = AcquireBufferPoolLease(context, pool_req, submission.error);
         if (!pool_lease.has_value()) {
             return submission;
         }
@@ -3097,19 +2517,16 @@ MatMulDigestSubmission SubmitCanonicalTranscriptDigest(const MatMulDigestRequest
 
         MetalPoolSlot& pool_slot = *state->lease->slot;
         id<MTLBuffer> params_buffer = pool_slot.params_buffer;
-        id<MTLBuffer> hash_params_buffer = pool_slot.hash_params_buffer;
         id<MTLBuffer> matrix_a_buffer = pool_slot.matrix_a_stage_buffer;
         id<MTLBuffer> matrix_b_buffer = pool_slot.matrix_b_stage_buffer;
         id<MTLBuffer> e_l_buffer = pool_slot.e_l_buffer;
         id<MTLBuffer> e_r_buffer = pool_slot.e_r_buffer;
         id<MTLBuffer> f_l_buffer = pool_slot.f_l_buffer;
         id<MTLBuffer> f_r_buffer = pool_slot.f_r_buffer;
-        id<MTLBuffer> compress_buffer = pool_slot.compress_buffer;
         id<MTLBuffer> a_prime_buffer = pool_slot.a_prime_buffer;
         id<MTLBuffer> b_prime_buffer = pool_slot.b_prime_buffer;
-        id<MTLBuffer> prefix_buffer = pool_slot.prefix_buffer;
-        id<MTLBuffer> compressed_buffer = pool_slot.compressed_buffer;
-        id<MTLBuffer> transcript_hash_buffer = pool_slot.transcript_hash_buffer;
+        id<MTLBuffer> c_prime_buffer = pool_slot.c_prime_buffer;
+        id<MTLBuffer> tile_hash_buffer = pool_slot.tile_hash_buffer;
         state->retained_inputs = CreateRetainedInputArray(6);
 
         if (request.use_uploaded_base_matrices) {
@@ -3152,17 +2569,8 @@ MatMulDigestSubmission SubmitCanonicalTranscriptDigest(const MatMulDigestRequest
         id<MTLBuffer> e_r_input_buffer = copy_or_wrap(request.noise_e_r, e_r_buffer, noise_bytes);
         id<MTLBuffer> f_l_input_buffer = copy_or_wrap(request.noise_f_l, f_l_buffer, noise_bytes);
         id<MTLBuffer> f_r_input_buffer = copy_or_wrap(request.noise_f_r, f_r_buffer, noise_bytes);
-        id<MTLBuffer> compress_input_buffer = WrapSharedNoCopyBuffer(context.device, request.compress_vec, compress_bytes);
-        if (compress_input_buffer == nil) {
-            compress_input_buffer = compress_buffer;
-            std::memcpy(compress_input_buffer.contents, request.compress_vec, compress_bytes);
-        } else {
-            state->any_zero_copy_input = true;
-            RetainTemporaryInputBuffer(state->retained_inputs, compress_input_buffer);
-        }
 
         std::memcpy(params_buffer.contents, &params, sizeof(params));
-        std::memcpy(hash_params_buffer.contents, &hash_params, sizeof(hash_params));
         id<MTLCommandBuffer> command = CreatePerformanceCommandBuffer(pool_slot.queue);
         if (command == nil) {
             submission.error = "Failed to create Metal command buffer";
@@ -3183,8 +2591,8 @@ MatMulDigestSubmission SubmitCanonicalTranscriptDigest(const MatMulDigestRequest
         }};
         const auto encode_build_start = std::chrono::steady_clock::now();
         if (!EncodeComputeBindings(command,
-                                   build_perturbed_pipeline,
-                                   static_cast<NSUInteger>(matrix_words),
+                                   selection.build_perturbed,
+                                   static_cast<NSUInteger>(shape.matrix_words),
                                    256,
                                    buffers_1,
                                    encode_error)) {
@@ -3195,100 +2603,29 @@ MatMulDigestSubmission SubmitCanonicalTranscriptDigest(const MatMulDigestRequest
                                                std::chrono::steady_clock::now() - encode_build_start)
                                                .count();
 
-        if (use_legacy_pipeline) {
-            const std::array<BufferBinding, 4> buffers_2{{
-                {params_buffer, 0},
-                {a_prime_buffer, 0},
-                {b_prime_buffer, 0},
-                {prefix_buffer, 0},
-            }};
-            const auto encode_prefix_start = std::chrono::steady_clock::now();
-            if (!EncodeComputeBindings(command,
-                                       build_prefix_pipeline,
-                                       static_cast<NSUInteger>(matrix_words),
-                                       256,
-                                       buffers_2,
-                                       encode_error)) {
-                submission.error = encode_error;
-                return submission;
-            }
-            const double encode_prefix_us = std::chrono::duration<double, std::micro>(
-                                                std::chrono::steady_clock::now() - encode_prefix_start)
-                                                .count();
-
-            const std::array<BufferBinding, 4> buffers_3{{
-                {params_buffer, 0},
-                {prefix_buffer, 0},
-                {compress_input_buffer, 0},
-                {compressed_buffer, 0},
-            }};
-            const auto encode_compress_start = std::chrono::steady_clock::now();
-            if (!EncodeComputeBindings(command,
-                                       compress_prefix_pipeline,
-                                       static_cast<NSUInteger>(compressed_words),
-                                       256,
-                                       buffers_3,
-                                       encode_error)) {
-                submission.error = encode_error;
-                return submission;
-            }
-            const double encode_compress_us = std::chrono::duration<double, std::micro>(
-                                                  std::chrono::steady_clock::now() - encode_compress_start)
-                                                  .count();
-            state->encode_fused_prefix_compress_us = encode_prefix_us + encode_compress_us;
-        } else {
-            const NSUInteger block_elements = static_cast<NSUInteger>(request.b) * request.b;
-            const std::array<BufferBinding, 5> buffers_2{{
-                {params_buffer, 0},
-                {a_prime_buffer, 0},
-                {b_prime_buffer, 0},
-                {compress_input_buffer, 0},
-                {compressed_buffer, 0},
-            }};
-            const auto encode_fused_start = std::chrono::steady_clock::now();
-            if (!EncodeComputeThreadgroupsBindings(command,
-                                                   fused_prefix_compress_pipeline,
-                                                   static_cast<NSUInteger>(N),
-                                                   static_cast<NSUInteger>(N),
-                                                   block_elements,
-                                                   buffers_2,
-                                                   encode_error)) {
-                submission.error = encode_error;
-                return submission;
-            }
-            state->encode_fused_prefix_compress_us = std::chrono::duration<double, std::micro>(
-                                                         std::chrono::steady_clock::now() - encode_fused_start)
-                                                         .count();
-
-            const std::array<BufferBinding, 3> buffers_3{{
-                {compressed_buffer, 0},
-                {hash_params_buffer, 0},
-                {transcript_hash_buffer, 0},
-            }};
-            const auto encode_hash_start = std::chrono::steady_clock::now();
-            if (!EncodeComputeBindings(command,
-                                       context.transcript_sha256_pipeline,
-                                       1,
-                                       1,
-                                       buffers_3,
-                                       encode_error)) {
-                submission.error = encode_error;
-                return submission;
-            }
-            state->encode_transcript_sha256_us = std::chrono::duration<double, std::micro>(
-                                                     std::chrono::steady_clock::now() - encode_hash_start)
-                                                     .count();
+        if (!EncodeProductAndTileHashes(command,
+                                        context,
+                                        selection,
+                                        params_buffer,
+                                        BufferBinding{a_prime_buffer, 0},
+                                        BufferBinding{b_prime_buffer, 0},
+                                        BufferBinding{c_prime_buffer, 0},
+                                        BufferBinding{tile_hash_buffer, 0},
+                                        request.n,
+                                        request.b,
+                                        N,
+                                        state->encode_product_us,
+                                        state->encode_tile_hash_us,
+                                        encode_error)) {
+            submission.error = encode_error;
+            return submission;
         }
 
-        state->use_legacy_pipeline = use_legacy_pipeline;
-        state->use_product_digest = use_product_digest;
         state->n = request.n;
         state->b = request.b;
         state->N = N;
         state->sigma = request.sigma;
-        state->compressed_words = compressed_words;
-        state->compressed_buffer = compressed_buffer;
-        state->transcript_hash_buffer = transcript_hash_buffer;
+        state->tile_hash_buffer = tile_hash_buffer;
 
         RecordAsyncSubmissionStart(context, state);
         const auto submit_wait_start = std::chrono::steady_clock::now();
@@ -3309,33 +2646,17 @@ MatMulDigestSubmission SubmitCanonicalTranscriptDigest(const MatMulDigestRequest
                 }
 
                 const auto finalize_start = std::chrono::steady_clock::now();
-                if (state->use_product_digest) {
-                    if (!FinalizeProductCommittedDigestFromFinalSliceBuffer(
-                            state->compressed_buffer,
-                            /*word_offset=*/0,
-                            state->N,
-                            state->n,
-                            state->b,
-                            state->sigma,
-                            state->result.digest,
-                            state->result.error)) {
-                        state->result.success = false;
-                        FinalizeAsyncSubmissionState(state, "profiling_samples_ready_async_error");
-                        return;
-                    }
-                } else if (state->use_legacy_pipeline) {
-                    const uint32_t* compressed_ptr = static_cast<const uint32_t*>(state->compressed_buffer.contents);
-                    CHash256 hasher;
-                    for (uint64_t idx = 0; idx < state->compressed_words; ++idx) {
-                        uint8_t le[4];
-                        WriteLE32(le, compressed_ptr[idx]);
-                        hasher.Write(le);
-                    }
-                    hasher.Finalize(state->result.digest);
-                } else {
-                    std::array<unsigned char, 32> digest_bytes{};
-                    std::memcpy(digest_bytes.data(), state->transcript_hash_buffer.contents, digest_bytes.size());
-                    state->result.digest = uint256{Span<const unsigned char>{digest_bytes.data(), digest_bytes.size()}};
+                if (!FinalizeProductDigestFromTileHashBytes(
+                        static_cast<const unsigned char*>(state->tile_hash_buffer.contents),
+                        state->N,
+                        state->n,
+                        state->b,
+                        state->sigma,
+                        state->result.digest,
+                        state->result.error)) {
+                    state->result.success = false;
+                    FinalizeAsyncSubmissionState(state, "profiling_samples_ready_async_error");
+                    return;
                 }
                 state->cpu_finalize_us = std::chrono::duration<double, std::micro>(
                                              std::chrono::steady_clock::now() - finalize_start)
@@ -3400,22 +2721,18 @@ MatMulDigestBatchSubmission SubmitCanonicalTranscriptDigestBatch(const MatMulDig
         submission.error = "invalid MatMul batch request: batch_size must be non-zero";
         return submission;
     }
-    const bool use_product_digest = request.digest_mode == MatMulDigestMode::PRODUCT_COMMITTED;
-    if (use_product_digest && request.sigmas == nullptr) {
-        submission.error = "invalid MatMul batch request: missing per-batch sigma values";
+    if (!ValidateDigestMode(request.digest_mode, submission.error)) {
         return submission;
     }
     if (request.noise_e_l == nullptr || request.noise_e_r == nullptr ||
-        request.noise_f_l == nullptr || request.noise_f_r == nullptr ||
-        request.compress_vec == nullptr) {
+        request.noise_f_l == nullptr || request.noise_f_r == nullptr) {
         submission.error = "invalid MatMul batch request: missing batch input pointers";
         return submission;
     }
 
     for (uint32_t i = 0; i < request.batch_size; ++i) {
         if (request.noise_e_l[i] == nullptr || request.noise_e_r[i] == nullptr ||
-            request.noise_f_l[i] == nullptr || request.noise_f_r[i] == nullptr ||
-            request.compress_vec[i] == nullptr) {
+            request.noise_f_l[i] == nullptr || request.noise_f_r[i] == nullptr) {
             submission.error = "invalid MatMul batch request: null per-batch input pointer";
             return submission;
         }
@@ -3426,7 +2743,7 @@ MatMulDigestBatchSubmission SubmitCanonicalTranscriptDigestBatch(const MatMulDig
         .b = request.b,
         .r = request.r,
         .digest_mode = request.digest_mode,
-        .sigma = use_product_digest ? request.sigmas[0] : uint256{},
+        .sigma = request.sigmas != nullptr ? request.sigmas[0] : uint256{},
         .matrix_a = request.matrix_a,
         .matrix_b = request.matrix_b,
         .use_uploaded_base_matrices = request.use_uploaded_base_matrices,
@@ -3434,72 +2751,30 @@ MatMulDigestBatchSubmission SubmitCanonicalTranscriptDigestBatch(const MatMulDig
         .noise_e_r = request.noise_e_r[0],
         .noise_f_l = request.noise_f_l[0],
         .noise_f_r = request.noise_f_r[0],
-        .compress_vec = request.compress_vec[0],
     };
 
-    uint32_t N{0};
-    uint64_t matrix_words{0};
-    uint64_t noise_words{0};
-    uint64_t prefix_words{0};
-    uint64_t compressed_words{0};
-    if (!BuildKernelParams(validation_request, N, matrix_words, noise_words, prefix_words, compressed_words, submission.error)) {
+    ShapeParams shape;
+    if (!BuildKernelParams(validation_request, shape, submission.error)) {
         return submission;
     }
-
-    struct KernelParams {
-        uint32_t n;
-        uint32_t b;
-        uint32_t r;
-        uint32_t N;
-    } params{request.n, request.b, request.r, N};
-    struct HashParams {
-        uint32_t compressed_words;
-    } hash_params{static_cast<uint32_t>(compressed_words)};
-    const SpecializedKernelPipelines* specialized = nullptr;
-    if (ShouldUseFunctionConstantSpecialization(request.n, /*use_legacy_pipeline=*/use_product_digest)) {
-        specialized = FindSpecializedPipelines(context, request.n, request.b, request.r, N);
-    }
-    id<MTLComputePipelineState> build_perturbed_pipeline =
-        (specialized != nullptr && specialized->build_perturbed_pipeline != nil)
-            ? specialized->build_perturbed_pipeline
-            : context.build_perturbed_pipeline;
-    id<MTLComputePipelineState> fused_prefix_compress_pipeline =
-        (specialized != nullptr && specialized->fused_prefix_compress_pipeline != nil)
-            ? specialized->fused_prefix_compress_pipeline
-            : context.fused_prefix_compress_pipeline;
+    const uint32_t N = shape.N;
+    const KernelParamsHost params{request.n, request.b, request.r, N};
+    const ProductPipelineSelection selection = SelectProductPipelines(context, request.n, request.b, request.r, N);
 
     auto state = std::make_shared<AsyncBatchDigestState>();
     state->result.available = true;
     state->batch_size = request.batch_size;
 
     @autoreleasepool {
-        const size_t matrix_bytes = matrix_words * sizeof(uint32_t);
-        const size_t noise_bytes = noise_words * sizeof(uint32_t);
-        const size_t compress_bytes = static_cast<size_t>(request.b) * request.b * sizeof(uint32_t);
-        const size_t prefix_bytes = prefix_words * sizeof(uint32_t);
-        const size_t compressed_bytes = compressed_words * sizeof(uint32_t);
-        constexpr size_t kHashBytesPerDigest = 32;
-        const size_t staged_matrix_bytes = use_product_digest
-            ? static_cast<size_t>(request.batch_size) * matrix_bytes
-            : matrix_bytes;
-        const size_t staged_noise_bytes = static_cast<size_t>(request.batch_size) * noise_bytes;
-        const size_t staged_compress_bytes = static_cast<size_t>(request.batch_size) * compress_bytes;
-        const size_t staged_prefix_bytes = prefix_bytes;
-        const size_t staged_compressed_bytes = use_product_digest
-            ? static_cast<size_t>(request.batch_size) * compressed_bytes
-            : compressed_bytes;
-        const size_t hash_bytes = static_cast<size_t>(request.batch_size) * kHashBytesPerDigest;
+        const PoolRequirements per_attempt = MakePoolRequirements(request.n, request.b, request.r, shape, 1);
+        const size_t matrix_bytes = per_attempt.matrix_bytes;
+        const size_t noise_bytes = per_attempt.noise_bytes;
+        const size_t tile_hash_bytes = per_attempt.tile_hash_bytes;
 
-        auto pool_lease = AcquireBufferPoolLease(context,
-                                                 validation_request,
-                                                 staged_matrix_bytes,
-                                                 staged_noise_bytes,
-                                                 staged_compress_bytes,
-                                                 staged_prefix_bytes,
-                                                 staged_compressed_bytes,
-                                                 hash_bytes,
-                                                 /*require_prefix_buffer=*/false,
-                                                 submission.error);
+        // The base matrices are shared across the batch (one staged copy); the
+        // perturbed operands, C' and tile hashes get a private region per item.
+        PoolRequirements pool_req = MakePoolRequirements(request.n, request.b, request.r, shape, request.batch_size);
+        auto pool_lease = AcquireBufferPoolLease(context, pool_req, submission.error);
         if (!pool_lease.has_value()) {
             return submission;
         }
@@ -3507,19 +2782,17 @@ MatMulDigestBatchSubmission SubmitCanonicalTranscriptDigestBatch(const MatMulDig
 
         MetalPoolSlot& pool_slot = *state->lease->slot;
         id<MTLBuffer> params_buffer = pool_slot.params_buffer;
-        id<MTLBuffer> hash_params_buffer = pool_slot.hash_params_buffer;
         id<MTLBuffer> matrix_a_buffer = pool_slot.matrix_a_stage_buffer;
         id<MTLBuffer> matrix_b_buffer = pool_slot.matrix_b_stage_buffer;
         id<MTLBuffer> e_l_stage_buffer = pool_slot.e_l_buffer;
         id<MTLBuffer> e_r_stage_buffer = pool_slot.e_r_buffer;
         id<MTLBuffer> f_l_stage_buffer = pool_slot.f_l_buffer;
         id<MTLBuffer> f_r_stage_buffer = pool_slot.f_r_buffer;
-        id<MTLBuffer> compress_stage_buffer = pool_slot.compress_buffer;
         id<MTLBuffer> a_prime_buffer = pool_slot.a_prime_buffer;
         id<MTLBuffer> b_prime_buffer = pool_slot.b_prime_buffer;
-        id<MTLBuffer> compressed_buffer = pool_slot.compressed_buffer;
-        id<MTLBuffer> transcript_hash_buffer = pool_slot.transcript_hash_buffer;
-        state->retained_inputs = CreateRetainedInputArray(static_cast<CFIndex>(request.batch_size * 5 + 2));
+        id<MTLBuffer> c_prime_buffer = pool_slot.c_prime_buffer;
+        id<MTLBuffer> tile_hash_buffer = pool_slot.tile_hash_buffer;
+        state->retained_inputs = CreateRetainedInputArray(static_cast<CFIndex>(request.batch_size * 4 + 2));
 
         if (request.use_uploaded_base_matrices) {
             std::lock_guard<std::mutex> lock(context.resident_base_mutex);
@@ -3545,7 +2818,6 @@ MatMulDigestBatchSubmission SubmitCanonicalTranscriptDigestBatch(const MatMulDig
         }
 
         std::memcpy(params_buffer.contents, &params, sizeof(params));
-        std::memcpy(hash_params_buffer.contents, &hash_params, sizeof(hash_params));
         id<MTLCommandBuffer> command = CreatePerformanceCommandBuffer(pool_slot.queue);
         if (command == nil) {
             submission.error = "Failed to create Metal command buffer";
@@ -3553,8 +2825,6 @@ MatMulDigestBatchSubmission SubmitCanonicalTranscriptDigestBatch(const MatMulDig
         }
 
         std::string encode_error;
-        const NSUInteger block_elements = static_cast<NSUInteger>(request.b) * request.b;
-
         for (uint32_t i = 0; i < request.batch_size; ++i) {
             auto make_input_binding = [&](const matmul::field::Element* source,
                                           id<MTLBuffer> staging_buffer,
@@ -3578,14 +2848,12 @@ MatMulDigestBatchSubmission SubmitCanonicalTranscriptDigestBatch(const MatMulDig
             const BufferBinding e_r_input = make_input_binding(request.noise_e_r[i], e_r_stage_buffer, noise_bytes, i);
             const BufferBinding f_l_input = make_input_binding(request.noise_f_l[i], f_l_stage_buffer, noise_bytes, i);
             const BufferBinding f_r_input = make_input_binding(request.noise_f_r[i], f_r_stage_buffer, noise_bytes, i);
-            const BufferBinding compress_input = make_input_binding(request.compress_vec[i], compress_stage_buffer, compress_bytes, i);
-            if (e_l_input.buffer == nil || e_r_input.buffer == nil || f_l_input.buffer == nil ||
-                f_r_input.buffer == nil || compress_input.buffer == nil) {
+            if (e_l_input.buffer == nil || e_r_input.buffer == nil || f_l_input.buffer == nil || f_r_input.buffer == nil) {
                 submission.error = "Failed to allocate Metal batch input buffers";
                 return submission;
             }
-            const size_t matrix_offset = use_product_digest ? static_cast<size_t>(i) * matrix_bytes : 0;
-            const size_t compressed_offset = use_product_digest ? static_cast<size_t>(i) * compressed_bytes : 0;
+            const NSUInteger matrix_offset = static_cast<NSUInteger>(static_cast<size_t>(i) * matrix_bytes);
+            const NSUInteger tile_hash_offset = static_cast<NSUInteger>(static_cast<size_t>(i) * tile_hash_bytes);
 
             const std::array<BufferBinding, 9> buffers_1{{
                 {params_buffer, 0},
@@ -3595,13 +2863,13 @@ MatMulDigestBatchSubmission SubmitCanonicalTranscriptDigestBatch(const MatMulDig
                 e_r_input,
                 f_l_input,
                 f_r_input,
-                {a_prime_buffer, static_cast<NSUInteger>(matrix_offset)},
-                {b_prime_buffer, static_cast<NSUInteger>(matrix_offset)},
+                {a_prime_buffer, matrix_offset},
+                {b_prime_buffer, matrix_offset},
             }};
             const auto encode_build_start = std::chrono::steady_clock::now();
             if (!EncodeComputeBindings(command,
-                                       build_perturbed_pipeline,
-                                       static_cast<NSUInteger>(matrix_words),
+                                       selection.build_perturbed,
+                                       static_cast<NSUInteger>(shape.matrix_words),
                                        256,
                                        buffers_1,
                                        encode_error)) {
@@ -3612,86 +2880,35 @@ MatMulDigestBatchSubmission SubmitCanonicalTranscriptDigestBatch(const MatMulDig
                                                     std::chrono::steady_clock::now() - encode_build_start)
                                                     .count();
 
-            if (use_product_digest) {
-                const std::array<BufferBinding, 5> buffers_2{{
-                    {params_buffer, 0},
-                    {a_prime_buffer, static_cast<NSUInteger>(matrix_offset)},
-                    {b_prime_buffer, static_cast<NSUInteger>(matrix_offset)},
-                    compress_input,
-                    {compressed_buffer, static_cast<NSUInteger>(compressed_offset)},
-                }};
-                const auto encode_product_start = std::chrono::steady_clock::now();
-                if (!EncodeComputeThreadgroupsBindings(command,
-                                           fused_prefix_compress_pipeline,
-                                           static_cast<NSUInteger>(N),
-                                           static_cast<NSUInteger>(N),
-                                           block_elements,
-                                           buffers_2,
-                                           encode_error)) {
-                    submission.error = encode_error;
-                    return submission;
-                }
-                state->encode_fused_prefix_compress_us += std::chrono::duration<double, std::micro>(
-                                                             std::chrono::steady_clock::now() - encode_product_start)
-                                                             .count();
-            } else {
-                const std::array<BufferBinding, 5> buffers_2{{
-                    {params_buffer, 0},
-                    {a_prime_buffer, 0},
-                    {b_prime_buffer, 0},
-                    compress_input,
-                    {compressed_buffer, 0},
-                }};
-                const auto encode_fused_start = std::chrono::steady_clock::now();
-                if (!EncodeComputeThreadgroupsBindings(command,
-                                                       fused_prefix_compress_pipeline,
-                                                       static_cast<NSUInteger>(N),
-                                                       static_cast<NSUInteger>(N),
-                                                       block_elements,
-                                                       buffers_2,
-                                                       encode_error)) {
-                    submission.error = encode_error;
-                    return submission;
-                }
-                state->encode_fused_prefix_compress_us += std::chrono::duration<double, std::micro>(
-                                                              std::chrono::steady_clock::now() - encode_fused_start)
-                                                              .count();
-
-                id<MTLComputeCommandEncoder> hash_encoder = [command computeCommandEncoder];
-                if (hash_encoder == nil) {
-                    submission.error = "Failed to create Metal compute encoder";
-                    return submission;
-                }
-                [hash_encoder setComputePipelineState:context.transcript_sha256_pipeline];
-                const std::array<BufferBinding, 3> hash_bindings{{
-                    {compressed_buffer, 0},
-                    {hash_params_buffer, 0},
-                    {transcript_hash_buffer, static_cast<NSUInteger>(i) * kHashBytesPerDigest},
-                }};
-                SetEncoderBindings(hash_encoder, hash_bindings);
-
-                const NSUInteger hash_group_size = SelectThreadGroupSize(context.transcript_sha256_pipeline, 1);
-                const MTLSize hash_grid = MTLSizeMake(1, 1, 1);
-                const MTLSize hash_group = MTLSizeMake(hash_group_size, 1, 1);
-                const auto encode_hash_start = std::chrono::steady_clock::now();
-                [hash_encoder dispatchThreads:hash_grid threadsPerThreadgroup:hash_group];
-                [hash_encoder endEncoding];
-                state->encode_transcript_sha256_us += std::chrono::duration<double, std::micro>(
-                                                          std::chrono::steady_clock::now() - encode_hash_start)
-                                                          .count();
+            if (!EncodeProductAndTileHashes(command,
+                                            context,
+                                            selection,
+                                            params_buffer,
+                                            BufferBinding{a_prime_buffer, matrix_offset},
+                                            BufferBinding{b_prime_buffer, matrix_offset},
+                                            BufferBinding{c_prime_buffer, matrix_offset},
+                                            BufferBinding{tile_hash_buffer, tile_hash_offset},
+                                            request.n,
+                                            request.b,
+                                            N,
+                                            state->encode_product_us,
+                                            state->encode_tile_hash_us,
+                                            encode_error)) {
+                submission.error = encode_error;
+                return submission;
             }
         }
 
-        state->use_product_digest = use_product_digest;
         state->n = request.n;
         state->b = request.b;
         state->N = N;
-        state->compressed_words = compressed_words;
-        if (use_product_digest) {
+        state->tile_hash_bytes_per_item = tile_hash_bytes;
+        if (request.sigmas != nullptr) {
             state->sigmas.assign(request.sigmas, request.sigmas + request.batch_size);
+        } else {
+            state->sigmas.assign(request.batch_size, uint256{});
         }
-        state->compressed_buffer = compressed_buffer;
-        state->transcript_hash_buffer = transcript_hash_buffer;
+        state->tile_hash_buffer = tile_hash_buffer;
 
         RecordAsyncSubmissionStart(context, state);
         const auto submit_wait_start = std::chrono::steady_clock::now();
@@ -3713,34 +2930,26 @@ MatMulDigestBatchSubmission SubmitCanonicalTranscriptDigestBatch(const MatMulDig
 
                 const auto finalize_start = std::chrono::steady_clock::now();
                 state->result.digests.reserve(state->batch_size);
-                if (state->use_product_digest) {
-                    for (uint32_t i = 0; i < state->batch_size; ++i) {
-                        uint256 digest;
-                        std::string finalize_error;
-                        if (!FinalizeProductCommittedDigestFromFinalSliceBuffer(
-                                state->compressed_buffer,
-                                static_cast<size_t>(i) * state->compressed_words,
-                                state->N,
-                                state->n,
-                                state->b,
-                                state->sigmas[i],
-                                digest,
-                                finalize_error)) {
-                            state->result.success = false;
-                            state->result.error = finalize_error;
-                            FinalizeAsyncSubmissionState(state, "profiling_samples_ready_batch_async_error");
-                            return;
-                        }
-                        state->result.digests.push_back(digest);
+                const auto* tile_hash_bytes_ptr = static_cast<const unsigned char*>(state->tile_hash_buffer.contents);
+                for (uint32_t i = 0; i < state->batch_size; ++i) {
+                    uint256 digest;
+                    std::string finalize_error;
+                    if (!FinalizeProductDigestFromTileHashBytes(
+                            tile_hash_bytes_ptr == nullptr
+                                ? nullptr
+                                : tile_hash_bytes_ptr + static_cast<size_t>(i) * state->tile_hash_bytes_per_item,
+                            state->N,
+                            state->n,
+                            state->b,
+                            state->sigmas[i],
+                            digest,
+                            finalize_error)) {
+                        state->result.success = false;
+                        state->result.error = finalize_error;
+                        FinalizeAsyncSubmissionState(state, "profiling_samples_ready_batch_async_error");
+                        return;
                     }
-                } else {
-                    const auto* hash_ptr = static_cast<const unsigned char*>(state->transcript_hash_buffer.contents);
-                    for (uint32_t i = 0; i < state->batch_size; ++i) {
-                        state->result.digests.emplace_back(Span<const unsigned char>{
-                            hash_ptr + (static_cast<size_t>(i) * kHashBytesPerDigest),
-                            kHashBytesPerDigest,
-                        });
-                    }
+                    state->result.digests.push_back(digest);
                 }
                 state->cpu_finalize_us = std::chrono::duration<double, std::micro>(
                                              std::chrono::steady_clock::now() - finalize_start)
@@ -3807,8 +3016,10 @@ MatMulDigestBatchResult ComputeCanonicalTranscriptDigestVariableBaseBatch(
         result.error = "invalid Metal variable-base batch request: batch_size must be non-zero";
         return result;
     }
-    const bool use_product_digest = request.digest_mode == MatMulDigestMode::PRODUCT_COMMITTED;
-    if (use_product_digest && request.sigmas == nullptr) {
+    if (!ValidateDigestMode(request.digest_mode, result.error)) {
+        return result;
+    }
+    if (request.sigmas == nullptr) {
         result.error = "invalid Metal variable-base batch request: missing per-batch sigma values";
         return result;
     }
@@ -3817,65 +3028,25 @@ MatMulDigestBatchResult ComputeCanonicalTranscriptDigestVariableBaseBatch(
         return result;
     }
     if (request.noise_e_l == nullptr || request.noise_e_r == nullptr ||
-        request.noise_f_l == nullptr || request.noise_f_r == nullptr ||
-        request.compress_vec == nullptr) {
+        request.noise_f_l == nullptr || request.noise_f_r == nullptr) {
         result.error = "invalid Metal variable-base batch request: missing batch input pointers";
         return result;
     }
     for (uint32_t i = 0; i < request.batch_size; ++i) {
         if (request.noise_e_l[i] == nullptr || request.noise_e_r[i] == nullptr ||
-            request.noise_f_l[i] == nullptr || request.noise_f_r[i] == nullptr ||
-            request.compress_vec[i] == nullptr) {
+            request.noise_f_l[i] == nullptr || request.noise_f_r[i] == nullptr) {
             result.error = "invalid Metal variable-base batch request: null per-batch input pointer";
             return result;
         }
     }
 
-    uint32_t N{0};
-    uint64_t matrix_words{0};
-    uint64_t noise_words{0};
-    uint64_t prefix_words{0};
-    uint64_t compressed_words{0};
-    if (!BuildKernelParamsForShape(
-            request.n,
-            request.b,
-            request.r,
-            N,
-            matrix_words,
-            noise_words,
-            prefix_words,
-            compressed_words,
-            result.error)) {
+    ShapeParams shape;
+    if (!BuildKernelParamsForShape(request.n, request.b, request.r, shape, result.error)) {
         return result;
     }
-    (void)prefix_words;
-
-    struct KernelParams {
-        uint32_t n;
-        uint32_t b;
-        uint32_t r;
-        uint32_t N;
-    } params{request.n, request.b, request.r, N};
-    struct HashParams {
-        uint32_t compressed_words;
-    } hash_params{static_cast<uint32_t>(compressed_words)};
-
-    const SpecializedKernelPipelines* specialized = nullptr;
-    if (ShouldUseFunctionConstantSpecialization(request.n, /*use_legacy_pipeline=*/use_product_digest)) {
-        specialized = FindSpecializedPipelines(context, request.n, request.b, request.r, N);
-    }
-    id<MTLComputePipelineState> build_perturbed_pipeline =
-        (specialized != nullptr && specialized->build_perturbed_pipeline != nil)
-            ? specialized->build_perturbed_pipeline
-            : context.build_perturbed_pipeline;
-    id<MTLComputePipelineState> fused_final_compress_pipeline =
-        (specialized != nullptr && specialized->fused_final_compress_pipeline != nil)
-            ? specialized->fused_final_compress_pipeline
-            : context.fused_final_compress_pipeline;
-    id<MTLComputePipelineState> fused_prefix_compress_pipeline =
-        (specialized != nullptr && specialized->fused_prefix_compress_pipeline != nil)
-            ? specialized->fused_prefix_compress_pipeline
-            : context.fused_prefix_compress_pipeline;
+    const uint32_t N = shape.N;
+    const KernelParamsHost params{request.n, request.b, request.r, N};
+    const ProductPipelineSelection selection = SelectProductPipelines(context, request.n, request.b, request.r, N);
 
     struct ScopedPoolSubmissionAccounting {
         MetalContext& context;
@@ -3897,46 +3068,13 @@ MatMulDigestBatchResult ComputeCanonicalTranscriptDigestVariableBaseBatch(
     };
 
     @autoreleasepool {
-        const size_t matrix_bytes = matrix_words * sizeof(uint32_t);
-        const size_t noise_bytes = noise_words * sizeof(uint32_t);
-        const size_t compress_bytes = static_cast<size_t>(request.b) * request.b * sizeof(uint32_t);
-        constexpr size_t kHashBytesPerDigest = 32;
-        const size_t product_words = static_cast<size_t>(N) * N;
-        const size_t staged_matrix_bytes = static_cast<size_t>(request.batch_size) * matrix_bytes;
-        const size_t staged_noise_bytes = static_cast<size_t>(request.batch_size) * noise_bytes;
-        const size_t staged_compress_bytes = static_cast<size_t>(request.batch_size) * compress_bytes;
-        const size_t staged_compressed_bytes = use_product_digest
-            ? static_cast<size_t>(request.batch_size) * product_words * sizeof(uint32_t)
-            : compressed_words * sizeof(uint32_t);
-        const size_t hash_bytes = static_cast<size_t>(request.batch_size) * kHashBytesPerDigest;
+        const PoolRequirements per_attempt = MakePoolRequirements(request.n, request.b, request.r, shape, 1);
+        const size_t matrix_bytes = per_attempt.matrix_bytes;
+        const size_t noise_bytes = per_attempt.noise_bytes;
+        const size_t tile_hash_bytes = per_attempt.tile_hash_bytes;
 
-        matmul::field::Element dummy_word{0};
-        MatMulDigestRequest pool_request{
-            .n = request.n,
-            .b = request.b,
-            .r = request.r,
-            .digest_mode = request.digest_mode,
-            .sigma = use_product_digest ? request.sigmas[0] : uint256{},
-            .matrix_a = &dummy_word,
-            .matrix_b = &dummy_word,
-            .use_uploaded_base_matrices = false,
-            .noise_e_l = request.noise_e_l[0],
-            .noise_e_r = request.noise_e_r[0],
-            .noise_f_l = request.noise_f_l[0],
-            .noise_f_r = request.noise_f_r[0],
-            .compress_vec = request.compress_vec[0],
-        };
-
-        auto pool_lease = AcquireBufferPoolLease(context,
-                                                 pool_request,
-                                                 staged_matrix_bytes,
-                                                 staged_noise_bytes,
-                                                 staged_compress_bytes,
-                                                 /*prefix_bytes=*/0,
-                                                 staged_compressed_bytes,
-                                                 hash_bytes,
-                                                 /*require_prefix_buffer=*/false,
-                                                 result.error);
+        const PoolRequirements pool_req = MakePoolRequirements(request.n, request.b, request.r, shape, request.batch_size);
+        auto pool_lease = AcquireBufferPoolLease(context, pool_req, result.error);
         if (!pool_lease.has_value()) {
             return result;
         }
@@ -3944,18 +3082,16 @@ MatMulDigestBatchResult ComputeCanonicalTranscriptDigestVariableBaseBatch(
 
         MetalPoolSlot& pool_slot = *pool_lease->slot;
         id<MTLBuffer> params_buffer = pool_slot.params_buffer;
-        id<MTLBuffer> hash_params_buffer = pool_slot.hash_params_buffer;
         id<MTLBuffer> matrix_a_buffer = pool_slot.matrix_a_stage_buffer;
         id<MTLBuffer> matrix_b_buffer = pool_slot.matrix_b_stage_buffer;
         id<MTLBuffer> e_l_stage_buffer = pool_slot.e_l_buffer;
         id<MTLBuffer> e_r_stage_buffer = pool_slot.e_r_buffer;
         id<MTLBuffer> f_l_stage_buffer = pool_slot.f_l_buffer;
         id<MTLBuffer> f_r_stage_buffer = pool_slot.f_r_buffer;
-        id<MTLBuffer> compress_stage_buffer = pool_slot.compress_buffer;
         id<MTLBuffer> a_prime_buffer = pool_slot.a_prime_buffer;
         id<MTLBuffer> b_prime_buffer = pool_slot.b_prime_buffer;
-        id<MTLBuffer> compressed_buffer = pool_slot.compressed_buffer;
-        id<MTLBuffer> transcript_hash_buffer = pool_slot.transcript_hash_buffer;
+        id<MTLBuffer> c_prime_buffer = pool_slot.c_prime_buffer;
+        id<MTLBuffer> tile_hash_buffer = pool_slot.tile_hash_buffer;
         const size_t seed_bytes = static_cast<size_t>(request.batch_size) * 2 * uint256::size();
         id<MTLBuffer> seed_stage_buffer = [context.device newBufferWithLength:seed_bytes
                                                                        options:MTLResourceStorageModeShared];
@@ -3974,7 +3110,6 @@ MatMulDigestBatchResult ComputeCanonicalTranscriptDigestVariableBaseBatch(
         }
 
         std::memcpy(params_buffer.contents, &params, sizeof(params));
-        std::memcpy(hash_params_buffer.contents, &hash_params, sizeof(hash_params));
         id<MTLCommandBuffer> command = CreatePerformanceCommandBuffer(pool_slot.queue);
         if (command == nil) {
             result.error = "Failed to create Metal variable-base command buffer";
@@ -3984,40 +3119,21 @@ MatMulDigestBatchResult ComputeCanonicalTranscriptDigestVariableBaseBatch(
         std::string encode_error;
         double encode_generate_base_us{0.0};
         double encode_build_perturbed_us{0.0};
-        double encode_fused_prefix_compress_us{0.0};
-        double encode_transcript_sha256_us{0.0};
-        const NSUInteger block_elements = static_cast<NSUInteger>(request.b) * request.b;
-
-        auto encode_generate_base = [&](size_t seed_offset,
-                                        id<MTLBuffer> output_buffer,
-                                        size_t output_offset) -> bool {
-            id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-            if (encoder == nil) {
-                encode_error = "Failed to create Metal variable-base matrix generation encoder";
-                return false;
-            }
-            [encoder setComputePipelineState:context.generate_base_matrix_pipeline];
-            [encoder setBuffer:params_buffer offset:0 atIndex:0];
-            [encoder setBuffer:seed_stage_buffer offset:static_cast<NSUInteger>(seed_offset) atIndex:1];
-            [encoder setBuffer:output_buffer offset:static_cast<NSUInteger>(output_offset) atIndex:2];
-            const NSUInteger group_size = SelectThreadGroupSize(context.generate_base_matrix_pipeline, 256);
-            [encoder dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(matrix_words), 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(group_size, 1, 1)];
-            [encoder endEncoding];
-            return true;
-        };
+        double encode_product_us{0.0};
+        double encode_tile_hash_us{0.0};
 
         for (uint32_t i = 0; i < request.batch_size; ++i) {
             const size_t matrix_offset = static_cast<size_t>(i) * matrix_bytes;
             const size_t noise_offset = static_cast<size_t>(i) * noise_bytes;
-            const size_t compress_offset = static_cast<size_t>(i) * compress_bytes;
-            const size_t compressed_offset = use_product_digest
-                ? static_cast<size_t>(i) * product_words * sizeof(uint32_t)
-                : 0;
+            const size_t tile_hash_offset = static_cast<size_t>(i) * tile_hash_bytes;
 
             const auto encode_base_start = std::chrono::steady_clock::now();
-            if (!encode_generate_base(static_cast<size_t>(i) * 2 * uint256::size(), matrix_a_buffer, matrix_offset) ||
-                !encode_generate_base((static_cast<size_t>(i) * 2 + 1) * uint256::size(), matrix_b_buffer, matrix_offset)) {
+            if (!EncodeGenerateBaseMatrix(command, context, params_buffer, seed_stage_buffer,
+                                          static_cast<size_t>(i) * 2 * uint256::size(),
+                                          matrix_a_buffer, matrix_offset, shape.matrix_words, encode_error) ||
+                !EncodeGenerateBaseMatrix(command, context, params_buffer, seed_stage_buffer,
+                                          (static_cast<size_t>(i) * 2 + 1) * uint256::size(),
+                                          matrix_b_buffer, matrix_offset, shape.matrix_words, encode_error)) {
                 result.error = encode_error;
                 return result;
             }
@@ -4029,7 +3145,6 @@ MatMulDigestBatchResult ComputeCanonicalTranscriptDigestVariableBaseBatch(
             std::memcpy(static_cast<unsigned char*>(e_r_stage_buffer.contents) + noise_offset, request.noise_e_r[i], noise_bytes);
             std::memcpy(static_cast<unsigned char*>(f_l_stage_buffer.contents) + noise_offset, request.noise_f_l[i], noise_bytes);
             std::memcpy(static_cast<unsigned char*>(f_r_stage_buffer.contents) + noise_offset, request.noise_f_r[i], noise_bytes);
-            std::memcpy(static_cast<unsigned char*>(compress_stage_buffer.contents) + compress_offset, request.compress_vec[i], compress_bytes);
 
             const std::array<BufferBinding, 9> build_bindings{{
                 {params_buffer, 0},
@@ -4044,8 +3159,8 @@ MatMulDigestBatchResult ComputeCanonicalTranscriptDigestVariableBaseBatch(
             }};
             const auto encode_build_start = std::chrono::steady_clock::now();
             if (!EncodeComputeBindings(command,
-                                       build_perturbed_pipeline,
-                                       static_cast<NSUInteger>(matrix_words),
+                                       selection.build_perturbed,
+                                       static_cast<NSUInteger>(shape.matrix_words),
                                        256,
                                        build_bindings,
                                        encode_error)) {
@@ -4056,49 +3171,22 @@ MatMulDigestBatchResult ComputeCanonicalTranscriptDigestVariableBaseBatch(
                                              std::chrono::steady_clock::now() - encode_build_start)
                                              .count();
 
-            const std::array<BufferBinding, 5> compress_bindings{{
-                {params_buffer, 0},
-                {a_prime_buffer, static_cast<NSUInteger>(matrix_offset)},
-                {b_prime_buffer, static_cast<NSUInteger>(matrix_offset)},
-                {compress_stage_buffer, static_cast<NSUInteger>(compress_offset)},
-                {compressed_buffer, static_cast<NSUInteger>(compressed_offset)},
-            }};
-            const auto encode_compress_start = std::chrono::steady_clock::now();
-            if (!EncodeComputeThreadgroupsBindings(command,
-                                                   use_product_digest ? fused_final_compress_pipeline : fused_prefix_compress_pipeline,
-                                                   static_cast<NSUInteger>(N),
-                                                   static_cast<NSUInteger>(N),
-                                                   block_elements,
-                                                   compress_bindings,
-                                                   encode_error)) {
+            if (!EncodeProductAndTileHashes(command,
+                                            context,
+                                            selection,
+                                            params_buffer,
+                                            BufferBinding{a_prime_buffer, static_cast<NSUInteger>(matrix_offset)},
+                                            BufferBinding{b_prime_buffer, static_cast<NSUInteger>(matrix_offset)},
+                                            BufferBinding{c_prime_buffer, static_cast<NSUInteger>(matrix_offset)},
+                                            BufferBinding{tile_hash_buffer, static_cast<NSUInteger>(tile_hash_offset)},
+                                            request.n,
+                                            request.b,
+                                            N,
+                                            encode_product_us,
+                                            encode_tile_hash_us,
+                                            encode_error)) {
                 result.error = encode_error;
                 return result;
-            }
-            encode_fused_prefix_compress_us += std::chrono::duration<double, std::micro>(
-                                                   std::chrono::steady_clock::now() - encode_compress_start)
-                                                   .count();
-
-            if (!use_product_digest) {
-                id<MTLComputeCommandEncoder> hash_encoder = [command computeCommandEncoder];
-                if (hash_encoder == nil) {
-                    result.error = "Failed to create Metal variable-base hash encoder";
-                    return result;
-                }
-                [hash_encoder setComputePipelineState:context.transcript_sha256_pipeline];
-                const std::array<BufferBinding, 3> hash_bindings{{
-                    {compressed_buffer, 0},
-                    {hash_params_buffer, 0},
-                    {transcript_hash_buffer, static_cast<NSUInteger>(i) * kHashBytesPerDigest},
-                }};
-                SetEncoderBindings(hash_encoder, hash_bindings);
-                const NSUInteger hash_group_size = SelectThreadGroupSize(context.transcript_sha256_pipeline, 1);
-                const auto encode_hash_start = std::chrono::steady_clock::now();
-                [hash_encoder dispatchThreads:MTLSizeMake(1, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(hash_group_size, 1, 1)];
-                [hash_encoder endEncoding];
-                encode_transcript_sha256_us += std::chrono::duration<double, std::micro>(
-                                                   std::chrono::steady_clock::now() - encode_hash_start)
-                                                   .count();
             }
         }
 
@@ -4118,38 +3206,25 @@ MatMulDigestBatchResult ComputeCanonicalTranscriptDigestVariableBaseBatch(
 
         const auto finalize_start = std::chrono::steady_clock::now();
         result.digests.reserve(request.batch_size);
-        if (use_product_digest) {
-            for (uint32_t i = 0; i < request.batch_size; ++i) {
-                uint256 digest;
-                std::string finalize_error;
-                if (!FinalizeProductCommittedDigestFromContiguousWordsBuffer(
-                        compressed_buffer,
-                        static_cast<size_t>(i) * product_words,
-                        N,
-                        request.n,
-                        request.b,
-                        request.sigmas[i],
-                        digest,
-                        finalize_error)) {
-                    result.success = false;
-                    result.error = finalize_error;
-                    return result;
-                }
-                result.digests.push_back(digest);
-            }
-        } else {
-            const auto* hash_ptr = static_cast<const unsigned char*>(transcript_hash_buffer.contents);
-            if (hash_ptr == nullptr) {
+        const auto* tile_hash_bytes_ptr = static_cast<const unsigned char*>(tile_hash_buffer.contents);
+        for (uint32_t i = 0; i < request.batch_size; ++i) {
+            uint256 digest;
+            std::string finalize_error;
+            if (!FinalizeProductDigestFromTileHashBytes(
+                    tile_hash_bytes_ptr == nullptr
+                        ? nullptr
+                        : tile_hash_bytes_ptr + static_cast<size_t>(i) * tile_hash_bytes,
+                    N,
+                    request.n,
+                    request.b,
+                    request.sigmas[i],
+                    digest,
+                    finalize_error)) {
                 result.success = false;
-                result.error = "Metal variable-base digest missing hash output contents";
+                result.error = finalize_error;
                 return result;
             }
-            for (uint32_t i = 0; i < request.batch_size; ++i) {
-                result.digests.emplace_back(Span<const unsigned char>{
-                    hash_ptr + (static_cast<size_t>(i) * kHashBytesPerDigest),
-                    kHashBytesPerDigest,
-                });
-            }
+            result.digests.push_back(digest);
         }
         const double cpu_finalize_us = std::chrono::duration<double, std::micro>(
                                            std::chrono::steady_clock::now() - finalize_start)
@@ -4162,8 +3237,8 @@ MatMulDigestBatchResult ComputeCanonicalTranscriptDigestVariableBaseBatch(
             ++context.profiling_stats.samples;
             context.profiling_stats.last_encode_build_perturbed_us =
                 encode_generate_base_us + encode_build_perturbed_us;
-            context.profiling_stats.last_encode_fused_prefix_compress_us = encode_fused_prefix_compress_us;
-            context.profiling_stats.last_encode_transcript_sha256_us = encode_transcript_sha256_us;
+            context.profiling_stats.last_encode_fused_prefix_compress_us = encode_product_us;
+            context.profiling_stats.last_encode_transcript_sha256_us = encode_tile_hash_us;
             context.profiling_stats.last_submit_wait_us = submit_wait_us;
             context.profiling_stats.last_gpu_execution_ms = submit_wait_us / 1000.0;
             context.profiling_stats.last_cpu_finalize_us = cpu_finalize_us;

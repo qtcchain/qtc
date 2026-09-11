@@ -246,10 +246,9 @@ int main(int argc, char* argv[])
     UniValue cuda_dispatch_obj(UniValue::VOBJ);
     cuda_dispatch_obj.pushKV("available", cuda_dispatch_config.available);
     cuda_dispatch_obj.pushKV("build_perturbed_threads", cuda_dispatch_config.build_perturbed_threads);
-    cuda_dispatch_obj.pushKV("finalize_max_threads", cuda_dispatch_config.finalize_max_threads);
-    cuda_dispatch_obj.pushKV("finalize_threads_b4", cuda_dispatch_config.finalize_threads_b4);
-    cuda_dispatch_obj.pushKV("finalize_threads_b8", cuda_dispatch_config.finalize_threads_b8);
-    cuda_dispatch_obj.pushKV("finalize_threads_b16", cuda_dispatch_config.finalize_threads_b16);
+    cuda_dispatch_obj.pushKV("gemm_tile_dim", cuda_dispatch_config.gemm_tile_dim);
+    cuda_dispatch_obj.pushKV("gemm_threads", cuda_dispatch_config.gemm_threads);
+    cuda_dispatch_obj.pushKV("tile_hash_threads", cuda_dispatch_config.tile_hash_threads);
     cuda_dispatch_obj.pushKV("max_supported_block_size", cuda_dispatch_config.max_supported_block_size);
     cuda_dispatch_obj.pushKV("nonblocking_streams", cuda_dispatch_config.nonblocking_streams);
     cuda_dispatch_obj.pushKV("reason", cuda_dispatch_config.reason);
@@ -258,7 +257,7 @@ int main(int argc, char* argv[])
     UniValue cuda_kernel_obj(UniValue::VOBJ);
     cuda_kernel_obj.pushKV("available", cuda_kernel_profile.available);
     cuda_kernel_obj.pushKV("low_rank_perturbation_kernel", cuda_kernel_profile.low_rank_perturbation_kernel);
-    cuda_kernel_obj.pushKV("fused_compressed_words_finalize", cuda_kernel_profile.fused_compressed_words_finalize);
+    cuda_kernel_obj.pushKV("tiled_product_digest_v4", cuda_kernel_profile.tiled_product_digest_v4);
     cuda_kernel_obj.pushKV("pinned_host_staging", cuda_kernel_profile.pinned_host_staging);
     cuda_kernel_obj.pushKV("base_matrix_cache", cuda_kernel_profile.base_matrix_cache);
     cuda_kernel_obj.pushKV("shared_buffer_pool", cuda_kernel_profile.shared_buffer_pool);
@@ -292,6 +291,10 @@ int main(int argc, char* argv[])
     cuda_profiling_obj.pushKV("last_used_device_prepared_inputs", cuda_profiling_stats.last_used_device_prepared_inputs);
     cuda_profiling_obj.pushKV("last_used_pinned_host_staging", cuda_profiling_stats.last_used_pinned_host_staging);
     cuda_profiling_obj.pushKV("last_base_matrix_cache_hit", cuda_profiling_stats.last_base_matrix_cache_hit);
+    cuda_profiling_obj.pushKV("last_gpu_build_us", cuda_profiling_stats.last_gpu_build_us);
+    cuda_profiling_obj.pushKV("last_gpu_gemm_us", cuda_profiling_stats.last_gpu_gemm_us);
+    cuda_profiling_obj.pushKV("last_gpu_tile_hash_us", cuda_profiling_stats.last_gpu_tile_hash_us);
+    cuda_profiling_obj.pushKV("last_gpu_copy_us", cuda_profiling_stats.last_gpu_copy_us);
     cuda_profiling_obj.pushKV("last_mode", cuda_profiling_stats.last_mode);
     cuda_profiling_obj.pushKV("reason", cuda_profiling_stats.reason);
     cuda_obj.pushKV("profiling", std::move(cuda_profiling_obj));
@@ -303,7 +306,6 @@ int main(int argc, char* argv[])
     cuda_oracle_obj.pushKV("allocation_events", cuda_oracle_profile.allocation_events);
     cuda_oracle_obj.pushKV("reuse_events", cuda_oracle_profile.reuse_events);
     cuda_oracle_obj.pushKV("last_encode_noise_us", cuda_oracle_profile.last_encode_noise_us);
-    cuda_oracle_obj.pushKV("last_encode_compress_us", cuda_oracle_profile.last_encode_compress_us);
     cuda_oracle_obj.pushKV("last_submit_wait_us", cuda_oracle_profile.last_submit_wait_us);
     cuda_oracle_obj.pushKV("last_gpu_generation_ms", cuda_oracle_profile.last_gpu_generation_ms);
     cuda_oracle_obj.pushKV("library_source", cuda_oracle_profile.library_source);

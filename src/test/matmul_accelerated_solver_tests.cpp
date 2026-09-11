@@ -4,6 +4,7 @@
 
 #include <matmul/accelerated_solver.h>
 
+#include <cuda/matmul_accel.h>
 #include <cuda/oracle_accel.h>
 #include <matmul/matmul_pow.h>
 #include <matmul/noise.h>
@@ -17,6 +18,8 @@
 #include <boost/test/unit_test.hpp>
 
 #include <cstdlib>
+#include <iterator>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -441,13 +444,10 @@ BOOST_AUTO_TEST_CASE(cuda_prepared_batch_digest_matches_cpu_or_cleanly_falls_bac
     const auto stats = matmul::accelerated::ProbeMatMulBackendRuntimeStats();
     BOOST_CHECK_EQUAL(stats.digest_requests, kBatchSize);
     BOOST_CHECK_EQUAL(stats.requested_cuda, kBatchSize);
-    if (cuda_capability.available) {
-        BOOST_CHECK_EQUAL(stats.cuda_successes, kBatchSize);
-        BOOST_CHECK_EQUAL(stats.cuda_fallbacks_to_cpu, 0U);
-    } else {
-        BOOST_CHECK_EQUAL(stats.cuda_successes, 0U);
-        BOOST_CHECK_EQUAL(stats.cuda_fallbacks_to_cpu, kBatchSize);
-    }
+    // TRANSCRIPT scheme: CPU-only on every GPU backend, reported as clean fallbacks.
+    (void)cuda_capability;
+    BOOST_CHECK_EQUAL(stats.cuda_successes, 0U);
+    BOOST_CHECK_EQUAL(stats.cuda_fallbacks_to_cpu, kBatchSize);
 
     for (uint32_t i = 0; i < kBatchSize; ++i) {
         const auto single = matmul::accelerated::ComputeMatMulDigestPrepared(
@@ -461,15 +461,9 @@ BOOST_AUTO_TEST_CASE(cuda_prepared_batch_digest_matches_cpu_or_cleanly_falls_bac
         BOOST_REQUIRE(single.ok);
         BOOST_REQUIRE(batch[i].ok);
         BOOST_CHECK_EQUAL(batch[i].digest, single.digest);
-        if (cuda_capability.available) {
-            BOOST_CHECK_EQUAL(batch[i].backend, matmul::backend::Kind::CUDA);
-            BOOST_CHECK(batch[i].accelerated);
-            BOOST_CHECK(batch[i].error.empty());
-        } else {
-            BOOST_CHECK_EQUAL(batch[i].backend, matmul::backend::Kind::CPU);
-            BOOST_CHECK(!batch[i].accelerated);
-            BOOST_CHECK(!batch[i].error.empty());
-        }
+        BOOST_CHECK_EQUAL(batch[i].backend, matmul::backend::Kind::CPU);
+        BOOST_CHECK(!batch[i].accelerated);
+        BOOST_CHECK(!batch[i].error.empty());
     }
 }
 
@@ -1060,15 +1054,12 @@ BOOST_AUTO_TEST_CASE(cuda_digest_matches_cpu_or_cleanly_falls_back)
     BOOST_CHECK(digest_result.ok);
     BOOST_CHECK_EQUAL(digest_result.digest, cpu_digest);
 
-    if (cuda_capability.available) {
-        BOOST_CHECK_EQUAL(digest_result.backend, matmul::backend::Kind::CUDA);
-        BOOST_CHECK(digest_result.accelerated);
-        BOOST_CHECK(digest_result.error.empty());
-    } else {
-        BOOST_CHECK_EQUAL(digest_result.backend, matmul::backend::Kind::CPU);
-        BOOST_CHECK(!digest_result.accelerated);
-        BOOST_CHECK(!digest_result.error.empty());
-    }
+    // The legacy TRANSCRIPT scheme is CPU-only on every GPU backend (QTC O5):
+    // the request must report a clean fallback with a reason, never a CUDA hit.
+    (void)cuda_capability;
+    BOOST_CHECK_EQUAL(digest_result.backend, matmul::backend::Kind::CPU);
+    BOOST_CHECK(!digest_result.accelerated);
+    BOOST_CHECK(!digest_result.error.empty());
 }
 
 BOOST_AUTO_TEST_CASE(cuda_regtest_shape_digest_matches_cpu_or_cleanly_falls_back)
@@ -1099,15 +1090,12 @@ BOOST_AUTO_TEST_CASE(cuda_regtest_shape_digest_matches_cpu_or_cleanly_falls_back
     BOOST_CHECK(digest_result.ok);
     BOOST_CHECK_EQUAL(digest_result.digest, cpu_digest);
 
-    if (cuda_capability.available) {
-        BOOST_CHECK_EQUAL(digest_result.backend, matmul::backend::Kind::CUDA);
-        BOOST_CHECK(digest_result.accelerated);
-        BOOST_CHECK(digest_result.error.empty());
-    } else {
-        BOOST_CHECK_EQUAL(digest_result.backend, matmul::backend::Kind::CPU);
-        BOOST_CHECK(!digest_result.accelerated);
-        BOOST_CHECK(!digest_result.error.empty());
-    }
+    // The legacy TRANSCRIPT scheme is CPU-only on every GPU backend (QTC O5):
+    // the request must report a clean fallback with a reason, never a CUDA hit.
+    (void)cuda_capability;
+    BOOST_CHECK_EQUAL(digest_result.backend, matmul::backend::Kind::CPU);
+    BOOST_CHECK(!digest_result.accelerated);
+    BOOST_CHECK(!digest_result.error.empty());
 }
 
 BOOST_AUTO_TEST_CASE(cuda_product_digest_matches_cpu_or_cleanly_falls_back)
@@ -1314,6 +1302,294 @@ BOOST_AUTO_TEST_CASE(cuda_strict_regtest_warning_repro_nonce_scan_matches_cpu_or
         if (cuda_capability.available) {
             BOOST_CHECK_EQUAL(batch[0].backend, matmul::backend::Kind::CUDA);
             BOOST_CHECK(batch[0].accelerated);
+        }
+    }
+}
+
+// ---- QTC O5: oracle v2 + product digest v4 CUDA parity ----
+
+BOOST_AUTO_TEST_CASE(cuda_oracle_v2_fill_matches_cpu_reference_and_vectors)
+{
+    const auto cuda_capability = matmul::backend::CapabilityFor(matmul::backend::Kind::CUDA);
+    if (!cuda_capability.available) {
+        const auto unavailable = qtc::cuda::FillFromOracleGPU(uint256{}, 0, 8);
+        BOOST_CHECK(!unavailable.success);
+        BOOST_CHECK(!unavailable.error.empty());
+        return;
+    }
+
+    // from_oracle_extra vectors (test/reference/test_vectors.json, oracle v2).
+    struct OracleVector {
+        const char* seed_hex;
+        uint32_t index;
+        uint32_t expected;
+    };
+    const OracleVector vectors[] = {
+        {"0000000000000000000000000000000000000000000000000000000000000000", 100U, 2060225844U},
+        {"0000000000000000000000000000000000000000000000000000000000000000", 255U, 126251429U},
+        {"0000000000000000000000000000000000000000000000000000000000000000", 1000U, 655637585U},
+        {"0000000000000000000000000000000000000000000000000000000000000000", 65535U, 178895147U},
+        {"0000000000000000000000000000000000000000000000000000000000000000", 4294967295U, 202950684U},
+        {"4504d44d861b69197db1d95e473442346c4f2bc1f5869996bdccd63cfbdbd150", 0U, 360032607U},
+        {"4504d44d861b69197db1d95e473442346c4f2bc1f5869996bdccd63cfbdbd150", 1U, 369286479U},
+        {"4504d44d861b69197db1d95e473442346c4f2bc1f5869996bdccd63cfbdbd150", 100U, 1349016275U},
+        {"4504d44d861b69197db1d95e473442346c4f2bc1f5869996bdccd63cfbdbd150", 999U, 1873833507U},
+        {"c6a811f7f75fe4e64be106a50351aed9c04403a74bfe7b4bbe59f7311722b735", 12345U, 995759357U},
+    };
+    for (const auto& vector : vectors) {
+        const uint256 seed = ParseUint256(vector.seed_hex);
+        const auto filled = qtc::cuda::FillFromOracleGPU(seed, vector.index, 1);
+        BOOST_REQUIRE_MESSAGE(filled.success, filled.error);
+        BOOST_REQUIRE_EQUAL(filled.values.size(), 1U);
+        BOOST_CHECK_EQUAL(filled.values[0], vector.expected);
+        BOOST_CHECK_EQUAL(filled.values[0], matmul::field::from_oracle(seed, vector.index));
+    }
+
+    // from_seed_4x4 first row, verbatim from the vectors file.
+    const auto zero4 = qtc::cuda::FillFromOracleGPU(uint256{}, 0, 4);
+    BOOST_REQUIRE_MESSAGE(zero4.success, zero4.error);
+    const uint32_t expected_row0[4] = {1432335981U, 1985401759U, 1463849330U, 1808620315U};
+    BOOST_CHECK_EQUAL_COLLECTIONS(
+        zero4.values.begin(), zero4.values.end(), std::begin(expected_row0), std::end(expected_row0));
+
+    // Whole base matrices: CUDA oracle fill == matmul::FromSeed (which the field
+    // tests pin to from_seed_4x4 / from_seed_8x8).
+    for (const uint32_t n : {4U, 8U, 64U, 512U}) {
+        const uint256 seed = n <= 8
+            ? uint256{}
+            : ParseUint256("4504d44d861b69197db1d95e473442346c4f2bc1f5869996bdccd63cfbdbd150");
+        const matmul::Matrix cpu = matmul::FromSeed(seed, n);
+        const auto filled = qtc::cuda::FillFromOracleGPU(seed, 0, n * n);
+        BOOST_REQUIRE_MESSAGE(filled.success, filled.error);
+        BOOST_REQUIRE_EQUAL(filled.values.size(), static_cast<size_t>(n) * n);
+        BOOST_CHECK_EQUAL_COLLECTIONS(
+            filled.values.begin(), filled.values.end(), cpu.data(), cpu.data() + static_cast<size_t>(n) * n);
+    }
+
+    // Unaligned index range crossing 8-lane block boundaries.
+    const uint256 seed = ParseUint256("c6a811f7f75fe4e64be106a50351aed9c04403a74bfe7b4bbe59f7311722b735");
+    const auto range = qtc::cuda::FillFromOracleGPU(seed, 12341, 37);
+    BOOST_REQUIRE_MESSAGE(range.success, range.error);
+    std::vector<matmul::field::Element> cpu_range(37);
+    matmul::field::fill_from_oracle(seed, 12341, 37, cpu_range.data());
+    BOOST_CHECK_EQUAL_COLLECTIONS(range.values.begin(), range.values.end(), cpu_range.begin(), cpu_range.end());
+    BOOST_CHECK_EQUAL(range.values[4], 995759357U);
+}
+
+BOOST_AUTO_TEST_CASE(cuda_product_tile_hashes_match_cpu_for_perturbed_matrices)
+{
+    const auto cuda_capability = matmul::backend::CapabilityFor(matmul::backend::Kind::CUDA);
+    struct Shape {
+        uint32_t n;
+        uint32_t b;
+    };
+    const Shape shapes[] = {{8U, 4U}, {64U, 8U}, {512U, 16U}};
+    const uint256 sigma = ParseUint256("5555555555555555555555555555555555555555555555555555555555555555");
+
+    for (const Shape shape : shapes) {
+        // Seeded matrices double as "perturbed" inputs: every element is a
+        // canonical field element, which is all the GEMM/tile-hash stage sees.
+        const matmul::Matrix A0 = matmul::FromSeed(
+            ParseUint256("1111111111111111111111111111111111111111111111111111111111111111"), shape.n);
+        const matmul::Matrix B0 = matmul::FromSeed(
+            ParseUint256("2222222222222222222222222222222222222222222222222222222222222222"), shape.n);
+        const matmul::Matrix A1 = matmul::FromSeed(
+            ParseUint256("3333333333333333333333333333333333333333333333333333333333333333"), shape.n);
+        const matmul::Matrix B1 = matmul::FromSeed(
+            ParseUint256("4444444444444444444444444444444444444444444444444444444444444444"), shape.n);
+        const matmul::field::Element* a_ptrs[] = {A0.data(), A1.data()};
+        const matmul::field::Element* b_ptrs[] = {B0.data(), B1.data()};
+        const uint256 sigma1 = ParseUint256("6666666666666666666666666666666666666666666666666666666666666666");
+        const uint256 sigmas[] = {sigma, sigma1};
+
+        const auto cuda = qtc::cuda::ComputeProductTileHashesBatch({
+            .n = shape.n,
+            .b = shape.b,
+            .batch_size = 2,
+            .matrix_a_perturbed = a_ptrs,
+            .matrix_b_perturbed = b_ptrs,
+            .sigmas = sigmas,
+            .return_tile_hashes = true,
+        });
+        BOOST_CHECK_EQUAL(cuda.available, cuda_capability.available);
+        if (!cuda_capability.available) {
+            BOOST_CHECK(!cuda.success);
+            BOOST_CHECK(!cuda.error.empty());
+            continue;
+        }
+        BOOST_REQUIRE_MESSAGE(cuda.success, cuda.error);
+
+        const uint32_t blocks_per_axis = shape.n / shape.b;
+        const uint32_t tiles = blocks_per_axis * blocks_per_axis;
+        BOOST_REQUIRE_EQUAL(cuda.tiles_per_request, tiles);
+        BOOST_REQUIRE_EQUAL(cuda.tile_hashes.size(), static_cast<size_t>(2) * tiles);
+
+        const matmul::Matrix C0 = A0 * B0;
+        const matmul::Matrix C1 = A1 * B1;
+        const auto cpu0 = matmul::transcript::ComputeProductTileHashes(C0, shape.b);
+        const auto cpu1 = matmul::transcript::ComputeProductTileHashes(C1, shape.b);
+        BOOST_REQUIRE_EQUAL(cpu0.size(), tiles);
+        for (uint32_t i = 0; i < tiles; ++i) {
+            BOOST_CHECK_EQUAL(cuda.tile_hashes[i], cpu0[i]);
+            BOOST_CHECK_EQUAL(cuda.tile_hashes[tiles + i], cpu1[i]);
+        }
+
+        BOOST_CHECK_EQUAL(
+            matmul::transcript::ComputeProductCommittedDigestFromTileHashes(
+                Span<const uint256>{cuda.tile_hashes.data(), tiles}, sigma, shape.n, shape.b),
+            matmul::transcript::ComputeProductCommittedDigest(C0, shape.b, sigma));
+        BOOST_CHECK_EQUAL(
+            matmul::transcript::ComputeProductCommittedDigestFromTileHashes(
+                Span<const uint256>{cuda.tile_hashes.data() + tiles, tiles}, sigma, shape.n, shape.b),
+            matmul::transcript::ComputeProductCommittedDigest(C1, shape.b, sigma));
+
+        // Device-side finish (root + outer SHA256d) must equal the host finish
+        // from the same tile hashes and the CPU reference digest.
+        BOOST_REQUIRE_EQUAL(cuda.digests.size(), 2U);
+        BOOST_CHECK_EQUAL(cuda.digests[0], matmul::transcript::ComputeProductCommittedDigest(C0, shape.b, sigma));
+        BOOST_CHECK_EQUAL(cuda.digests[1], matmul::transcript::ComputeProductCommittedDigest(C1, shape.b, sigma1));
+        BOOST_CHECK_EQUAL(
+            cuda.digests[1],
+            matmul::transcript::ComputeProductCommittedDigestFromTileHashes(
+                Span<const uint256>{cuda.tile_hashes.data() + tiles, tiles}, sigma1, shape.n, shape.b));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(cuda_mainnet_shape_product_digest_matches_cpu)
+{
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kTranscriptBlockSize = 16;
+    constexpr uint32_t kNoiseRank = 8;
+
+    CBlockHeader header = MakeCandidateHeaderWithDim(kN);
+    header.nVersion = 0x20000000;
+    header.nTime = 1'790'000'123U;
+    header.nBits = 0x1e063c74U;
+    header.nNonce64 = 0x1d3f9a7c5b2e4801ULL;
+    header.nNonce = static_cast<uint32_t>(header.nNonce64);
+    header.hashPrevBlock = ParseUint256("7a1c2f3e4d5b6a798897a6b5c4d3e2f10f1e2d3c4b5a69788796a5b4c3d2e1f0");
+    header.hashMerkleRoot = ParseUint256("0f1e2d3c4b5a69788796a5b4c3d2e1f07a1c2f3e4d5b6a798897a6b5c4d3e2f1");
+    header.seed_a = ParseUint256("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08");
+    header.seed_b = ParseUint256("2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae");
+
+    const matmul::Matrix A = matmul::FromSeed(header.seed_a, kN);
+    const matmul::Matrix B = matmul::FromSeed(header.seed_b, kN);
+    const uint256 cpu_digest = matmul::accelerated::ComputeMatMulDigestCPU(
+        header, A, B, kTranscriptBlockSize, kNoiseRank, matmul::accelerated::DigestScheme::PRODUCT_COMMITTED);
+    BOOST_CHECK_EQUAL(
+        cpu_digest,
+        ComputeReferenceProductDigest(header, A, B, kTranscriptBlockSize, kNoiseRank));
+    const auto cuda_capability = matmul::backend::CapabilityFor(matmul::backend::Kind::CUDA);
+
+    const auto check = [&](const matmul::accelerated::DigestResult& digest_result) {
+        BOOST_CHECK(digest_result.ok);
+        BOOST_CHECK_EQUAL(digest_result.digest, cpu_digest);
+        if (cuda_capability.available) {
+            BOOST_CHECK_EQUAL(digest_result.backend, matmul::backend::Kind::CUDA);
+            BOOST_CHECK(digest_result.accelerated);
+            BOOST_CHECK_MESSAGE(digest_result.error.empty(), digest_result.error);
+        } else {
+            BOOST_CHECK_EQUAL(digest_result.backend, matmul::backend::Kind::CPU);
+            BOOST_CHECK(!digest_result.accelerated);
+            BOOST_CHECK(!digest_result.error.empty());
+        }
+    };
+
+    {
+        // AUTO policy: device-generated noise for the mainnet shape.
+        ScopedGpuInputEnv gpu_env(nullptr);
+        ScopedCudaDevicePreparedInputsEnv device_inputs_env(nullptr);
+        check(matmul::accelerated::ComputeMatMulDigest(
+            header, A, B, kTranscriptBlockSize, kNoiseRank,
+            matmul::backend::Kind::CUDA, matmul::accelerated::DigestScheme::PRODUCT_COMMITTED));
+    }
+    {
+        // Host-prepared noise through the same CUDA path.
+        ScopedGpuInputEnv gpu_env("0");
+        check(matmul::accelerated::ComputeMatMulDigest(
+            header, A, B, kTranscriptBlockSize, kNoiseRank,
+            matmul::backend::Kind::CUDA, matmul::accelerated::DigestScheme::PRODUCT_COMMITTED));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(cuda_variable_base_host_noise_regtest_shape_batch_matches_cpu_product_digest)
+{
+    // The nonce-seeded regtest mining path: per-header seeds, host-prepared noise
+    // (the AUTO GPU-input policy stays off at n=64), CUDA regenerates A'/B' from
+    // the seeds with oracle v2 and must agree with the CPU reference.
+    ScopedGpuInputEnv gpu_env("0");
+    constexpr uint32_t kN = 64;
+    constexpr uint32_t kTranscriptBlockSize = 8;
+    constexpr uint32_t kNoiseRank = 4;
+    constexpr uint32_t kBatchSize = 5;
+
+    std::vector<CBlockHeader> headers;
+    headers.reserve(kBatchSize);
+    for (uint32_t i = 0; i < kBatchSize; ++i) {
+        CBlockHeader header = MakeStrictRegtestWarningReproHeader();
+        header.nNonce64 = 1000 + i;
+        header.nNonce = static_cast<uint32_t>(header.nNonce64);
+        const std::string suffix = i < 10 ? "0" + std::to_string(i) : std::to_string(i);
+        header.seed_a = ParseUint256("4504d44d861b69197db1d95e473442346c4f2bc1f5869996bdccd63cfbdbd1" + suffix);
+        header.seed_b = ParseUint256("c6a811f7f75fe4e64be106a50351aed9c04403a74bfe7b4bbe59f7311722b7" + suffix);
+        headers.push_back(header);
+    }
+
+    const auto prepared_batch = matmul::accelerated::PrepareMatMulDigestInputsBatchForBackend(
+        headers,
+        kTranscriptBlockSize,
+        kNoiseRank,
+        matmul::backend::Kind::CUDA,
+        matmul::accelerated::DigestScheme::PRODUCT_COMMITTED);
+    BOOST_REQUIRE_EQUAL(prepared_batch.size(), headers.size());
+    for (const auto& prepared : prepared_batch) {
+        BOOST_REQUIRE(prepared.noise.has_value());
+        BOOST_REQUIRE(prepared.cuda_generated_inputs == nullptr);
+    }
+
+    const auto cuda_capability = matmul::backend::CapabilityFor(matmul::backend::Kind::CUDA);
+    matmul::accelerated::ResetMatMulBackendRuntimeStats();
+    const auto batch_results = matmul::accelerated::ComputeMatMulDigestPreparedVariableBaseBatchForMining(
+        headers,
+        kTranscriptBlockSize,
+        kNoiseRank,
+        prepared_batch,
+        matmul::backend::Kind::CUDA,
+        matmul::accelerated::DigestScheme::PRODUCT_COMMITTED);
+    BOOST_REQUIRE_EQUAL(batch_results.size(), headers.size());
+
+    const auto stats = matmul::accelerated::ProbeMatMulBackendRuntimeStats();
+    BOOST_CHECK_EQUAL(stats.requested_cuda, kBatchSize);
+    if (cuda_capability.available) {
+        BOOST_CHECK_EQUAL(stats.cuda_successes, kBatchSize);
+        BOOST_CHECK_EQUAL(stats.cuda_fallbacks_to_cpu, 0U);
+    } else {
+        BOOST_CHECK_EQUAL(stats.cuda_successes, 0U);
+        BOOST_CHECK_EQUAL(stats.cuda_fallbacks_to_cpu, kBatchSize);
+    }
+
+    for (size_t i = 0; i < headers.size(); ++i) {
+        BOOST_REQUIRE_MESSAGE(batch_results[i].ok, batch_results[i].error);
+        const matmul::Matrix A = matmul::FromSeed(headers[i].seed_a, kN);
+        const matmul::Matrix B = matmul::FromSeed(headers[i].seed_b, kN);
+        const uint256 cpu_digest = matmul::accelerated::ComputeDigestCpuFromPreparedInputs(
+            A,
+            B,
+            prepared_batch[i],
+            kTranscriptBlockSize,
+            matmul::accelerated::DigestScheme::PRODUCT_COMMITTED);
+        BOOST_CHECK_EQUAL(batch_results[i].digest, cpu_digest);
+        BOOST_CHECK_EQUAL(
+            cpu_digest,
+            ComputeReferenceProductDigest(headers[i], A, B, kTranscriptBlockSize, kNoiseRank));
+        if (cuda_capability.available) {
+            BOOST_CHECK_EQUAL(batch_results[i].backend, matmul::backend::Kind::CUDA);
+            BOOST_CHECK(batch_results[i].accelerated);
+            BOOST_CHECK_MESSAGE(batch_results[i].error.empty(), batch_results[i].error);
+        } else {
+            BOOST_CHECK_EQUAL(batch_results[i].backend, matmul::backend::Kind::CPU);
+            BOOST_CHECK(!batch_results[i].accelerated);
+            BOOST_CHECK(!batch_results[i].error.empty());
         }
     }
 }

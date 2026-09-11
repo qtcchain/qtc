@@ -16,6 +16,10 @@
 #include <stdexcept>
 #include <string_view>
 
+// Metal product digest v4 benchmarks. One "digest" == one mining attempt:
+// A' = A + E_L*E_R, B' = B + F_L*F_R, C' = A'*B', per-tile SHA-256 on the
+// device and the root + tagged SHA256d on the host.
+
 namespace {
 
 uint256 ParseUint256(std::string_view hex)
@@ -82,18 +86,17 @@ void RunMatMulMetalDigestBenchmark(benchmark::Bench& bench, uint32_t n, uint32_t
         nonce_header.nNonce = static_cast<uint32_t>(nonce_header.nNonce64);
         const uint256 sigma = matmul::DeriveSigma(nonce_header);
         const auto noise = matmul::noise::Generate(sigma, n, r);
-        const auto compress_vec = matmul::transcript::DeriveCompressionVector(sigma, b);
 
         const auto result = qtc::metal::ComputeCanonicalTranscriptDigest({
             .n = n,
             .b = b,
             .r = r,
+            .sigma = sigma,
             .use_uploaded_base_matrices = true,
             .noise_e_l = noise.E_L.data(),
             .noise_e_r = noise.E_R.data(),
             .noise_f_l = noise.F_L.data(),
             .noise_f_r = noise.F_R.data(),
-            .compress_vec = compress_vec.data(),
         });
         if (!result.success) {
             throw std::runtime_error("Metal digest benchmark failed: " + result.error);
@@ -141,29 +144,26 @@ void RunMatMulMetalBatchDigestBenchmark(benchmark::Bench& bench,
 
     CBlockHeader nonce_header{template_header};
     std::vector<matmul::noise::NoisePair> noises;
-    std::vector<std::vector<matmul::field::Element>> compress_vectors;
+    std::vector<uint256> sigmas(batch_size);
     std::vector<const matmul::field::Element*> noise_e_l_ptrs(batch_size);
     std::vector<const matmul::field::Element*> noise_e_r_ptrs(batch_size);
     std::vector<const matmul::field::Element*> noise_f_l_ptrs(batch_size);
     std::vector<const matmul::field::Element*> noise_f_r_ptrs(batch_size);
-    std::vector<const matmul::field::Element*> compress_ptrs(batch_size);
     noises.reserve(batch_size);
-    compress_vectors.reserve(batch_size);
 
     bench.batch(batch_size).unit("digest").run([&] {
         noises.clear();
-        compress_vectors.clear();
         for (uint32_t i = 0; i < batch_size; ++i) {
             nonce_header.nNonce64 += 1;
             nonce_header.nNonce = static_cast<uint32_t>(nonce_header.nNonce64);
-            const uint256 sigma = matmul::DeriveSigma(nonce_header);
-            noises.push_back(matmul::noise::Generate(sigma, n, r));
-            compress_vectors.push_back(matmul::transcript::DeriveCompressionVector(sigma, b));
+            sigmas[i] = matmul::DeriveSigma(nonce_header);
+            noises.push_back(matmul::noise::Generate(sigmas[i], n, r));
+        }
+        for (uint32_t i = 0; i < batch_size; ++i) {
             noise_e_l_ptrs[i] = noises[i].E_L.data();
             noise_e_r_ptrs[i] = noises[i].E_R.data();
             noise_f_l_ptrs[i] = noises[i].F_L.data();
             noise_f_r_ptrs[i] = noises[i].F_R.data();
-            compress_ptrs[i] = compress_vectors[i].data();
         }
 
         const auto result = qtc::metal::ComputeCanonicalTranscriptDigestBatch({
@@ -171,15 +171,83 @@ void RunMatMulMetalBatchDigestBenchmark(benchmark::Bench& bench,
             .b = b,
             .r = r,
             .batch_size = batch_size,
+            .sigmas = sigmas.data(),
             .use_uploaded_base_matrices = true,
             .noise_e_l = noise_e_l_ptrs.data(),
             .noise_e_r = noise_e_r_ptrs.data(),
             .noise_f_l = noise_f_l_ptrs.data(),
             .noise_f_r = noise_f_r_ptrs.data(),
-            .compress_vec = compress_ptrs.data(),
         });
         if (!result.success) {
             throw std::runtime_error("Metal batch digest benchmark failed: " + result.error);
+        }
+    });
+}
+
+// Mining path: per-nonce oracle-v2 base matrices generated on the device.
+void RunMatMulMetalVariableBaseDigestBenchmark(benchmark::Bench& bench,
+                                               uint32_t n,
+                                               uint32_t b,
+                                               uint32_t r,
+                                               uint32_t batch_size)
+{
+    const auto acceleration_probe = qtc::metal::ProbeMatMulDigestAcceleration();
+    if (!acceleration_probe.available || batch_size == 0) {
+        std::cout << "MatMulMetalVariableBaseDigestBenchmark skipped"
+                  << " n=" << n
+                  << " b=" << b
+                  << " r=" << r
+                  << " batch_size=" << batch_size
+                  << " reason=" << (batch_size == 0 ? "invalid_batch_size" : acceleration_probe.reason) << '\n';
+        bench.epochs(1).epochIterations(1).run([&] {});
+        return;
+    }
+
+    CBlockHeader nonce_header = BuildTemplateHeader(n);
+    std::vector<matmul::noise::NoisePair> noises;
+    std::vector<uint256> sigmas(batch_size);
+    std::vector<uint256> seeds_a(batch_size);
+    std::vector<uint256> seeds_b(batch_size);
+    std::vector<const matmul::field::Element*> noise_e_l_ptrs(batch_size);
+    std::vector<const matmul::field::Element*> noise_e_r_ptrs(batch_size);
+    std::vector<const matmul::field::Element*> noise_f_l_ptrs(batch_size);
+    std::vector<const matmul::field::Element*> noise_f_r_ptrs(batch_size);
+    noises.reserve(batch_size);
+
+    bench.batch(batch_size).unit("digest").run([&] {
+        noises.clear();
+        for (uint32_t i = 0; i < batch_size; ++i) {
+            nonce_header.nNonce64 += 1;
+            nonce_header.nNonce = static_cast<uint32_t>(nonce_header.nNonce64);
+            nonce_header.seed_a = DeterministicMatMulSeedV2(nonce_header, /*activation_height=*/0, 0);
+            nonce_header.seed_b = DeterministicMatMulSeedV2(nonce_header, /*activation_height=*/0, 1);
+            seeds_a[i] = nonce_header.seed_a;
+            seeds_b[i] = nonce_header.seed_b;
+            sigmas[i] = matmul::DeriveSigma(nonce_header);
+            noises.push_back(matmul::noise::Generate(sigmas[i], n, r));
+        }
+        for (uint32_t i = 0; i < batch_size; ++i) {
+            noise_e_l_ptrs[i] = noises[i].E_L.data();
+            noise_e_r_ptrs[i] = noises[i].E_R.data();
+            noise_f_l_ptrs[i] = noises[i].F_L.data();
+            noise_f_r_ptrs[i] = noises[i].F_R.data();
+        }
+
+        const auto result = qtc::metal::ComputeCanonicalTranscriptDigestVariableBaseBatch({
+            .n = n,
+            .b = b,
+            .r = r,
+            .batch_size = batch_size,
+            .sigmas = sigmas.data(),
+            .matrix_a_seeds = seeds_a.data(),
+            .matrix_b_seeds = seeds_b.data(),
+            .noise_e_l = noise_e_l_ptrs.data(),
+            .noise_e_r = noise_e_r_ptrs.data(),
+            .noise_f_l = noise_f_l_ptrs.data(),
+            .noise_f_r = noise_f_r_ptrs.data(),
+        });
+        if (!result.success) {
+            throw std::runtime_error("Metal variable-base digest benchmark failed: " + result.error);
         }
     });
 }
@@ -204,6 +272,11 @@ void MatMulMetalBatchDigestMainnetBatch4(benchmark::Bench& bench)
     RunMatMulMetalBatchDigestBenchmark(bench, /*n=*/512, /*b=*/16, /*r=*/8, /*batch_size=*/4);
 }
 
+void MatMulMetalVariableBaseDigestMainnetBatch4(benchmark::Bench& bench)
+{
+    RunMatMulMetalVariableBaseDigestBenchmark(bench, /*n=*/512, /*b=*/16, /*r=*/8, /*batch_size=*/4);
+}
+
 void RunMatMulCpuInputPreparationBenchmark(benchmark::Bench& bench, uint32_t n, uint32_t b, uint32_t r)
 {
     const CBlockHeader template_header = BuildTemplateHeader(n);
@@ -214,9 +287,8 @@ void RunMatMulCpuInputPreparationBenchmark(benchmark::Bench& bench, uint32_t n, 
         nonce_header.nNonce = static_cast<uint32_t>(nonce_header.nNonce64);
         const uint256 sigma = matmul::DeriveSigma(nonce_header);
         const auto noise = matmul::noise::Generate(sigma, n, r);
-        const auto compress_vec = matmul::transcript::DeriveCompressionVector(sigma, b);
         (void)noise;
-        (void)compress_vec;
+        (void)b;
     });
 }
 
@@ -269,5 +341,6 @@ BENCHMARK(MatMulMetalDigestMainnetDimensions, benchmark::PriorityLevel::HIGH);
 BENCHMARK(MatMulMetalDigestTestnetDimensions, benchmark::PriorityLevel::HIGH);
 BENCHMARK(MatMulMetalBatchDigestMainnetBatch2, benchmark::PriorityLevel::HIGH);
 BENCHMARK(MatMulMetalBatchDigestMainnetBatch4, benchmark::PriorityLevel::HIGH);
+BENCHMARK(MatMulMetalVariableBaseDigestMainnetBatch4, benchmark::PriorityLevel::HIGH);
 BENCHMARK(MatMulCpuInputPreparationMainnetDimensions, benchmark::PriorityLevel::HIGH);
 BENCHMARK(MatMulGpuInputPreparationMainnetDimensions, benchmark::PriorityLevel::HIGH);

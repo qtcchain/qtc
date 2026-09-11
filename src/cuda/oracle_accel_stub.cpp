@@ -46,6 +46,15 @@ MatMulInputGenerationDeviceBatchResult GenerateMatMulInputsGPUDeviceBatch(
     return result;
 }
 
+MatMulOracleFillResult FillFromOracleGPU(const uint256&, uint32_t, uint32_t)
+{
+    MatMulOracleFillResult result;
+    result.available = false;
+    result.success = false;
+    result.error = "CUDA oracle acceleration is unavailable on this build";
+    return result;
+}
+
 MatMulNonceSeedPreHashScanResult ScanMatMulNonceSeedPreHashGPU(const MatMulNonceSeedPreHashScanRequest&)
 {
     MatMulNonceSeedPreHashScanResult result;

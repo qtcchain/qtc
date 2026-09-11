@@ -63,126 +63,65 @@ MatMulProfilingStats ProbeMatMulProfilingStats()
     return stats;
 }
 
-MatMulCompressedWordsResult ComputeCompressedWords(const MatMulCompressedWordsRequest&,
-                                                  MatMulCompressedWordsMode)
+namespace {
+
+MatMulProductTileHashBatchResult DisabledResult()
 {
-    MatMulCompressedWordsResult result;
+    MatMulProductTileHashBatchResult result;
     result.error = "disabled_by_build";
     return result;
 }
 
-MatMulCompressedWordsBatchResult ComputeCompressedWordsBatch(const MatMulCompressedWordsBatchRequest&,
-                                                            MatMulCompressedWordsMode)
+} // namespace
+
+MatMulProductTileHashBatchResult ComputeProductTileHashesBatch(const MatMulProductTileHashBatchRequest&)
 {
-    MatMulCompressedWordsBatchResult result;
-    result.error = "disabled_by_build";
-    return result;
+    return DisabledResult();
 }
 
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankBatch(const MatMulLowRankCompressedWordsBatchRequest&,
-                                                                    MatMulCompressedWordsMode)
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankBatch(const MatMulLowRankProductBatchRequest&)
 {
-    MatMulCompressedWordsBatchResult result;
-    result.error = "disabled_by_build";
-    return result;
+    return DisabledResult();
 }
 
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankBatchOnDevice(const MatMulLowRankCompressedWordsBatchRequest&,
-                                                                            MatMulCompressedWordsMode,
-                                                                            int)
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankBatchOnDevice(const MatMulLowRankProductBatchRequest&, int)
 {
-    MatMulCompressedWordsBatchResult result;
-    result.error = "disabled_by_build";
-    return result;
+    return DisabledResult();
 }
 
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankBatchMultiDevice(const MatMulLowRankCompressedWordsBatchRequest&,
-                                                                               MatMulCompressedWordsMode)
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankBatchMultiDevice(const MatMulLowRankProductBatchRequest&)
 {
-    MatMulCompressedWordsBatchResult result;
-    result.error = "disabled_by_build";
-    return result;
+    return DisabledResult();
 }
 
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankDeviceBatch(
-    const MatMulLowRankCompressedWordsDeviceBatchRequest&,
-    MatMulCompressedWordsMode)
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankDeviceBatch(const MatMulLowRankProductDeviceBatchRequest&)
 {
-    MatMulCompressedWordsBatchResult result;
-    result.error = "disabled_by_build";
-    return result;
+    return DisabledResult();
 }
 
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankDeviceBatchOnDevice(
-    const MatMulLowRankCompressedWordsDeviceBatchRequest&,
-    MatMulCompressedWordsMode,
-    int)
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankDeviceBatchOnDevice(const MatMulLowRankProductDeviceBatchRequest&, int)
 {
-    MatMulCompressedWordsBatchResult result;
-    result.error = "disabled_by_build";
-    return result;
+    return DisabledResult();
 }
 
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankDeviceBatchMultiDevice(
-    const MatMulLowRankCompressedWordsDeviceBatchRequest&,
-    MatMulCompressedWordsMode)
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankDeviceBatchMultiDevice(const MatMulLowRankProductDeviceBatchRequest&)
 {
-    MatMulCompressedWordsBatchResult result;
-    result.error = "disabled_by_build";
-    return result;
+    return DisabledResult();
 }
 
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankVariableBaseDeviceBatch(
-    const MatMulLowRankVariableBaseDeviceBatchRequest&,
-    MatMulCompressedWordsMode)
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankVariableBaseBatch(const MatMulLowRankVariableBaseProductBatchRequest&)
 {
-    MatMulCompressedWordsBatchResult result;
-    result.error = "disabled_by_build";
-    return result;
+    return DisabledResult();
 }
 
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankVariableBaseDeviceBatchOnDevice(
-    const MatMulLowRankVariableBaseDeviceBatchRequest&,
-    MatMulCompressedWordsMode,
-    int)
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankVariableBaseBatchOnDevice(const MatMulLowRankVariableBaseProductBatchRequest&, int)
 {
-    MatMulCompressedWordsBatchResult result;
-    result.error = "disabled_by_build";
-    return result;
+    return DisabledResult();
 }
 
-MatMulCompressedWordsBatchResult ComputeCompressedWordsLowRankVariableBaseDeviceBatchMultiDevice(
-    const MatMulLowRankVariableBaseDeviceBatchRequest&,
-    MatMulCompressedWordsMode)
+MatMulProductTileHashBatchResult ComputeProductTileHashesLowRankVariableBaseBatchMultiDevice(const MatMulLowRankVariableBaseProductBatchRequest&)
 {
-    MatMulCompressedWordsBatchResult result;
-    result.error = "disabled_by_build";
-    return result;
-}
-
-MatMulProductDigestBatchResult ComputeProductDigestsLowRankVariableBaseDeviceBatch(
-    const MatMulLowRankVariableBaseProductDigestDeviceBatchRequest&)
-{
-    MatMulProductDigestBatchResult result;
-    result.error = "disabled_by_build";
-    return result;
-}
-
-MatMulProductDigestBatchResult ComputeProductDigestsLowRankVariableBaseDeviceBatchOnDevice(
-    const MatMulLowRankVariableBaseProductDigestDeviceBatchRequest&,
-    int)
-{
-    MatMulProductDigestBatchResult result;
-    result.error = "disabled_by_build";
-    return result;
-}
-
-MatMulProductDigestBatchResult ComputeProductDigestsLowRankVariableBaseDeviceBatchMultiDevice(
-    const MatMulLowRankVariableBaseProductDigestDeviceBatchRequest&)
-{
-    MatMulProductDigestBatchResult result;
-    result.error = "disabled_by_build";
-    return result;
+    return DisabledResult();
 }
 
 } // namespace qtc::cuda

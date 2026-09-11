@@ -1,8 +1,21 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// QTC MatMul proof-of-work Metal kernels.
+//
+// Consensus references (device output must stay bit-identical):
+//   * oracle v2          -> src/matmul/field.cpp (from_oracle / from_oracle_block)
+//   * product digest v4  -> src/matmul/transcript.cpp (HashProductTile,
+//                           HashProductTileHashes, FinalizeProductCommittedDigestFromHash)
+//
+// The device produces the perturbed operands A' = A + E_L*E_R, B' = B + F_L*F_R,
+// the full product C' = A'*B' over GF(2^31-1), and the N*N per-tile SHA-256
+// hashes of C' (row-major LE32 elements, b*b elements per tile). The root hash
+// over the tile hashes and the tagged outer SHA256d are finished on the host.
+
 constant uint MODULUS = 0x7fffffffu;
 constant uint MAX_BLOCK_ELEMENTS = 256u;
+constant uint PRODUCT_TILE_DIM = 16u;
 constant uint FC_SPEC_N [[function_constant(0)]];
 constant uint FC_SPEC_B [[function_constant(1)]];
 constant uint FC_SPEC_R [[function_constant(2)]];
@@ -15,9 +28,9 @@ struct KernelParams {
     uint N;
 };
 
-struct HashParams {
-    uint compressed_words;
-};
+// ---------------------------------------------------------------------------
+// GF(2^31 - 1) arithmetic (mirrors matmul::field)
+// ---------------------------------------------------------------------------
 
 inline uint reduce64(ulong x)
 {
@@ -43,36 +56,9 @@ inline uint mul_mod(uint a, uint b)
     return reduce64((ulong)a * (ulong)b);
 }
 
-inline uint dot_step(uint acc, uint a, uint b)
-{
-    return reduce64((ulong)acc + ((ulong)a * (ulong)b));
-}
-
-inline uint reduce_simdgroup_add_mod(uint value, uint simd_size)
-{
-    for (uint offset = simd_size >> 1u; offset > 0u; offset >>= 1u) {
-        value = add_mod(value, simd_shuffle_xor(value, offset));
-    }
-    return value;
-}
-
-inline uint reduce_threadgroup_add_mod(threadgroup uint* values, uint tid, uint count)
-{
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint active = count;
-    while (active > 1u) {
-        const uint half_count = active >> 1u;
-        if (tid < half_count) {
-            values[tid] = add_mod(values[tid], values[tid + half_count]);
-        }
-        if ((active & 1u) != 0u && tid == 0u) {
-            values[0] = add_mod(values[0], values[active - 1u]);
-        }
-        active = half_count;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return values[0];
-}
+// ---------------------------------------------------------------------------
+// SHA-256
+// ---------------------------------------------------------------------------
 
 inline uint rotr(uint x, uint n)
 {
@@ -120,6 +106,18 @@ constant uint SHA256_K[64] = {
     0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
 };
 
+inline void sha256_init(thread uint state[8])
+{
+    state[0] = 0x6a09e667u;
+    state[1] = 0xbb67ae85u;
+    state[2] = 0x3c6ef372u;
+    state[3] = 0xa54ff53au;
+    state[4] = 0x510e527fu;
+    state[5] = 0x9b05688cu;
+    state[6] = 0x1f83d9abu;
+    state[7] = 0x5be0cd19u;
+}
+
 inline void sha256_compress(thread uint state[8], thread uint w[64])
 {
     for (uint t = 16; t < 64; ++t) {
@@ -158,142 +156,14 @@ inline void sha256_compress(thread uint state[8], thread uint w[64])
     state[7] += h;
 }
 
-inline uint MessageByteAt(device const uint* compressed, uint64_t msg_len_bytes, uint64_t total_bytes, uint64_t offset)
-{
-    if (offset < msg_len_bytes) {
-        const uint64_t word_index = offset >> 2;
-        const uint lane = (uint)(offset & 3u);
-        const uint word = compressed[word_index];
-        return (word >> (lane * 8u)) & 0xffu;
-    }
-
-    if (offset == msg_len_bytes) {
-        return 0x80u;
-    }
-
-    if (offset >= (total_bytes - 8u)) {
-        const uint64_t bit_len = msg_len_bytes * 8u;
-        const uint shift = (uint)((total_bytes - 1u - offset) * 8u);
-        return (uint)((bit_len >> shift) & 0xffu);
-    }
-
-    return 0u;
-}
-
-inline uint FinalEllMessageByteAt(device const uint* compressed, uint N, uint64_t msg_len_bytes, uint64_t total_bytes, uint64_t offset)
-{
-    if (offset < msg_len_bytes) {
-        const uint64_t word_index = offset >> 2;
-        const uint lane = (uint)(offset & 3u);
-        const uint64_t physical_index = word_index * (uint64_t)N + (uint64_t)(N - 1u);
-        const uint word = compressed[physical_index];
-        return (word >> (lane * 8u)) & 0xffu;
-    }
-
-    if (offset == msg_len_bytes) {
-        return 0x80u;
-    }
-
-    if (offset >= (total_bytes - 8u)) {
-        const uint64_t bit_len = msg_len_bytes * 8u;
-        const uint shift = (uint)((total_bytes - 1u - offset) * 8u);
-        return (uint)((bit_len >> shift) & 0xffu);
-    }
-
-    return 0u;
-}
-
-inline void sha256_stream_words(device const uint* compressed, uint words, thread uint out_state[8])
-{
-    out_state[0] = 0x6a09e667u;
-    out_state[1] = 0xbb67ae85u;
-    out_state[2] = 0x3c6ef372u;
-    out_state[3] = 0xa54ff53au;
-    out_state[4] = 0x510e527fu;
-    out_state[5] = 0x9b05688cu;
-    out_state[6] = 0x1f83d9abu;
-    out_state[7] = 0x5be0cd19u;
-
-    const uint64_t msg_len_bytes = (uint64_t)words * 4u;
-    const uint64_t total_blocks = (msg_len_bytes + 9u + 63u) / 64u;
-    const uint64_t total_bytes = total_blocks * 64u;
-
-    thread uint w[64];
-    for (uint64_t block = 0; block < total_blocks; ++block) {
-        const uint64_t base = block * 64u;
-        for (uint i = 0; i < 16; ++i) {
-            const uint64_t off = base + (uint64_t)i * 4u;
-            const uint b0 = MessageByteAt(compressed, msg_len_bytes, total_bytes, off + 0u);
-            const uint b1 = MessageByteAt(compressed, msg_len_bytes, total_bytes, off + 1u);
-            const uint b2 = MessageByteAt(compressed, msg_len_bytes, total_bytes, off + 2u);
-            const uint b3 = MessageByteAt(compressed, msg_len_bytes, total_bytes, off + 3u);
-            w[i] = (b0 << 24u) | (b1 << 16u) | (b2 << 8u) | b3;
-        }
-        sha256_compress(out_state, w);
-    }
-}
-
-inline void sha256_stream_final_ell_words(device const uint* compressed, uint N, uint words, thread uint out_state[8])
-{
-    out_state[0] = 0x6a09e667u;
-    out_state[1] = 0xbb67ae85u;
-    out_state[2] = 0x3c6ef372u;
-    out_state[3] = 0xa54ff53au;
-    out_state[4] = 0x510e527fu;
-    out_state[5] = 0x9b05688cu;
-    out_state[6] = 0x1f83d9abu;
-    out_state[7] = 0x5be0cd19u;
-
-    const uint64_t msg_len_bytes = (uint64_t)words * 4u;
-    const uint64_t total_blocks = (msg_len_bytes + 9u + 63u) / 64u;
-    const uint64_t total_bytes = total_blocks * 64u;
-
-    thread uint w[64];
-    for (uint64_t block = 0; block < total_blocks; ++block) {
-        const uint64_t base = block * 64u;
-        for (uint i = 0; i < 16; ++i) {
-            const uint64_t off = base + (uint64_t)i * 4u;
-            const uint b0 = FinalEllMessageByteAt(compressed, N, msg_len_bytes, total_bytes, off + 0u);
-            const uint b1 = FinalEllMessageByteAt(compressed, N, msg_len_bytes, total_bytes, off + 1u);
-            const uint b2 = FinalEllMessageByteAt(compressed, N, msg_len_bytes, total_bytes, off + 2u);
-            const uint b3 = FinalEllMessageByteAt(compressed, N, msg_len_bytes, total_bytes, off + 3u);
-            w[i] = (b0 << 24u) | (b1 << 16u) | (b2 << 8u) | b3;
-        }
-        sha256_compress(out_state, w);
-    }
-}
-
-inline void sha256_double_digest(thread uint first_state[8], thread uint out_state[8])
-{
-    out_state[0] = 0x6a09e667u;
-    out_state[1] = 0xbb67ae85u;
-    out_state[2] = 0x3c6ef372u;
-    out_state[3] = 0xa54ff53au;
-    out_state[4] = 0x510e527fu;
-    out_state[5] = 0x9b05688cu;
-    out_state[6] = 0x1f83d9abu;
-    out_state[7] = 0x5be0cd19u;
-
-    thread uint w[64];
-    for (uint i = 0; i < 8; ++i) {
-        w[i] = first_state[i];
-    }
-    w[8] = 0x80000000u;
-    for (uint i = 9; i < 15; ++i) {
-        w[i] = 0u;
-    }
-    w[15] = 256u;
-    sha256_compress(out_state, w);
-}
-
-inline void set_oracle_byte(thread uint w[64], uint offset, uint byte)
+inline void set_msg_byte(thread uint w[64], uint offset, uint byte)
 {
     const uint word_index = offset >> 2u;
     const uint shift = (3u - (offset & 3u)) * 8u;
     w[word_index] |= (byte & 0xffu) << shift;
 }
 
-inline uint oracle_bswap32(uint x)
+inline uint bswap32(uint x)
 {
     return ((x & 0x000000ffu) << 24u) |
            ((x & 0x0000ff00u) << 8u) |
@@ -301,10 +171,21 @@ inline uint oracle_bswap32(uint x)
            ((x & 0xff000000u) >> 24u);
 }
 
-inline uint oracle_candidate_from_seed_and_index(constant uchar* seed_internal,
-                                                 uint index,
-                                                 bool with_retry,
-                                                 uint retry)
+// ---------------------------------------------------------------------------
+// Oracle v2 (matmul::field::from_oracle / from_oracle_block)
+//
+//   block = index >> 3, lane = index & 7
+//   H = SHA-256(seed_canonical || LE32(block) [|| LE32(retry) if retry > 0])
+//   candidate = LE32(H[4*lane .. 4*lane+3]) & 0x7FFFFFFF
+//   candidate == 0x7FFFFFFF is rejected; retry 1..255 re-hash with the SAME lane.
+//   After 256 rejections: LE32(SHA-256(seed_canonical || LE32(block) ||
+//   "oracle-fallback")[lane]) mod M31.
+//
+// `seed_internal` is the uint256 internal byte order; the canonical seed
+// bytes are its reverse (seed.data()[31 - i]).
+// ---------------------------------------------------------------------------
+
+inline void oracle_block_state(constant uchar* seed_internal, uint block, uint retry, thread uint state[8])
 {
     thread uint w[64];
     for (uint i = 0; i < 64; ++i) {
@@ -312,40 +193,38 @@ inline uint oracle_candidate_from_seed_and_index(constant uchar* seed_internal,
     }
 
     for (uint i = 0; i < 32; ++i) {
-        set_oracle_byte(w, i, seed_internal[31u - i]);
+        set_msg_byte(w, i, seed_internal[31u - i]);
     }
 
-    set_oracle_byte(w, 32u, index & 0xffu);
-    set_oracle_byte(w, 33u, (index >> 8u) & 0xffu);
-    set_oracle_byte(w, 34u, (index >> 16u) & 0xffu);
-    set_oracle_byte(w, 35u, (index >> 24u) & 0xffu);
+    set_msg_byte(w, 32u, block & 0xffu);
+    set_msg_byte(w, 33u, (block >> 8u) & 0xffu);
+    set_msg_byte(w, 34u, (block >> 16u) & 0xffu);
+    set_msg_byte(w, 35u, (block >> 24u) & 0xffu);
 
     uint message_len = 36u;
-    if (with_retry) {
-        set_oracle_byte(w, 36u, retry & 0xffu);
-        set_oracle_byte(w, 37u, (retry >> 8u) & 0xffu);
-        set_oracle_byte(w, 38u, (retry >> 16u) & 0xffu);
-        set_oracle_byte(w, 39u, (retry >> 24u) & 0xffu);
+    if (retry > 0u) {
+        set_msg_byte(w, 36u, retry & 0xffu);
+        set_msg_byte(w, 37u, (retry >> 8u) & 0xffu);
+        set_msg_byte(w, 38u, (retry >> 16u) & 0xffu);
+        set_msg_byte(w, 39u, (retry >> 24u) & 0xffu);
         message_len = 40u;
     }
 
-    set_oracle_byte(w, message_len, 0x80u);
+    set_msg_byte(w, message_len, 0x80u);
     w[15] = message_len * 8u;
 
-    thread uint state[8];
-    state[0] = 0x6a09e667u;
-    state[1] = 0xbb67ae85u;
-    state[2] = 0x3c6ef372u;
-    state[3] = 0xa54ff53au;
-    state[4] = 0x510e527fu;
-    state[5] = 0x9b05688cu;
-    state[6] = 0x1f83d9abu;
-    state[7] = 0x5be0cd19u;
+    sha256_init(state);
     sha256_compress(state, w);
-    return oracle_bswap32(state[0]) & MODULUS;
 }
 
-inline uint oracle_fallback_candidate(constant uchar* seed_internal, uint index)
+inline uint oracle_lane_candidate(thread const uint state[8], uint lane)
+{
+    // state[lane] holds hash bytes 4*lane..4*lane+3 big-endian; LE32 of those
+    // bytes is the byte-swapped word.
+    return bswap32(state[lane]) & MODULUS;
+}
+
+inline uint oracle_fallback_lane(constant uchar* seed_internal, uint block, uint lane)
 {
     thread uint w[64];
     for (uint i = 0; i < 64; ++i) {
@@ -353,50 +232,57 @@ inline uint oracle_fallback_candidate(constant uchar* seed_internal, uint index)
     }
 
     for (uint i = 0; i < 32; ++i) {
-        set_oracle_byte(w, i, seed_internal[31u - i]);
+        set_msg_byte(w, i, seed_internal[31u - i]);
     }
 
-    set_oracle_byte(w, 32u, index & 0xffu);
-    set_oracle_byte(w, 33u, (index >> 8u) & 0xffu);
-    set_oracle_byte(w, 34u, (index >> 16u) & 0xffu);
-    set_oracle_byte(w, 35u, (index >> 24u) & 0xffu);
+    set_msg_byte(w, 32u, block & 0xffu);
+    set_msg_byte(w, 33u, (block >> 8u) & 0xffu);
+    set_msg_byte(w, 34u, (block >> 16u) & 0xffu);
+    set_msg_byte(w, 35u, (block >> 24u) & 0xffu);
 
     const uchar fallback_tag[15] = {
         'o', 'r', 'a', 'c', 'l', 'e', '-', 'f', 'a', 'l', 'l', 'b', 'a', 'c', 'k'
     };
     for (uint i = 0; i < 15; ++i) {
-        set_oracle_byte(w, 36u + i, fallback_tag[i]);
+        set_msg_byte(w, 36u + i, fallback_tag[i]);
     }
 
-    set_oracle_byte(w, 51u, 0x80u);
+    set_msg_byte(w, 51u, 0x80u);
     w[15] = 51u * 8u;
 
     thread uint state[8];
-    state[0] = 0x6a09e667u;
-    state[1] = 0xbb67ae85u;
-    state[2] = 0x3c6ef372u;
-    state[3] = 0xa54ff53au;
-    state[4] = 0x510e527fu;
-    state[5] = 0x9b05688cu;
-    state[6] = 0x1f83d9abu;
-    state[7] = 0x5be0cd19u;
+    sha256_init(state);
     sha256_compress(state, w);
-    return oracle_bswap32(state[0]) % MODULUS;
+    return bswap32(state[lane]) % MODULUS;
 }
 
-inline uint oracle_from_seed(constant uchar* seed_internal, uint index)
+inline uint oracle_lane_with_retries(constant uchar* seed_internal, uint block, uint lane, uint first_retry)
 {
-    for (uint retry = 0; retry < 256; ++retry) {
-        const uint candidate = retry == 0
-            ? oracle_candidate_from_seed_and_index(seed_internal, index, false, 0u)
-            : oracle_candidate_from_seed_and_index(seed_internal, index, true, retry);
+    for (uint retry = first_retry; retry < 256u; ++retry) {
+        thread uint state[8];
+        oracle_block_state(seed_internal, block, retry, state);
+        const uint candidate = oracle_lane_candidate(state, lane);
         if (candidate < MODULUS) {
             return candidate;
         }
     }
-    return oracle_fallback_candidate(seed_internal, index);
+    return oracle_fallback_lane(seed_internal, block, lane);
 }
 
+// All eight lanes of one oracle block (== from_oracle(seed, 8*block + lane)).
+inline void oracle_fill_block(constant uchar* seed_internal, uint block, thread uint out[8])
+{
+    thread uint state[8];
+    oracle_block_state(seed_internal, block, 0u, state);
+    for (uint lane = 0; lane < 8u; ++lane) {
+        const uint candidate = oracle_lane_candidate(state, lane);
+        out[lane] = candidate < MODULUS
+            ? candidate
+            : oracle_lane_with_retries(seed_internal, block, lane, 1u);
+    }
+}
+
+// One thread per oracle block (8 elements). Grid = ceil(n*n / 8).
 kernel void generate_base_matrix_from_seed(
     constant KernelParams& p [[buffer(0)]],
     constant uchar* seed_internal [[buffer(1)]],
@@ -404,11 +290,23 @@ kernel void generate_base_matrix_from_seed(
     uint gid [[thread_position_in_grid]])
 {
     const uint nn = p.n * p.n;
-    if (gid >= nn) {
+    const uint base = gid * 8u;
+    if (base >= nn) {
         return;
     }
-    output[gid] = oracle_from_seed(seed_internal, gid);
+    thread uint lanes[8];
+    oracle_fill_block(seed_internal, gid, lanes);
+    for (uint lane = 0; lane < 8u; ++lane) {
+        const uint index = base + lane;
+        if (index < nn) {
+            output[index] = lanes[lane];
+        }
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Perturbed operands: A' = A + E_L*E_R, B' = B + F_L*F_R
+// ---------------------------------------------------------------------------
 
 kernel void build_perturbed(
     constant KernelParams& p [[buffer(0)]],
@@ -444,122 +342,6 @@ kernel void build_perturbed(
 
     a_prime[gid] = add_mod(matrix_a[gid], e_acc);
     b_prime[gid] = add_mod(matrix_b[gid], f_acc);
-}
-
-kernel void build_prefix(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* a_prime [[buffer(1)]],
-    device const uint* b_prime [[buffer(2)]],
-    device uint* c_prefix [[buffer(3)]],
-    uint gid [[thread_position_in_grid]])
-{
-    const uint nn = p.n * p.n;
-    if (gid >= nn) {
-        return;
-    }
-
-    const uint row = gid / p.n;
-    const uint col = gid - row * p.n;
-
-    uint c_acc = 0;
-    for (uint ell = 0; ell < p.N; ++ell) {
-        const uint k_base = ell * p.b;
-
-        uint product = 0;
-        for (uint k = 0; k < p.b; ++k) {
-            const uint a = a_prime[row * p.n + (k_base + k)];
-            const uint b = b_prime[(k_base + k) * p.n + col];
-            product = dot_step(product, a, b);
-        }
-
-        c_acc = add_mod(c_acc, product);
-        c_prefix[ell * nn + gid] = c_acc;
-    }
-}
-
-kernel void fused_final_compress(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* a_prime [[buffer(1)]],
-    device const uint* b_prime [[buffer(2)]],
-    device const uint* compress_vec [[buffer(3)]],
-    device uint* compressed [[buffer(4)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint simd_size [[threads_per_simdgroup]],
-    uint2 tgid [[threadgroup_position_in_grid]])
-{
-    const uint block_elements = p.b * p.b;
-    if (block_elements == 0 || block_elements > MAX_BLOCK_ELEMENTS || tid >= block_elements) {
-        return;
-    }
-
-    const uint tile_i = tgid.y;
-    const uint tile_j = tgid.x;
-    if (tile_i >= p.N || tile_j >= p.N) {
-        return;
-    }
-
-    const uint br = tid / p.b;
-    const uint bc = tid - br * p.b;
-    const uint row = tile_i * p.b + br;
-    const uint col = tile_j * p.b + bc;
-
-    threadgroup uint weighted_terms[MAX_BLOCK_ELEMENTS];
-    const uint weight = compress_vec[tid];
-    uint c_acc = 0;
-    for (uint ell = 0; ell < p.N; ++ell) {
-        const uint k_base = ell * p.b;
-
-        uint product = 0;
-        for (uint k = 0; k < p.b; ++k) {
-            const uint a = a_prime[row * p.n + (k_base + k)];
-            const uint b = b_prime[(k_base + k) * p.n + col];
-            product = dot_step(product, a, b);
-        }
-
-        c_acc = add_mod(c_acc, product);
-    }
-
-    weighted_terms[tid] = mul_mod(c_acc, weight);
-    const uint reduced = reduce_threadgroup_add_mod(weighted_terms, tid, block_elements);
-    if (tid == 0u) {
-        compressed[tile_i * p.N + tile_j] = reduced;
-    }
-}
-
-kernel void compress_prefix(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* c_prefix [[buffer(1)]],
-    device const uint* compress_vec [[buffer(2)]],
-    device uint* compressed [[buffer(3)]],
-    uint gid [[thread_position_in_grid]])
-{
-    const uint n3 = p.N * p.N * p.N;
-    if (gid >= n3) {
-        return;
-    }
-
-    const uint i = gid / (p.N * p.N);
-    const uint rem = gid - i * (p.N * p.N);
-    const uint j = rem / p.N;
-    const uint ell = rem - j * p.N;
-
-    const uint row_base = i * p.b;
-    const uint col_base = j * p.b;
-    const uint nn = p.n * p.n;
-
-    uint acc = 0;
-    uint v_idx = 0;
-    for (uint br = 0; br < p.b; ++br) {
-        const uint row = row_base + br;
-        for (uint bc = 0; bc < p.b; ++bc) {
-            const uint col = col_base + bc;
-            const uint value = c_prefix[ell * nn + row * p.n + col];
-            const uint weight = compress_vec[v_idx++];
-            acc = dot_step(acc, value, weight);
-        }
-    }
-
-    compressed[gid] = acc;
 }
 
 kernel void build_perturbed_specialized(
@@ -604,252 +386,33 @@ kernel void build_perturbed_specialized(
     b_prime[gid] = add_mod(matrix_b[gid], f_acc);
 }
 
-kernel void build_prefix_specialized(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* a_prime [[buffer(1)]],
-    device const uint* b_prime [[buffer(2)]],
-    device uint* c_prefix [[buffer(3)]],
-    uint gid [[thread_position_in_grid]])
+// ---------------------------------------------------------------------------
+// Product C' = A' * B' (full matrix, row-major). The result is exact modulo
+// 2^31-1 whatever the accumulation order, so every kernel below is consensus
+// equivalent to matmul::Matrix::operator*.
+//
+// Four 62-bit products plus a reduced carry fit in 64 bits:
+//   2^31 + 4 * (2^31 - 1)^2 < 2^64
+// ---------------------------------------------------------------------------
+
+inline ulong dot4_accumulate(ulong acc, uint a, uint b, thread uint& pending)
 {
-    const uint n = FC_SPEC_N;
-    const uint b = FC_SPEC_B;
-    const uint N = FC_SPEC_NBLOCKS;
-    if (p.n != n || p.b != b || p.N != N) {
-        return;
+    acc += (ulong)a * (ulong)b;
+    if (++pending == 4u) {
+        acc = reduce64(acc);
+        pending = 0u;
     }
-
-    const uint nn = n * n;
-    if (gid >= nn) {
-        return;
-    }
-
-    const uint row = gid / n;
-    const uint col = gid - row * n;
-
-    uint c_acc = 0;
-    for (uint ell = 0; ell < FC_SPEC_NBLOCKS; ++ell) {
-        const uint k_base = ell * b;
-
-        uint product = 0;
-        for (uint k = 0; k < FC_SPEC_B; ++k) {
-            const uint a = a_prime[row * n + (k_base + k)];
-            const uint b_val = b_prime[(k_base + k) * n + col];
-            product = dot_step(product, a, b_val);
-        }
-
-        c_acc = add_mod(c_acc, product);
-        c_prefix[ell * nn + gid] = c_acc;
-    }
+    return acc;
 }
 
-kernel void fused_final_compress_specialized(
+// One threadgroup per b x b output tile, one thread per element. Works for any
+// b with b*b <= MAX_BLOCK_ELEMENTS and any n divisible by b.
+kernel void build_product(
     constant KernelParams& p [[buffer(0)]],
     device const uint* a_prime [[buffer(1)]],
     device const uint* b_prime [[buffer(2)]],
-    device const uint* compress_vec [[buffer(3)]],
-    device uint* compressed [[buffer(4)]],
+    device uint* c_prime [[buffer(3)]],
     uint tid [[thread_index_in_threadgroup]],
-    uint simd_size [[threads_per_simdgroup]],
-    uint2 tgid [[threadgroup_position_in_grid]])
-{
-    const uint n = FC_SPEC_N;
-    const uint b = FC_SPEC_B;
-    const uint N = FC_SPEC_NBLOCKS;
-    if (p.n != n || p.b != b || p.N != N) {
-        return;
-    }
-
-    const uint block_elements = FC_SPEC_B * FC_SPEC_B;
-    if (block_elements == 0 || block_elements > MAX_BLOCK_ELEMENTS || tid >= block_elements) {
-        return;
-    }
-
-    const uint tile_i = tgid.y;
-    const uint tile_j = tgid.x;
-    if (tile_i >= N || tile_j >= N) {
-        return;
-    }
-
-    const uint br = tid / b;
-    const uint bc = tid - br * b;
-    const uint row = tile_i * b + br;
-    const uint col = tile_j * b + bc;
-
-    threadgroup uint weighted_terms[MAX_BLOCK_ELEMENTS];
-    const uint weight = compress_vec[tid];
-    uint c_acc = 0;
-    for (uint ell = 0; ell < FC_SPEC_NBLOCKS; ++ell) {
-        const uint k_base = ell * b;
-
-        uint product = 0;
-        for (uint k = 0; k < FC_SPEC_B; ++k) {
-            const uint a = a_prime[row * n + (k_base + k)];
-            const uint b_val = b_prime[(k_base + k) * n + col];
-            product = dot_step(product, a, b_val);
-        }
-
-        c_acc = add_mod(c_acc, product);
-    }
-
-    weighted_terms[tid] = mul_mod(c_acc, weight);
-    const uint reduced = reduce_threadgroup_add_mod(weighted_terms, tid, block_elements);
-    if (tid == 0u) {
-        compressed[tile_i * N + tile_j] = reduced;
-    }
-}
-
-kernel void compress_prefix_specialized(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* c_prefix [[buffer(1)]],
-    device const uint* compress_vec [[buffer(2)]],
-    device uint* compressed [[buffer(3)]],
-    uint gid [[thread_position_in_grid]])
-{
-    const uint n = FC_SPEC_N;
-    const uint b = FC_SPEC_B;
-    const uint N = FC_SPEC_NBLOCKS;
-    if (p.n != n || p.b != b || p.N != N) {
-        return;
-    }
-
-    const uint n3 = N * N * N;
-    if (gid >= n3) {
-        return;
-    }
-
-    const uint i = gid / (N * N);
-    const uint rem = gid - i * (N * N);
-    const uint j = rem / N;
-    const uint ell = rem - j * N;
-
-    const uint row_base = i * b;
-    const uint col_base = j * b;
-    const uint nn = n * n;
-
-    uint acc = 0;
-    uint v_idx = 0;
-    for (uint br = 0; br < FC_SPEC_B; ++br) {
-        const uint row = row_base + br;
-        for (uint bc = 0; bc < FC_SPEC_B; ++bc) {
-            const uint col = col_base + bc;
-            const uint value = c_prefix[ell * nn + row * n + col];
-            const uint weight = compress_vec[v_idx++];
-            acc = dot_step(acc, value, weight);
-        }
-    }
-
-    compressed[gid] = acc;
-}
-
-kernel void fused_prefix_compress_specialized(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* a_prime [[buffer(1)]],
-    device const uint* b_prime [[buffer(2)]],
-    device const uint* compress_vec [[buffer(3)]],
-    device uint* compressed [[buffer(4)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint simd_size [[threads_per_simdgroup]],
-    uint2 tgid [[threadgroup_position_in_grid]])
-{
-    const uint n = FC_SPEC_N;
-    const uint b = FC_SPEC_B;
-    const uint N = FC_SPEC_NBLOCKS;
-    if (p.n != n || p.b != b || p.N != N) {
-        return;
-    }
-
-    const uint block_elements = FC_SPEC_B * FC_SPEC_B;
-    if (block_elements == 0 || block_elements > MAX_BLOCK_ELEMENTS || tid >= block_elements) {
-        return;
-    }
-
-    const uint tile_i = tgid.y;
-    const uint tile_j = tgid.x;
-    if (tile_i >= N || tile_j >= N) {
-        return;
-    }
-
-    const uint br = tid / b;
-    const uint bc = tid - br * b;
-    const uint row = tile_i * b + br;
-    const uint col = tile_j * b + bc;
-
-    threadgroup uint weighted_terms[MAX_BLOCK_ELEMENTS];
-    const uint weight = compress_vec[tid];
-    uint c_acc = 0;
-
-    for (uint ell = 0; ell < FC_SPEC_NBLOCKS; ++ell) {
-        const uint k_base = ell * b;
-
-        uint product = 0;
-        for (uint k = 0; k < FC_SPEC_B; ++k) {
-            const uint a = a_prime[row * n + (k_base + k)];
-            const uint b_val = b_prime[(k_base + k) * n + col];
-            product = dot_step(product, a, b_val);
-        }
-
-        c_acc = add_mod(c_acc, product);
-        weighted_terms[tid] = mul_mod(c_acc, weight);
-        const uint reduced = reduce_threadgroup_add_mod(weighted_terms, tid, block_elements);
-        if (tid == 0u) {
-            compressed[(tile_i * N + tile_j) * N + ell] = reduced;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
-
-kernel void build_prefix_tiled(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* a_prime [[buffer(1)]],
-    device const uint* b_prime [[buffer(2)]],
-    device uint* c_prefix [[buffer(3)]],
-    uint2 gid [[thread_position_in_grid]],
-    uint2 tid [[thread_position_in_threadgroup]])
-{
-    const uint row = gid.y;
-    const uint col = gid.x;
-    if (row >= p.n || col >= p.n) {
-        return;
-    }
-
-    threadgroup uint tile_a[16][16];
-    threadgroup uint tile_b[16][16];
-
-    uint c_acc = 0;
-    for (uint ell = 0; ell < p.N; ++ell) {
-        const uint k_base = ell * p.b;
-
-        uint a_value = 0;
-        uint b_value = 0;
-        if (tid.x < p.b && tid.y < p.b) {
-            a_value = a_prime[row * p.n + (k_base + tid.x)];
-            b_value = b_prime[(k_base + tid.y) * p.n + col];
-        }
-        tile_a[tid.y][tid.x] = a_value;
-        tile_b[tid.y][tid.x] = b_value;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        uint product = 0;
-        for (uint k = 0; k < p.b; ++k) {
-            const uint a = tile_a[tid.y][k];
-            const uint b = tile_b[k][tid.x];
-            product = dot_step(product, a, b);
-        }
-
-        c_acc = add_mod(c_acc, product);
-        c_prefix[ell * (p.n * p.n) + row * p.n + col] = c_acc;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
-
-kernel void fused_prefix_compress(
-    constant KernelParams& p [[buffer(0)]],
-    device const uint* a_prime [[buffer(1)]],
-    device const uint* b_prime [[buffer(2)]],
-    device const uint* compress_vec [[buffer(3)]],
-    device uint* compressed [[buffer(4)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint simd_size [[threads_per_simdgroup]],
     uint2 tgid [[threadgroup_position_in_grid]])
 {
     const uint block_elements = p.b * p.b;
@@ -868,77 +431,156 @@ kernel void fused_prefix_compress(
     const uint row = tile_i * p.b + br;
     const uint col = tile_j * p.b + bc;
 
-    threadgroup uint weighted_terms[MAX_BLOCK_ELEMENTS];
-    const uint weight = compress_vec[tid];
-    uint c_acc = 0;
+    ulong acc = 0;
+    uint pending = 0;
+    for (uint k = 0; k < p.n; ++k) {
+        acc = dot4_accumulate(acc, a_prime[row * p.n + k], b_prime[k * p.n + col], pending);
+    }
+    c_prime[row * p.n + col] = reduce64(acc);
+}
 
-    for (uint ell = 0; ell < p.N; ++ell) {
-        const uint k_base = ell * p.b;
+kernel void build_product_specialized(
+    constant KernelParams& p [[buffer(0)]],
+    device const uint* a_prime [[buffer(1)]],
+    device const uint* b_prime [[buffer(2)]],
+    device uint* c_prime [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]])
+{
+    const uint n = FC_SPEC_N;
+    const uint b = FC_SPEC_B;
+    const uint N = FC_SPEC_NBLOCKS;
+    if (p.n != n || p.b != b || p.N != N) {
+        return;
+    }
 
-        uint product = 0;
-        for (uint k = 0; k < p.b; ++k) {
-            const uint a = a_prime[row * p.n + (k_base + k)];
-            const uint b = b_prime[(k_base + k) * p.n + col];
-            product = dot_step(product, a, b);
+    const uint block_elements = FC_SPEC_B * FC_SPEC_B;
+    if (block_elements == 0 || block_elements > MAX_BLOCK_ELEMENTS || tid >= block_elements) {
+        return;
+    }
+
+    const uint tile_i = tgid.y;
+    const uint tile_j = tgid.x;
+    if (tile_i >= N || tile_j >= N) {
+        return;
+    }
+
+    const uint br = tid / b;
+    const uint bc = tid - br * b;
+    const uint row = tile_i * b + br;
+    const uint col = tile_j * b + bc;
+
+    ulong acc = 0;
+    uint pending = 0;
+    for (uint ell = 0; ell < FC_SPEC_NBLOCKS; ++ell) {
+        const uint k_base = ell * b;
+        for (uint k = 0; k < FC_SPEC_B; ++k) {
+            acc = dot4_accumulate(acc, a_prime[row * n + (k_base + k)], b_prime[(k_base + k) * n + col], pending);
         }
+    }
+    c_prime[row * n + col] = reduce64(acc);
+}
 
-        c_acc = add_mod(c_acc, product);
-        weighted_terms[tid] = mul_mod(c_acc, weight);
-        const uint reduced = reduce_threadgroup_add_mod(weighted_terms, tid, block_elements);
-        if (tid == 0u) {
-            compressed[(tile_i * p.N + tile_j) * p.N + ell] = reduced;
+// 16x16 threadgroup-memory tiled variant: requires n % 16 == 0 (independent of
+// the transcript block size b). Grid = (n/16, n/16) threadgroups of 16x16.
+kernel void build_product_tiled(
+    constant KernelParams& p [[buffer(0)]],
+    device const uint* a_prime [[buffer(1)]],
+    device const uint* b_prime [[buffer(2)]],
+    device uint* c_prime [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]])
+{
+    const uint n = p.n;
+    if ((n % PRODUCT_TILE_DIM) != 0u) {
+        return;
+    }
+    const uint row = gid.y;
+    const uint col = gid.x;
+    if (row >= n || col >= n) {
+        return;
+    }
+
+    threadgroup uint tile_a[PRODUCT_TILE_DIM][PRODUCT_TILE_DIM];
+    threadgroup uint tile_b[PRODUCT_TILE_DIM][PRODUCT_TILE_DIM];
+
+    ulong acc = 0;
+    uint pending = 0;
+    const uint k_tiles = n / PRODUCT_TILE_DIM;
+    for (uint kt = 0; kt < k_tiles; ++kt) {
+        const uint k_base = kt * PRODUCT_TILE_DIM;
+        tile_a[tid.y][tid.x] = a_prime[row * n + (k_base + tid.x)];
+        tile_b[tid.y][tid.x] = b_prime[(k_base + tid.y) * n + col];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < PRODUCT_TILE_DIM; ++k) {
+            acc = dot4_accumulate(acc, tile_a[tid.y][k], tile_b[k][tid.x], pending);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    c_prime[row * n + col] = reduce64(acc);
 }
 
-kernel void transcript_sha256(
-    device const uint* compressed [[buffer(0)]],
-    constant HashParams& hp [[buffer(1)]],
-    device uchar* hash_output [[buffer(2)]],
+// ---------------------------------------------------------------------------
+// Product digest v4 tile hashes: one thread per b x b tile of C'. The message
+// is the tile's elements row-major as LE32 (4*b*b bytes); output is the raw
+// 32-byte SHA-256 digest at tile_hashes[32 * (tile_i * N + tile_j)].
+// (matmul::transcript::HashProductTile)
+// ---------------------------------------------------------------------------
+
+kernel void hash_product_tiles(
+    constant KernelParams& p [[buffer(0)]],
+    device const uint* c_prime [[buffer(1)]],
+    device uchar* tile_hashes [[buffer(2)]],
     uint gid [[thread_position_in_grid]])
 {
-    if (gid != 0) {
+    const uint tile_count = p.N * p.N;
+    if (gid >= tile_count) {
         return;
     }
 
-    thread uint first_state[8];
-    sha256_stream_words(compressed, hp.compressed_words, first_state);
+    const uint tile_i = gid / p.N;
+    const uint tile_j = gid - tile_i * p.N;
+    const uint row_base = tile_i * p.b;
+    const uint col_base = tile_j * p.b;
 
-    thread uint final_state[8];
-    sha256_double_digest(first_state, final_state);
+    const uint msg_len_bytes = p.b * p.b * 4u;
+    const uint total_blocks = (msg_len_bytes + 9u + 63u) / 64u;
+    const uint total_bytes = total_blocks * 64u;
+    const ulong bit_len = (ulong)msg_len_bytes * 8u;
 
-    for (uint i = 0; i < 8; ++i) {
-        const uint word = final_state[i];
-        hash_output[i * 4 + 0] = (uchar)((word >> 24u) & 0xffu);
-        hash_output[i * 4 + 1] = (uchar)((word >> 16u) & 0xffu);
-        hash_output[i * 4 + 2] = (uchar)((word >> 8u) & 0xffu);
-        hash_output[i * 4 + 3] = (uchar)(word & 0xffu);
+    thread uint state[8];
+    sha256_init(state);
+
+    thread uint w[64];
+    for (uint block = 0; block < total_blocks; ++block) {
+        for (uint i = 0; i < 16; ++i) {
+            const uint off = block * 64u + i * 4u;
+            uint word = 0u;
+            if (off < msg_len_bytes) {
+                const uint element = off >> 2u;
+                const uint er = element / p.b;
+                const uint ec = element - er * p.b;
+                // LE32 bytes of the element form a big-endian message word.
+                word = bswap32(c_prime[(row_base + er) * p.n + (col_base + ec)]);
+            } else if (off == msg_len_bytes) {
+                word = 0x80000000u;
+            } else if (off == total_bytes - 8u) {
+                word = (uint)(bit_len >> 32u);
+            } else if (off == total_bytes - 4u) {
+                word = (uint)(bit_len & 0xffffffffu);
+            }
+            w[i] = word;
+        }
+        sha256_compress(state, w);
     }
-}
 
-kernel void product_compressed_sha256(
-    device const uint* compressed [[buffer(0)]],
-    constant KernelParams& kp [[buffer(1)]],
-    device uchar* hash_output [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid != 0) {
-        return;
-    }
-
-    const uint final_words = kp.N * kp.N;
-    thread uint first_state[8];
-    sha256_stream_final_ell_words(compressed, kp.N, final_words, first_state);
-
-    thread uint final_state[8];
-    sha256_double_digest(first_state, final_state);
-
+    device uchar* out = tile_hashes + gid * 32u;
     for (uint i = 0; i < 8; ++i) {
-        const uint word = final_state[i];
-        hash_output[i * 4 + 0] = (uchar)((word >> 24u) & 0xffu);
-        hash_output[i * 4 + 1] = (uchar)((word >> 16u) & 0xffu);
-        hash_output[i * 4 + 2] = (uchar)((word >> 8u) & 0xffu);
-        hash_output[i * 4 + 3] = (uchar)(word & 0xffu);
+        const uint word = state[i];
+        out[i * 4u + 0u] = (uchar)((word >> 24u) & 0xffu);
+        out[i * 4u + 1u] = (uchar)((word >> 16u) & 0xffu);
+        out[i * 4u + 2u] = (uchar)((word >> 8u) & 0xffu);
+        out[i * 4u + 3u] = (uchar)(word & 0xffu);
     }
 }

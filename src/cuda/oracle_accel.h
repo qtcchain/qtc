@@ -15,20 +15,22 @@
 
 namespace qtc::cuda {
 
+/** Device-resident low-rank noise for one digest request (QTC O5 / oracle v2).
+ *  storage = [E_L (n*r) | E_R (r*n) | F_L (n*r) | F_R (r*n)] as row-major words.
+ *  The v3 compression vector is gone: the v4 product digest hashes every C'
+ *  tile in full and has no linear compression stage. */
 struct MatMulGeneratedInputsDevice {
     int device_index{-1};
     uint32_t n{0};
     uint32_t b{0};
     uint32_t r{0};
     uint32_t noise_words{0};
-    uint32_t compress_words{0};
     matmul::field::Element* storage{nullptr};
     void* ready_event{nullptr};
     matmul::field::Element* noise_e_l{nullptr};
     matmul::field::Element* noise_e_r{nullptr};
     matmul::field::Element* noise_f_l{nullptr};
     matmul::field::Element* noise_f_r{nullptr};
-    matmul::field::Element* compress_vec{nullptr};
 
     MatMulGeneratedInputsDevice() = default;
     MatMulGeneratedInputsDevice(const MatMulGeneratedInputsDevice&) = delete;
@@ -52,7 +54,6 @@ struct MatMulInputGenerationResult {
     std::vector<matmul::field::Element> noise_e_r;
     std::vector<matmul::field::Element> noise_f_l;
     std::vector<matmul::field::Element> noise_f_r;
-    std::vector<matmul::field::Element> compress_vec;
     std::string error;
 };
 
@@ -75,6 +76,15 @@ struct MatMulInputGenerationDeviceBatchResult {
     bool available{false};
     bool success{false};
     std::vector<std::shared_ptr<const MatMulGeneratedInputsDevice>> inputs;
+    std::string error;
+};
+
+/** Direct oracle-v2 evaluation on the device (parity tests and tooling):
+ *  values[k] = matmul::field::from_oracle(seed, start_index + k). */
+struct MatMulOracleFillResult {
+    bool available{false};
+    bool success{false};
+    std::vector<matmul::field::Element> values;
     std::string error;
 };
 
@@ -119,7 +129,6 @@ struct MatMulInputGenerationProfile {
     uint64_t allocation_events{0};
     uint64_t reuse_events{0};
     double last_encode_noise_us{0.0};
-    double last_encode_compress_us{0.0};
     double last_submit_wait_us{0.0};
     double last_gpu_generation_ms{0.0};
     std::string library_source;
@@ -131,6 +140,7 @@ MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationR
 MatMulInputGenerationDeviceResult GenerateMatMulInputsGPUDevice(const MatMulInputGenerationRequest& request);
 MatMulInputGenerationDeviceBatchResult GenerateMatMulInputsGPUDeviceBatch(
     const MatMulInputGenerationDeviceBatchRequest& request);
+MatMulOracleFillResult FillFromOracleGPU(const uint256& seed, uint32_t start_index, uint32_t count);
 MatMulNonceSeedPreHashScanResult ScanMatMulNonceSeedPreHashGPU(
     const MatMulNonceSeedPreHashScanRequest& request);
 

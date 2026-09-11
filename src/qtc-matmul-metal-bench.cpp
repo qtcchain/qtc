@@ -6,6 +6,7 @@
 #include <matmul/noise.h>
 #include <matmul/transcript.h>
 #include <metal/matmul_accel.h>
+#include <pow.h>
 #include <primitives/block.h>
 #include <uint256.h>
 #include <util/translation.h>
@@ -29,6 +30,19 @@
 #include <thread>
 #include <vector>
 
+// qtc-matmul-metal-bench: measures Metal product digest v4 attempts per second.
+//
+// One request == batch_size mining attempts. Each attempt computes
+// A' = A + E_L*E_R, B' = B + F_L*F_R, C' = A'*B', the N*N per-tile SHA-256
+// hashes on the device and the root + tagged SHA256d on the host. The reported
+// "digest" rate is therefore the attempt rate of the Metal digest stage; sigma
+// and noise generation (CPU) are excluded from the timed region unless
+// --include-input-prep=1.
+//
+//   --variable-base 1   uses the mining path (per-nonce oracle-v2 base
+//                       matrices generated on the device).
+//   --variable-base 0   uses uploaded base matrices (fixed A/B).
+
 const TranslateFn G_TRANSLATION_FUN{nullptr};
 
 namespace {
@@ -42,17 +56,20 @@ struct Options {
     uint32_t warmup{2};
     uint32_t iterations{8};
     bool uploaded_base{true};
+    bool variable_base{false};
+    bool include_input_prep{false};
     std::optional<uint32_t> pool_slots_override;
-    qtc::metal::MatMulDigestMode digest_mode{qtc::metal::MatMulDigestMode::TRANSCRIPT};
+    qtc::metal::MatMulDigestMode digest_mode{qtc::metal::MatMulDigestMode::PRODUCT_COMMITTED};
 };
 
 struct Sample {
     double request_us{0.0};
     double per_digest_us{0.0};
     double encode_build_us{0.0};
-    double encode_fused_prefix_compress_us{0.0};
-    double encode_transcript_sha256_us{0.0};
+    double encode_product_us{0.0};
+    double encode_tile_hash_us{0.0};
     double submit_wait_us{0.0};
+    double cpu_finalize_us{0.0};
     bool zero_copy_inputs{false};
     bool async_submission{false};
 };
@@ -171,8 +188,10 @@ void PrintUsage(std::ostream& out)
         << " [--batch-size <count>] [--parallel <threads>]"
         << " [--warmup <count>] [--iterations <count>]"
         << " [--pool-slots <count>]"
-        << " [--digest-mode <transcript|product>]"
-        << " [--uploaded-base <0|1>]" << std::endl;
+        << " [--digest-mode <product|transcript>]"
+        << " [--uploaded-base <0|1>]"
+        << " [--variable-base <0|1>]"
+        << " [--include-input-prep <0|1>]" << std::endl;
 }
 
 bool ParseArgs(int argc, char* argv[], Options& options)
@@ -209,6 +228,18 @@ bool ParseArgs(int argc, char* argv[], Options& options)
             return true;
         };
 
+        auto parse_bool_option = [&](std::string_view name, bool& target) -> bool {
+            return parse_kv(name, [&](std::string_view value) {
+                bool parsed{false};
+                if (!ParseBoolArg(value, parsed)) {
+                    std::cerr << "error: invalid value for " << name << ": " << value << std::endl;
+                    return false;
+                }
+                target = parsed;
+                return true;
+            });
+        };
+
         bool consumed = false;
         if (arg == "--n" || arg.rfind("--n=", 0) == 0) {
             consumed = true;
@@ -243,19 +274,19 @@ bool ParseArgs(int argc, char* argv[], Options& options)
                 })) return false;
         } else if (arg == "--uploaded-base" || arg.rfind("--uploaded-base=", 0) == 0) {
             consumed = true;
-            if (!parse_kv("--uploaded-base", [&](std::string_view value) {
-                    bool parsed{false};
-                    if (!ParseBoolArg(value, parsed)) {
-                        std::cerr << "error: invalid value for --uploaded-base: " << value << std::endl;
-                        return false;
-                    }
-                    options.uploaded_base = parsed;
-                    return true;
-                })) return false;
+            if (!parse_bool_option("--uploaded-base", options.uploaded_base)) return false;
+        } else if (arg == "--variable-base" || arg.rfind("--variable-base=", 0) == 0) {
+            consumed = true;
+            if (!parse_bool_option("--variable-base", options.variable_base)) return false;
+        } else if (arg == "--include-input-prep" || arg.rfind("--include-input-prep=", 0) == 0) {
+            consumed = true;
+            if (!parse_bool_option("--include-input-prep", options.include_input_prep)) return false;
         } else if (arg == "--digest-mode" || arg.rfind("--digest-mode=", 0) == 0) {
             consumed = true;
             if (!parse_kv("--digest-mode", [&](std::string_view value) {
                     if (value == "transcript") {
+                        // Not served by Metal since product digest v4; kept so
+                        // the clean rejection path can be exercised.
                         options.digest_mode = qtc::metal::MatMulDigestMode::TRANSCRIPT;
                         return true;
                     }
@@ -320,32 +351,88 @@ UniValue SummarizeSeries(const std::vector<double>& values)
     return out;
 }
 
+// Per-request inputs for one batch of attempts.
+struct BatchInputs {
+    std::vector<uint256> sigmas;
+    std::vector<uint256> seeds_a;
+    std::vector<uint256> seeds_b;
+    std::vector<matmul::noise::NoisePair> noises;
+    std::vector<const matmul::field::Element*> noise_e_l_ptrs;
+    std::vector<const matmul::field::Element*> noise_e_r_ptrs;
+    std::vector<const matmul::field::Element*> noise_f_l_ptrs;
+    std::vector<const matmul::field::Element*> noise_f_r_ptrs;
+
+    void Prepare(const Options& options, CBlockHeader& nonce_header)
+    {
+        sigmas.clear();
+        seeds_a.clear();
+        seeds_b.clear();
+        noises.clear();
+        noise_e_l_ptrs.assign(options.batch_size, nullptr);
+        noise_e_r_ptrs.assign(options.batch_size, nullptr);
+        noise_f_l_ptrs.assign(options.batch_size, nullptr);
+        noise_f_r_ptrs.assign(options.batch_size, nullptr);
+        for (uint32_t i = 0; i < options.batch_size; ++i) {
+            nonce_header.nNonce64 += 1;
+            nonce_header.nNonce = static_cast<uint32_t>(nonce_header.nNonce64);
+            if (options.variable_base) {
+                nonce_header.seed_a = DeterministicMatMulSeedV2(nonce_header, /*activation_height=*/0, 0);
+                nonce_header.seed_b = DeterministicMatMulSeedV2(nonce_header, /*activation_height=*/0, 1);
+            }
+            seeds_a.push_back(nonce_header.seed_a);
+            seeds_b.push_back(nonce_header.seed_b);
+            const uint256 sigma = matmul::DeriveSigma(nonce_header);
+            sigmas.push_back(sigma);
+            noises.push_back(matmul::noise::Generate(sigma, options.n, options.r));
+        }
+        for (uint32_t i = 0; i < options.batch_size; ++i) {
+            noise_e_l_ptrs[i] = noises[i].E_L.data();
+            noise_e_r_ptrs[i] = noises[i].E_R.data();
+            noise_f_l_ptrs[i] = noises[i].F_L.data();
+            noise_f_r_ptrs[i] = noises[i].F_R.data();
+        }
+    }
+};
+
 bool RunDigestRequest(const Options& options,
                       const matmul::Matrix& matrix_a,
                       const matmul::Matrix& matrix_b,
-                      const std::vector<uint256>& sigmas,
-                      const std::vector<const matmul::field::Element*>& noise_e_l_ptrs,
-                      const std::vector<const matmul::field::Element*>& noise_e_r_ptrs,
-                      const std::vector<const matmul::field::Element*>& noise_f_l_ptrs,
-                      const std::vector<const matmul::field::Element*>& noise_f_r_ptrs,
-                      const std::vector<const matmul::field::Element*>& compress_ptrs,
+                      const BatchInputs& inputs,
                       std::string& error)
 {
+    if (options.variable_base) {
+        const auto result = qtc::metal::ComputeCanonicalTranscriptDigestVariableBaseBatch({
+            .n = options.n,
+            .b = options.b,
+            .r = options.r,
+            .batch_size = options.batch_size,
+            .digest_mode = options.digest_mode,
+            .sigmas = inputs.sigmas.data(),
+            .matrix_a_seeds = inputs.seeds_a.data(),
+            .matrix_b_seeds = inputs.seeds_b.data(),
+            .noise_e_l = inputs.noise_e_l_ptrs.data(),
+            .noise_e_r = inputs.noise_e_r_ptrs.data(),
+            .noise_f_l = inputs.noise_f_l_ptrs.data(),
+            .noise_f_r = inputs.noise_f_r_ptrs.data(),
+        });
+        error = result.error;
+        return result.success;
+    }
+
     if (options.batch_size == 1) {
         const auto result = qtc::metal::ComputeCanonicalTranscriptDigest({
             .n = options.n,
             .b = options.b,
             .r = options.r,
             .digest_mode = options.digest_mode,
-            .sigma = sigmas[0],
+            .sigma = inputs.sigmas[0],
             .matrix_a = options.uploaded_base ? nullptr : matrix_a.data(),
             .matrix_b = options.uploaded_base ? nullptr : matrix_b.data(),
             .use_uploaded_base_matrices = options.uploaded_base,
-            .noise_e_l = noise_e_l_ptrs[0],
-            .noise_e_r = noise_e_r_ptrs[0],
-            .noise_f_l = noise_f_l_ptrs[0],
-            .noise_f_r = noise_f_r_ptrs[0],
-            .compress_vec = compress_ptrs[0],
+            .noise_e_l = inputs.noise_e_l_ptrs[0],
+            .noise_e_r = inputs.noise_e_r_ptrs[0],
+            .noise_f_l = inputs.noise_f_l_ptrs[0],
+            .noise_f_r = inputs.noise_f_r_ptrs[0],
         });
         error = result.error;
         return result.success;
@@ -357,18 +444,33 @@ bool RunDigestRequest(const Options& options,
         .r = options.r,
         .batch_size = options.batch_size,
         .digest_mode = options.digest_mode,
-        .sigmas = sigmas.data(),
+        .sigmas = inputs.sigmas.data(),
         .matrix_a = options.uploaded_base ? nullptr : matrix_a.data(),
         .matrix_b = options.uploaded_base ? nullptr : matrix_b.data(),
         .use_uploaded_base_matrices = options.uploaded_base,
-        .noise_e_l = noise_e_l_ptrs.data(),
-        .noise_e_r = noise_e_r_ptrs.data(),
-        .noise_f_l = noise_f_l_ptrs.data(),
-        .noise_f_r = noise_f_r_ptrs.data(),
-        .compress_vec = compress_ptrs.data(),
+        .noise_e_l = inputs.noise_e_l_ptrs.data(),
+        .noise_e_r = inputs.noise_e_r_ptrs.data(),
+        .noise_f_l = inputs.noise_f_l_ptrs.data(),
+        .noise_f_r = inputs.noise_f_r_ptrs.data(),
     });
     error = result.error;
     return result.success;
+}
+
+Sample MakeSample(const Options& options, double request_us)
+{
+    const auto profiling = qtc::metal::ProbeMatMulProfilingStats();
+    return Sample{
+        .request_us = request_us,
+        .per_digest_us = request_us / static_cast<double>(options.batch_size),
+        .encode_build_us = profiling.last_encode_build_perturbed_us,
+        .encode_product_us = profiling.last_encode_fused_prefix_compress_us,
+        .encode_tile_hash_us = profiling.last_encode_transcript_sha256_us,
+        .submit_wait_us = profiling.last_submit_wait_us,
+        .cpu_finalize_us = profiling.last_cpu_finalize_us,
+        .zero_copy_inputs = profiling.last_zero_copy_inputs,
+        .async_submission = profiling.last_async_submission,
+    };
 }
 
 } // namespace
@@ -398,6 +500,8 @@ int main(int argc, char* argv[])
     options_obj.pushKV("warmup", options.warmup);
     options_obj.pushKV("iterations", options.iterations);
     options_obj.pushKV("uploaded_base", options.uploaded_base);
+    options_obj.pushKV("variable_base", options.variable_base);
+    options_obj.pushKV("include_input_prep", options.include_input_prep);
     options_obj.pushKV("digest_mode",
                        options.digest_mode == qtc::metal::MatMulDigestMode::PRODUCT_COMMITTED
                            ? "product"
@@ -419,10 +523,14 @@ int main(int argc, char* argv[])
 
     const auto probe = qtc::metal::ProbeMatMulDigestAcceleration();
     const auto kernel_profile = qtc::metal::ProbeMatMulKernelProfile();
+    const auto device_info = qtc::metal::ProbeMatMulDeviceInfo();
     UniValue probe_obj(UniValue::VOBJ);
     probe_obj.pushKV("available", probe.available);
     probe_obj.pushKV("reason", probe.reason);
+    probe_obj.pushKV("device_name", device_info.device_name);
+    probe_obj.pushKV("gpu_core_count", device_info.gpu_core_count);
     probe_obj.pushKV("library_source", kernel_profile.library_source);
+    probe_obj.pushKV("kernel_pipeline", kernel_profile.reason);
     output.pushKV("probe", std::move(probe_obj));
 
     if (!probe.available) {
@@ -435,7 +543,7 @@ int main(int argc, char* argv[])
     const matmul::Matrix matrix_b = matmul::FromSeed(template_header.seed_b, options.n);
 
     UniValue upload_obj(UniValue::VOBJ);
-    if (options.uploaded_base) {
+    if (options.uploaded_base && !options.variable_base) {
         const auto uploaded = qtc::metal::UploadBaseMatrices({
             .n = options.n,
             .matrix_a = matrix_a.data(),
@@ -464,186 +572,78 @@ int main(int argc, char* argv[])
     std::optional<std::chrono::steady_clock::time_point> aggregate_start;
     std::optional<std::chrono::steady_clock::time_point> aggregate_stop;
 
-    if (options.parallel == 1) {
+    auto run_thread = [&](uint32_t thread_index, IterationGate* gate, ThreadRunState& state) {
         CBlockHeader nonce_header{template_header};
-        std::vector<matmul::noise::NoisePair> noises;
-        std::vector<std::vector<matmul::field::Element>> compress_vectors;
-        std::vector<uint256> sigmas;
-        std::vector<const matmul::field::Element*> noise_e_l_ptrs(options.batch_size);
-        std::vector<const matmul::field::Element*> noise_e_r_ptrs(options.batch_size);
-        std::vector<const matmul::field::Element*> noise_f_l_ptrs(options.batch_size);
-        std::vector<const matmul::field::Element*> noise_f_r_ptrs(options.batch_size);
-        std::vector<const matmul::field::Element*> compress_ptrs(options.batch_size);
-        noises.reserve(options.batch_size);
-        compress_vectors.reserve(options.batch_size);
-        sigmas.reserve(options.batch_size);
+        nonce_header.nNonce64 += static_cast<uint64_t>(thread_index) << 32;
+        nonce_header.nNonce = static_cast<uint32_t>(nonce_header.nNonce64);
+        BatchInputs inputs;
+        state.samples.reserve(options.iterations);
 
         for (uint32_t run = 0; run < total_runs; ++run) {
-            noises.clear();
-            compress_vectors.clear();
-            sigmas.clear();
-            for (uint32_t i = 0; i < options.batch_size; ++i) {
-                nonce_header.nNonce64 += 1;
-                nonce_header.nNonce = static_cast<uint32_t>(nonce_header.nNonce64);
-                const uint256 sigma = matmul::DeriveSigma(nonce_header);
-                sigmas.push_back(sigma);
-                noises.push_back(matmul::noise::Generate(sigma, options.n, options.r));
-                compress_vectors.push_back(matmul::transcript::DeriveCompressionVector(sigma, options.b));
-                noise_e_l_ptrs[i] = noises[i].E_L.data();
-                noise_e_r_ptrs[i] = noises[i].E_R.data();
-                noise_f_l_ptrs[i] = noises[i].F_L.data();
-                noise_f_r_ptrs[i] = noises[i].F_R.data();
-                compress_ptrs[i] = compress_vectors[i].data();
+            std::optional<std::chrono::steady_clock::time_point> prep_start;
+            if (options.include_input_prep) {
+                prep_start = std::chrono::steady_clock::now();
+            }
+            inputs.Prepare(options, nonce_header);
+
+            if (gate != nullptr && !gate->ArriveAndWait()) {
+                return;
             }
 
             std::string error;
-            const auto start = std::chrono::steady_clock::now();
-            const bool ok = RunDigestRequest(options,
-                                             matrix_a,
-                                             matrix_b,
-                                             sigmas,
-                                             noise_e_l_ptrs,
-                                             noise_e_r_ptrs,
-                                             noise_f_l_ptrs,
-                                             noise_f_r_ptrs,
-                                             compress_ptrs,
-                                             error);
+            const auto start = prep_start.has_value() ? *prep_start : std::chrono::steady_clock::now();
+            const bool ok = RunDigestRequest(options, matrix_a, matrix_b, inputs, error);
             const auto stop = std::chrono::steady_clock::now();
             if (!ok) {
-                output.pushKV("error", error);
-                std::cout << output.write(2) << std::endl;
-                return 1;
+                state.error = error;
+                if (gate != nullptr) gate->Abort();
+                return;
             }
 
             if (run >= options.warmup) {
-                const auto profiling = qtc::metal::ProbeMatMulProfilingStats();
                 const double request_us = std::chrono::duration<double, std::micro>(stop - start).count();
-                samples.push_back({
-                    .request_us = request_us,
-                    .per_digest_us = request_us / static_cast<double>(options.batch_size),
-                    .encode_build_us = profiling.last_encode_build_perturbed_us,
-                    .encode_fused_prefix_compress_us = profiling.last_encode_fused_prefix_compress_us,
-                    .encode_transcript_sha256_us = profiling.last_encode_transcript_sha256_us,
-                    .submit_wait_us = profiling.last_submit_wait_us,
-                    .zero_copy_inputs = profiling.last_zero_copy_inputs,
-                    .async_submission = profiling.last_async_submission,
-                });
-                if (!aggregate_start.has_value()) {
-                    aggregate_start = start;
+                state.samples.push_back(MakeSample(options, request_us));
+                if (!state.first_measured_start.has_value()) {
+                    state.first_measured_start = start;
                 }
-                aggregate_stop = stop;
+                state.last_measured_stop = stop;
             }
         }
+    };
+
+    std::vector<ThreadRunState> thread_states(options.parallel);
+    if (options.parallel == 1) {
+        run_thread(0, nullptr, thread_states[0]);
     } else {
         IterationGate gate(options.parallel);
-        std::vector<ThreadRunState> thread_states(options.parallel);
         std::vector<std::thread> workers;
         workers.reserve(options.parallel);
-
         for (uint32_t thread_index = 0; thread_index < options.parallel; ++thread_index) {
             workers.emplace_back([&, thread_index] {
-                CBlockHeader nonce_header{template_header};
-                nonce_header.nNonce64 += static_cast<uint64_t>(thread_index) << 32;
-                nonce_header.nNonce = static_cast<uint32_t>(nonce_header.nNonce64);
-
-                std::vector<matmul::noise::NoisePair> noises;
-                std::vector<std::vector<matmul::field::Element>> compress_vectors;
-                std::vector<uint256> sigmas;
-                std::vector<const matmul::field::Element*> noise_e_l_ptrs(options.batch_size);
-                std::vector<const matmul::field::Element*> noise_e_r_ptrs(options.batch_size);
-                std::vector<const matmul::field::Element*> noise_f_l_ptrs(options.batch_size);
-                std::vector<const matmul::field::Element*> noise_f_r_ptrs(options.batch_size);
-                std::vector<const matmul::field::Element*> compress_ptrs(options.batch_size);
-                noises.reserve(options.batch_size);
-                compress_vectors.reserve(options.batch_size);
-                sigmas.reserve(options.batch_size);
-
-                auto& state = thread_states[thread_index];
-                state.samples.reserve(options.iterations);
-                for (uint32_t run = 0; run < total_runs; ++run) {
-                    noises.clear();
-                    compress_vectors.clear();
-                    sigmas.clear();
-                    for (uint32_t i = 0; i < options.batch_size; ++i) {
-                        nonce_header.nNonce64 += 1;
-                        nonce_header.nNonce = static_cast<uint32_t>(nonce_header.nNonce64);
-                        const uint256 sigma = matmul::DeriveSigma(nonce_header);
-                        sigmas.push_back(sigma);
-                        noises.push_back(matmul::noise::Generate(sigma, options.n, options.r));
-                        compress_vectors.push_back(matmul::transcript::DeriveCompressionVector(sigma, options.b));
-                        noise_e_l_ptrs[i] = noises[i].E_L.data();
-                        noise_e_r_ptrs[i] = noises[i].E_R.data();
-                        noise_f_l_ptrs[i] = noises[i].F_L.data();
-                        noise_f_r_ptrs[i] = noises[i].F_R.data();
-                        compress_ptrs[i] = compress_vectors[i].data();
-                    }
-
-                    if (!gate.ArriveAndWait()) {
-                        return;
-                    }
-
-                    std::string error;
-                    const auto start = std::chrono::steady_clock::now();
-                    const bool ok = RunDigestRequest(options,
-                                                     matrix_a,
-                                                     matrix_b,
-                                                     sigmas,
-                                                     noise_e_l_ptrs,
-                                                     noise_e_r_ptrs,
-                                                     noise_f_l_ptrs,
-                                                     noise_f_r_ptrs,
-                                                     compress_ptrs,
-                                                     error);
-                    const auto stop = std::chrono::steady_clock::now();
-                    if (!ok) {
-                        state.error = error;
-                        gate.Abort();
-                        return;
-                    }
-
-                    if (run >= options.warmup) {
-                        const auto profiling = qtc::metal::ProbeMatMulProfilingStats();
-                        const double request_us = std::chrono::duration<double, std::micro>(stop - start).count();
-                        state.samples.push_back({
-                            .request_us = request_us,
-                            .per_digest_us = request_us / static_cast<double>(options.batch_size),
-                            .encode_build_us = profiling.last_encode_build_perturbed_us,
-                            .encode_fused_prefix_compress_us = profiling.last_encode_fused_prefix_compress_us,
-                            .encode_transcript_sha256_us = profiling.last_encode_transcript_sha256_us,
-                            .submit_wait_us = profiling.last_submit_wait_us,
-                            .zero_copy_inputs = profiling.last_zero_copy_inputs,
-                            .async_submission = profiling.last_async_submission,
-                        });
-                        if (!state.first_measured_start.has_value()) {
-                            state.first_measured_start = start;
-                        }
-                        state.last_measured_stop = stop;
-                    }
-                }
+                run_thread(thread_index, &gate, thread_states[thread_index]);
             });
         }
-
         for (auto& worker : workers) {
             worker.join();
         }
+    }
 
-        for (const auto& state : thread_states) {
-            if (!state.error.empty()) {
-                output.pushKV("error", state.error);
-                std::cout << output.write(2) << std::endl;
-                return 1;
-            }
-            samples.insert(samples.end(), state.samples.begin(), state.samples.end());
-            if (state.first_measured_start.has_value()) {
-                aggregate_start = aggregate_start.has_value()
-                    ? std::min(*aggregate_start, *state.first_measured_start)
-                    : state.first_measured_start;
-            }
-            if (state.last_measured_stop.has_value()) {
-                aggregate_stop = aggregate_stop.has_value()
-                    ? std::max(*aggregate_stop, *state.last_measured_stop)
-                    : state.last_measured_stop;
-            }
+    for (const auto& state : thread_states) {
+        if (!state.error.empty()) {
+            output.pushKV("error", state.error);
+            std::cout << output.write(2) << std::endl;
+            return 1;
+        }
+        samples.insert(samples.end(), state.samples.begin(), state.samples.end());
+        if (state.first_measured_start.has_value()) {
+            aggregate_start = aggregate_start.has_value()
+                ? std::min(*aggregate_start, *state.first_measured_start)
+                : state.first_measured_start;
+        }
+        if (state.last_measured_stop.has_value()) {
+            aggregate_stop = aggregate_stop.has_value()
+                ? std::max(*aggregate_stop, *state.last_measured_stop)
+                : state.last_measured_stop;
         }
     }
 
@@ -652,24 +652,20 @@ int main(int argc, char* argv[])
     std::vector<double> request_us_values;
     std::vector<double> per_digest_us_values;
     std::vector<double> encode_build_us_values;
-    std::vector<double> encode_fused_us_values;
-    std::vector<double> encode_hash_us_values;
+    std::vector<double> encode_product_us_values;
+    std::vector<double> encode_tile_hash_us_values;
     std::vector<double> submit_wait_us_values;
+    std::vector<double> cpu_finalize_us_values;
     uint64_t zero_copy_samples{0};
     uint64_t async_samples{0};
-    request_us_values.reserve(samples.size());
-    per_digest_us_values.reserve(samples.size());
-    encode_build_us_values.reserve(samples.size());
-    encode_fused_us_values.reserve(samples.size());
-    encode_hash_us_values.reserve(samples.size());
-    submit_wait_us_values.reserve(samples.size());
     for (const auto& sample : samples) {
         request_us_values.push_back(sample.request_us);
         per_digest_us_values.push_back(sample.per_digest_us);
         encode_build_us_values.push_back(sample.encode_build_us);
-        encode_fused_us_values.push_back(sample.encode_fused_prefix_compress_us);
-        encode_hash_us_values.push_back(sample.encode_transcript_sha256_us);
+        encode_product_us_values.push_back(sample.encode_product_us);
+        encode_tile_hash_us_values.push_back(sample.encode_tile_hash_us);
         submit_wait_us_values.push_back(sample.submit_wait_us);
+        cpu_finalize_us_values.push_back(sample.cpu_finalize_us);
         if (sample.zero_copy_inputs) {
             ++zero_copy_samples;
         }
@@ -684,6 +680,7 @@ int main(int argc, char* argv[])
     const double mean_per_digest_us = Mean(per_digest_us_values);
     const double mean_request_digests_per_sec = mean_per_digest_us > 0.0 ? 1'000'000.0 / mean_per_digest_us : 0.0;
     summary.pushKV("mean_request_digests_per_sec", mean_request_digests_per_sec);
+    summary.pushKV("mean_request_attempts_per_sec", mean_request_digests_per_sec);
     summary.pushKV("request_us", SummarizeSeries(request_us_values));
     summary.pushKV("per_digest_us", SummarizeSeries(per_digest_us_values));
     summary.pushKV("zero_copy_samples", zero_copy_samples);
@@ -699,22 +696,26 @@ int main(int argc, char* argv[])
         summary.pushKV("aggregate_wall_us", aggregate_wall_us);
         summary.pushKV("aggregate_requests_per_sec", aggregate_requests_per_sec);
         summary.pushKV("aggregate_digests_per_sec", aggregate_digests_per_sec);
+        summary.pushKV("aggregate_attempts_per_sec", aggregate_digests_per_sec);
     } else {
         summary.pushKV("aggregate_wall_us", 0.0);
         summary.pushKV("aggregate_requests_per_sec", 0.0);
         summary.pushKV("aggregate_digests_per_sec", 0.0);
+        summary.pushKV("aggregate_attempts_per_sec", 0.0);
     }
     summary.pushKV("parallel_profiling_reliable", options.parallel == 1);
     if (options.parallel == 1) {
         summary.pushKV("encode_build_perturbed_us", SummarizeSeries(encode_build_us_values));
-        summary.pushKV("encode_fused_prefix_compress_us", SummarizeSeries(encode_fused_us_values));
-        summary.pushKV("encode_transcript_sha256_us", SummarizeSeries(encode_hash_us_values));
+        summary.pushKV("encode_product_gemm_us", SummarizeSeries(encode_product_us_values));
+        summary.pushKV("encode_tile_hash_us", SummarizeSeries(encode_tile_hash_us_values));
         summary.pushKV("submit_wait_us", SummarizeSeries(submit_wait_us_values));
+        summary.pushKV("cpu_finalize_us", SummarizeSeries(cpu_finalize_us_values));
     } else {
         summary.pushKV("encode_build_perturbed_us", UniValue());
-        summary.pushKV("encode_fused_prefix_compress_us", UniValue());
-        summary.pushKV("encode_transcript_sha256_us", UniValue());
+        summary.pushKV("encode_product_gemm_us", UniValue());
+        summary.pushKV("encode_tile_hash_us", UniValue());
         summary.pushKV("submit_wait_us", UniValue());
+        summary.pushKV("cpu_finalize_us", UniValue());
     }
     output.pushKV("summary", std::move(summary));
 

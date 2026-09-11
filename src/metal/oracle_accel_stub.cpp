@@ -25,6 +25,15 @@ MatMulInputGenerationResult GenerateMatMulInputsGPU(const MatMulInputGenerationR
     return result;
 }
 
+MatMulOracleVectorResult GenerateOracleVectorGPUForTesting(const uint256&, uint32_t)
+{
+    MatMulOracleVectorResult result;
+    result.available = false;
+    result.success = false;
+    result.error = "Metal oracle acceleration is unavailable on this build";
+    return result;
+}
+
 MatMulNonceSeedPreHashScanResult ScanMatMulNonceSeedPreHashGPU(const MatMulNonceSeedPreHashScanRequest&)
 {
     MatMulNonceSeedPreHashScanResult result;
