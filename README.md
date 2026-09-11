@@ -1260,3 +1260,11 @@ Released under the [MIT License](COPYING).
 
 Copyright (c) 2009-2025 The Bitcoin Core developers
 Copyright (c) 2026 The QTC developers
+
+## Contributing and repository protection
+
+`main` accepts changes only through pull requests: the `protect-main` ruleset (applied by
+`contrib/devtools/github-protect-main.sh` the moment the repository is public, since GitHub offers rulesets only on
+public repositories or paid plans) blocks direct pushes, force pushes and deletions for everyone including admins,
+requires a linear history, resolved review threads, and the pull-request CI checks. Release tags `v*` cannot be
+deleted or moved. Maintainers publish by pushing a branch and merging its pull request.
