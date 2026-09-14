@@ -385,3 +385,9 @@ standardness (CHECKSIG leaves `htlc_tx`/`htlc_sha256` standard, CSFS leaf non-st
 support), fail-closed ASERT with fatal startup validation (F-5), headers-sync slot reclaim, ZMQ default-ON with a
 fail-closed release ship gate (`scripts/release/verify_release_qtcd.py`). Detail: QTC-SECURITY-REVIEW.md
 "Upstream-derived hardening applied". Consensus and genesis unchanged from 0.0.7.
+
+### DONE — launch freeze items 1–5 (2026-09-14) ✅
+Seeds compiled in (M-3: `seed.qtc.gold`, `seed.qtc.exchange`, testnet variants; fixed seeds and mining mesh = the two
+inbound launch nodes), stale upstream bootstrap names purged from docs/scripts/RPC help, help text aligned with code
+(review Info items), M-11 template-readiness guard implemented with 16 unit cases, auto-update confirmed off with no
+key compiled in (D3). Consensus unchanged from 0.0.7.

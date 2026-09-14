@@ -562,10 +562,9 @@ QTC_MINING_MAX_LOOPS=4 \
   --address-file="${TMPDIR}/address.txt" \
   --sleep=0 >/dev/null 2>&1
 
-grep -q "peer-bootstrap-refresh reason=insufficient_peer_consensus attempted=3 succeeded=3 failed=0" "${RESULTS_DIR}/live-mining-health.log"
-grep -q "addnode node.qtc.dev:19335 onetry" "${STATE_DIR}/addnode.log"
-grep -q "addnode node.qtcchain.org:19335 onetry" "${STATE_DIR}/addnode.log"
-grep -q "addnode node.qtc.tools:19335 onetry" "${STATE_DIR}/addnode.log"
+grep -q "peer-bootstrap-refresh reason=insufficient_peer_consensus attempted=2 succeeded=2 failed=0" "${RESULTS_DIR}/live-mining-health.log"
+grep -q "addnode 157.230.194.146:19755 onetry" "${STATE_DIR}/addnode.log"
+grep -q "addnode 167.99.181.131:19755 onetry" "${STATE_DIR}/addnode.log"
 
 STATE_DIR="${TMPDIR}/state-cached-peers"
 RESULTS_DIR="${TMPDIR}/results-cached-peers"
@@ -607,7 +606,7 @@ JSON
     ;;
   getpeerinfo)
     cat <<JSON
-[{"inbound":false,"addr":"100.85.221.75:19335","connection_type":"manual","minping":0.001,"synced_headers":100,"synced_blocks":100},{"inbound":false,"addr":"node.qtc.tools:19335","connection_type":"manual","minping":0.050,"synced_headers":100,"synced_blocks":100},{"inbound":false,"addr":"221.240.90.124:19335","connection_type":"outbound-full-relay","minping":0.003,"synced_headers":100,"synced_blocks":100},{"inbound":false,"addr":"147.182.192.221:19335","connection_type":"outbound-full-relay","minping":0.108,"synced_headers":100,"synced_blocks":100}]
+[{"inbound":false,"addr":"100.85.221.75:19335","connection_type":"manual","minping":0.001,"synced_headers":100,"synced_blocks":100},{"inbound":false,"addr":"peer.example:19755","connection_type":"manual","minping":0.050,"synced_headers":100,"synced_blocks":100},{"inbound":false,"addr":"221.240.90.124:19335","connection_type":"outbound-full-relay","minping":0.003,"synced_headers":100,"synced_blocks":100},{"inbound":false,"addr":"147.182.192.221:19335","connection_type":"outbound-full-relay","minping":0.108,"synced_headers":100,"synced_blocks":100}]
 JSON
     ;;
   generatetoaddress)
@@ -647,7 +646,7 @@ test "$(sed -n '2p' "${RESULTS_DIR}/live-peer-cache.txt")" = "147.182.192.221:19
 grep -q "peer-bootstrap-refresh reason=insufficient_peer_consensus attempted=4 succeeded=4 failed=0" "${RESULTS_DIR}/live-mining-health.log"
 test "$(sed -n '1p' "${STATE_DIR}/addnode.log")" = "addnode 221.240.90.124:19335 onetry"
 test "$(sed -n '2p' "${STATE_DIR}/addnode.log")" = "addnode 147.182.192.221:19335 onetry"
-grep -q "addnode node.qtc.tools:19335 onetry" "${STATE_DIR}/addnode.log"
+grep -q "addnode peer.example:19755 onetry" "${STATE_DIR}/addnode.log"
 grep -q "addnode 100.85.221.75:19335 onetry" "${STATE_DIR}/addnode.log"
 
 STATE_DIR="${TMPDIR}/state-peer-topoff"

@@ -69,13 +69,12 @@ def main() -> int:
     )
 
     require(
-        "node.qtc.tools." in chainparams_text,
-        "missing required live mainnet DNS seed: node.qtc.tools.",
+        "seed.qtc.gold." in chainparams_text,
+        "missing required live mainnet DNS seed: seed.qtc.gold.",
         errors,
     )
     for required_seed in (
-        "node.qtcchain.org.",
-        "node.qtc.dev.",
+        "seed.qtc.exchange.",
     ):
         require(required_seed in chainparams_text, f"missing required live mainnet DNS seed: {required_seed}", errors)
     require(

@@ -235,30 +235,106 @@ static OutboundPeerDiagnosticsSummary CollectOutboundPeerDiagnostics(
     return summary;
 }
 
+std::optional<MiningTemplateRefusal> CheckMiningTemplateReadiness(
+    const MiningTemplateReadinessPolicy& policy,
+    const MiningTemplateReadinessObservation& observation)
+{
+    if (!observation.has_tip) {
+        return MiningTemplateRefusal{RPC_CLIENT_IN_INITIAL_DOWNLOAD, CLIENT_NAME " has no active tip yet"};
+    }
+
+    if (policy.enforce_connectivity) {
+        if (observation.connected_peers == 0) {
+            return MiningTemplateRefusal{RPC_CLIENT_NOT_CONNECTED, CLIENT_NAME " is not connected!"};
+        }
+
+        if (policy.min_outbound_peers > 0 &&
+            observation.outbound_peers < static_cast<size_t>(policy.min_outbound_peers)) {
+            return MiningTemplateRefusal{
+                RPC_CLIENT_NOT_CONNECTED,
+                strprintf("%s has %u outbound peers, requires at least %d for getblocktemplate; "
+                          "set -miningminoutboundpeers=0 to disable",
+                          CLIENT_NAME,
+                          static_cast<unsigned>(observation.outbound_peers),
+                          policy.min_outbound_peers)};
+        }
+
+        if (observation.initial_block_download) {
+            return MiningTemplateRefusal{RPC_CLIENT_IN_INITIAL_DOWNLOAD, CLIENT_NAME " is in initial sync and waiting for blocks..."};
+        }
+
+        if (policy.min_synced_outbound_peers > 0) {
+            if (!observation.peerman_available) {
+                return MiningTemplateRefusal{RPC_INTERNAL_ERROR, "Peer manager unavailable while enforcing mining peer sync guard"};
+            }
+            if (observation.synced_outbound_peers < static_cast<size_t>(policy.min_synced_outbound_peers)) {
+                return MiningTemplateRefusal{
+                    RPC_CLIENT_NOT_CONNECTED,
+                    strprintf("%s has %u synced outbound peers, requires at least %d within %d blocks of active tip for getblocktemplate; "
+                              "set -miningminsyncedoutboundpeers=0 to disable",
+                              CLIENT_NAME,
+                              static_cast<unsigned>(observation.synced_outbound_peers),
+                              policy.min_synced_outbound_peers,
+                              static_cast<int>(policy.max_peer_sync_height_lag))};
+            }
+        }
+    }
+
+    if (policy.enforce_header_lag && policy.max_header_lag > 0 && observation.has_best_header) {
+        const int64_t header_lag = std::max<int64_t>(0, observation.best_header_height - observation.tip_height);
+        if (header_lag > policy.max_header_lag) {
+            return MiningTemplateRefusal{
+                RPC_CLIENT_IN_INITIAL_DOWNLOAD,
+                strprintf("%s validated tip is %d blocks behind best header (%d > %d); "
+                          "set -miningmaxheaderlag=0 to disable",
+                          CLIENT_NAME,
+                          header_lag,
+                          header_lag,
+                          policy.max_header_lag)};
+        }
+    }
+
+    return std::nullopt;
+}
+
+/**
+ * Refuse to hand out a block template unless the node can produce one that is
+ * likely to be valid and to propagate: an active tip, peers, enough (synced)
+ * outbound peers, not in initial block download, and a validated tip close to
+ * the best known header (security review M-11). Longpoll re-runs this after
+ * waking up, so a client never keeps receiving work after connectivity or
+ * validation degrades.
+ */
 static void EnforceMiningTemplateReadiness(
     const ChainstateManager& chainman,
     const CConnman& connman,
     const PeerManager* peerman,
-    Mining& miner,
-    const bool enforce_connectivity,
-    const int64_t min_outbound_peers,
-    const int64_t min_synced_outbound_peers,
-    const int64_t max_peer_sync_height_lag,
-    const bool enforce_header_lag,
-    const int64_t max_header_lag) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+    const MiningTemplateReadinessPolicy& policy) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
 {
-    (void)connman;
-    (void)peerman;
-    (void)enforce_connectivity;
-    (void)min_outbound_peers;
-    (void)min_synced_outbound_peers;
-    (void)max_peer_sync_height_lag;
-    (void)enforce_header_lag;
-    (void)max_header_lag;
-    (void)miner;
+    MiningTemplateReadinessObservation observation;
 
-    if (chainman.ActiveChain().Tip() == nullptr) {
-        throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, CLIENT_NAME " has no active tip yet");
+    const CBlockIndex* const active_tip = chainman.ActiveChain().Tip();
+    observation.has_tip = active_tip != nullptr;
+    observation.tip_height = active_tip != nullptr ? active_tip->nHeight : -1;
+
+    const CBlockIndex* const best_header = chainman.m_best_header;
+    observation.has_best_header = best_header != nullptr;
+    observation.best_header_height = best_header != nullptr ? best_header->nHeight : -1;
+
+    observation.initial_block_download = chainman.IsInitialBlockDownload();
+    observation.connected_peers = connman.GetNodeCount(ConnectionDirection::Both);
+    observation.outbound_peers = connman.GetNodeCount(ConnectionDirection::Out);
+    observation.peerman_available = peerman != nullptr;
+    if (peerman != nullptr && active_tip != nullptr && policy.min_synced_outbound_peers > 0) {
+        observation.synced_outbound_peers = CollectOutboundPeerDiagnostics(
+            connman,
+            peerman,
+            active_tip->nHeight,
+            policy.max_peer_sync_height_lag).synced_outbound_peers;
+    }
+
+    if (const auto refusal = CheckMiningTemplateReadiness(policy, observation)) {
+        throw JSONRPCError(refusal->code, refusal->message);
     }
 }
 
@@ -7766,22 +7842,16 @@ static RPCHelpMan getblocktemplate()
     const int64_t max_header_lag = std::max<int64_t>(
         0,
         args.GetIntArg("-miningmaxheaderlag", DefaultMaxHeaderLagForMiningTemplate(chainparams)));
-    const bool enforce_connectivity =
-        !miner.isTestChain() || min_outbound_peers > 0 || min_synced_outbound_peers > 0;
-    const bool enforce_header_lag =
-        !miner.isTestChain() || max_header_lag > 0;
+    const MiningTemplateReadinessPolicy readiness_policy{
+        .enforce_connectivity = !miner.isTestChain() || min_outbound_peers > 0 || min_synced_outbound_peers > 0,
+        .min_outbound_peers = min_outbound_peers,
+        .min_synced_outbound_peers = min_synced_outbound_peers,
+        .max_peer_sync_height_lag = max_peer_sync_height_lag,
+        .enforce_header_lag = !miner.isTestChain() || max_header_lag > 0,
+        .max_header_lag = max_header_lag,
+    };
 
-    EnforceMiningTemplateReadiness(
-        chainman,
-        connman,
-        peerman,
-        miner,
-        enforce_connectivity,
-        min_outbound_peers,
-        min_synced_outbound_peers,
-        max_peer_sync_height_lag,
-        enforce_header_lag,
-        max_header_lag);
+    EnforceMiningTemplateReadiness(chainman, connman, peerman, readiness_policy);
 
     static unsigned int nTransactionsUpdatedLast;
     const CTxMemPool& mempool = EnsureMemPool(node);
@@ -7831,17 +7901,7 @@ static RPCHelpMan getblocktemplate()
             throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "Shutting down");
         // Re-check readiness after longpoll wakeup; connectivity/header-lag
         // may have degraded while waiting.
-        EnforceMiningTemplateReadiness(
-            chainman,
-            connman,
-            peerman,
-            miner,
-            enforce_connectivity,
-            min_outbound_peers,
-            min_synced_outbound_peers,
-            max_peer_sync_height_lag,
-            enforce_header_lag,
-            max_header_lag);
+        EnforceMiningTemplateReadiness(chainman, connman, peerman, readiness_policy);
     }
 
     const Consensus::Params& consensusParams = chainman.GetParams().GetConsensus();

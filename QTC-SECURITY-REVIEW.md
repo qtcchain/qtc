@@ -194,7 +194,7 @@ and `-miningmaxheaderlag` are silent no-ops (stubbed upstream on 2026-06-14, bef
 mining_basic.py` still expects the guard to throw, so that test fails. Fix: implement the guard against connman/peerman
 counts or remove the options and the test expectations; not consensus.
 
-### (v1) M2 timewarp bounded, M3 seeds/mesh, M5 SLH-DSA weight — unchanged.
+### (v1) M2 timewarp bounded, M5 SLH-DSA weight — unchanged. **M3 seeds/mesh FIXED 2026-09-14**: DNS seeds `seed.qtc.gold`/`seed.qtc.exchange` (mainnet) and `testnet-seed.*` (testnet) on two providers and two registrars; fixed seeds and the mining-guard mesh are the two inbound launch nodes (157.230.194.146, 167.99.181.131); Node A is outbound-only and not listed.
 
 ---
 
@@ -300,3 +300,16 @@ Ported after comparing the tree with the upstream project's v0.34.6 (analysis in
 Not taken, after checking: the libsodium/SLH-DSA symbol clash (QTC links no libsodium), the file-preallocation change
 (QTC has Bitcoin Core's original), and everything tied to upstream's v4 proof-of-work, attestation, trusted-mirror,
 dump-floor and stall-recovery machinery.
+
+## Launch freeze items applied (2026-09-14)
+
+- **M-3** seeds and mesh compiled in (above). Stale upstream-era bootstrap hostnames removed from docs, scripts, RPC help
+  examples and the closure-verification script.
+- **M-11** `EnforceMiningTemplateReadiness` implemented: `getblocktemplate` refuses work (fail closed, ordered no tip →
+  no peers → too few outbound → initial block download → too few synced outbound → validated tip too far behind the best
+  header) with the `-miningmin*`/`-miningmaxheaderlag` thresholds; always enforced on mainnet, opt-in on test chains so
+  a lone regtest node still mines. Unit suite `mining_template_readiness_tests` (16 cases incl. real RPC).
+- **Info items**: help text for `-miningchainguard`, `-miningchainguarddefaultmesh`, the three auto-update options (no
+  default compiled in), the four `-mining*` thresholds, `-reorghysteresisdepth`/`-reorgprotectionprofile` (emergency
+  profile uses depth 1) now match the code; bootstrap doc defaults corrected.
+- **D3** auto-update ships off with no key, URL or origin compiled in (verified, no change needed).

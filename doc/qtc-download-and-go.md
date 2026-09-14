@@ -88,9 +88,8 @@ rpcallowip=127.0.0.1
 # Keep peer discovery on and use DNS-only bootstrap hints.
 dnsseed=1
 fixedseeds=1
-addnode=node.qtc.dev:19335
-addnode=node.qtcchain.org:19335
-addnode=node.qtc.tools:19335
+addnode=157.230.194.146:19755
+addnode=167.99.181.131:19755
 
 # Miner fast-start posture.
 prune=4096

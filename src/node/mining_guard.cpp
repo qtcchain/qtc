@@ -39,10 +39,17 @@ int ComputeMedianTip(std::vector<int> peer_heights)
 
 const std::vector<std::string>& DefaultMiningPeerMesh()
 {
-    // QTC has no public reference mesh yet. An empty default mesh plus a default-off
-    // guard keeps a lone launch node able to mine; operators enable the guard with
-    // -miningchainguard=1 and supply peers once a mesh exists.
-    static const std::vector<std::string> default_mesh{};
+    // The launch network's inbound-capable public nodes (the same hosts that back
+    // the DNS and fixed seeds in kernel/chainparams.cpp). Entries deliberately
+    // carry no port: CConnman::AddNode and ConnectNode resolve a bare host with
+    // the active chain's default P2P port, so one mesh serves mainnet (19755)
+    // and testnet (29755) without per-chain tables. Outbound-only nodes must
+    // never be listed here. The guard itself stays default-off (see
+    // GetMiningChainGuardOptions); operators opt in with -miningchainguard=1.
+    static const std::vector<std::string> default_mesh{
+        "157.230.194.146", // relay node, Singapore
+        "167.99.181.131",  // mining node, Toronto
+    };
     return default_mesh;
 }
 
@@ -50,8 +57,10 @@ MiningChainGuardOptions GetMiningChainGuardOptions(const NodeContext& node)
 {
     MiningChainGuardOptions options;
 
-    // QTC: off by default on every chain until a public reference mesh exists (see
-    // DefaultMiningPeerMesh); with no reachable peers the guard would block all mining.
+    // QTC: off by default on every chain. The public mesh (DefaultMiningPeerMesh)
+    // is only two hosts, below DEFAULT_MINING_CHAIN_GUARD_MIN_PEERS, so a node
+    // with no other reachable peers would report unhealthy; operators with a
+    // larger peer set opt in with -miningchainguard=1.
     const bool default_enabled = false;
 
     if (!node.args) {

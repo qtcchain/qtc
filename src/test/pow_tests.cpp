@@ -879,9 +879,8 @@ BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_qtc_network_identity)
     BOOST_CHECK_EQUAL(msg[3], 0x02);
     BOOST_CHECK_EQUAL(params->GetDefaultPort(), 29755);
     BOOST_CHECK_EQUAL(params->Bech32HRP(), "tqtc");
-    BOOST_CHECK_EQUAL(params->DNSSeeds().size(), 0U); // QTC: no seed infra yet
-    // No hardcoded fixed seeds yet; DNS seeds are the primary discovery method.
-    BOOST_CHECK(params->FixedSeeds().empty());
+    BOOST_CHECK_EQUAL(params->DNSSeeds().size(), 2U); // exact names: qtc_seed_tests
+    BOOST_CHECK(!params->FixedSeeds().empty());        // decoded in qtc_seed_tests
     BOOST_CHECK_EQUAL(params->Checkpoints().mapCheckpoints.size(), 1U);
     BOOST_CHECK(params->GetAvailableSnapshotHeights().empty());
     BOOST_CHECK(params->AssumeutxoForHeight(110).has_value() == false);
@@ -893,7 +892,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_TESTNET4_qtc_network_identity)
 
     BOOST_CHECK_EQUAL(params->GetDefaultPort(), 48333);
     BOOST_CHECK_EQUAL(params->Bech32HRP(), "tqtc4");
-    BOOST_CHECK_EQUAL(params->DNSSeeds().size(), 0U); // QTC: no seed infra yet
+    BOOST_CHECK_EQUAL(params->DNSSeeds().size(), 0U); // QTC: no public testnet4
     BOOST_CHECK(params->FixedSeeds().empty());
     BOOST_CHECK(params->GetAvailableSnapshotHeights().empty());
     BOOST_CHECK(!params->AssumeutxoForHeight(110));
@@ -2322,8 +2321,8 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_qtc_network_identity)
     BOOST_CHECK_EQUAL(params->Base58Prefix(CChainParams::PUBKEY_ADDRESS).at(0), 58);
     BOOST_CHECK_EQUAL(params->Base58Prefix(CChainParams::SCRIPT_ADDRESS).at(0), 63);
     BOOST_CHECK_EQUAL(params->Base58Prefix(CChainParams::SECRET_KEY).at(0), 186);
-    BOOST_CHECK_EQUAL(params->DNSSeeds().size(), 0U); // QTC: no seed infra yet
-    BOOST_CHECK(params->FixedSeeds().empty()); // QTC: no fixed seeds yet
+    BOOST_CHECK_EQUAL(params->DNSSeeds().size(), 2U); // exact names: qtc_seed_tests
+    BOOST_CHECK(!params->FixedSeeds().empty());        // decoded in qtc_seed_tests
     BOOST_CHECK_GE(params->Checkpoints().mapCheckpoints.size(), 1U);
     BOOST_CHECK(!params->AssumeutxoForHeight(110).has_value());
 }

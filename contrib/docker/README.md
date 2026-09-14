@@ -32,7 +32,7 @@ docker run -d \
   --init \
   --user $(id -u):$(id -g) \
   --name qtcd \
-  -p 19335:19335 -p 127.0.0.1:19334:19334 \
+  -p 19755:19755 -p 127.0.0.1:19754:19754 \
   -v path/to/conf:/etc/qtc/qtc.conf:ro \
   -v path/to/data:/var/lib/qtcd:rw \
   qtcd

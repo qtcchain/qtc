@@ -693,8 +693,8 @@ static RPCHelpMan getminingpeermesh()
             }},
         RPCExamples{
             HelpExampleCli("getminingpeermesh", "")
-            + HelpExampleCli("getminingpeermesh", "\"node.qtc.tools:19335\"")
-            + HelpExampleRpc("getminingpeermesh", "\"node.qtc.tools:19335\"")
+            + HelpExampleCli("getminingpeermesh", "\"167.99.181.131:19755\"")
+            + HelpExampleRpc("getminingpeermesh", "\"167.99.181.131:19755\"")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -775,8 +775,8 @@ static RPCHelpMan addminingpeermeshnode()
                 {RPCResult::Type::BOOL, "try_now", "Whether a connection attempt was queued"},
             }},
         RPCExamples{
-            HelpExampleCli("addminingpeermeshnode", "\"node.qtc.tools:19335\"")
-            + HelpExampleRpc("addminingpeermeshnode", "\"node.qtc.tools:19335\", true, true")
+            HelpExampleCli("addminingpeermeshnode", "\"167.99.181.131:19755\"")
+            + HelpExampleRpc("addminingpeermeshnode", "\"167.99.181.131:19755\", true, true")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -833,8 +833,8 @@ static RPCHelpMan removeminingpeermeshnode()
                 {RPCResult::Type::BOOL, "disconnected", "Whether a current session was disconnected"},
             }},
         RPCExamples{
-            HelpExampleCli("removeminingpeermeshnode", "\"node.qtc.tools:19335\"")
-            + HelpExampleRpc("removeminingpeermeshnode", "\"node.qtc.tools:19335\", true")
+            HelpExampleCli("removeminingpeermeshnode", "\"167.99.181.131:19755\"")
+            + HelpExampleRpc("removeminingpeermeshnode", "\"167.99.181.131:19755\", true")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {

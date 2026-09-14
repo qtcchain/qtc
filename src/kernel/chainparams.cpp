@@ -387,15 +387,18 @@ public:
         m_is_mockable_chain = false;
 
         // Live bootstrap DNS seeds for mainnet peer discovery. Keep these as
-        // DNS names, not hard-coded IPs, so archive-node rotation does not
-        // require a binary update.
-        // QTC has no seed infrastructure yet — populate with your own DNS seeds
-        // (e.g. seed.qtc.example) before public launch. Empty = manual -addnode
-        // / -connect peering for the initial bootstrap network.
+        // DNS names, not hard-coded IPs, so seed-host rotation does not require
+        // a binary update. The two names are served by independent DNS
+        // providers under independently registered domains so that a single
+        // provider or registrar outage cannot take down bootstrap.
         vSeeds.clear();
+        vSeeds.emplace_back("seed.qtc.gold.");
+        vSeeds.emplace_back("seed.qtc.exchange.");
 
-        // No fixed seeds until QTC infrastructure exists; do not inherit QTC's.
-        vFixedSeeds.clear();
+        // Fixed seeds: the launch network's inbound-capable public nodes, compiled
+        // from contrib/seeds/nodes_main.txt (see contrib/seeds/README.md). They are
+        // the fallback when DNS resolution is unavailable.
+        vFixedSeeds = std::vector<uint8_t>{std::begin(chainparams_seed_main), std::end(chainparams_seed_main)};
 
         // New chain: only the genesis checkpoint. Add real checkpoints once QTC
         // has accumulated history and you want to pin against deep reorgs.
@@ -569,9 +572,12 @@ public:
         assert(!consensus.fMatMulPOW ||
                ValidateMatMulAsertParams(consensus, consensus.nMatMulAsertHeight));
 
-        // Testnet DNS seeds mirror mainnet domains; fixed seeds provide fallback.
+        // Testnet DNS seeds mirror the mainnet domains under a testnet- prefix;
+        // fixed seeds (contrib/seeds/nodes_test.txt) provide the fallback.
         vSeeds.clear();
-        vFixedSeeds.clear();
+        vSeeds.emplace_back("testnet-seed.qtc.gold.");
+        vSeeds.emplace_back("testnet-seed.qtc.exchange.");
+        vFixedSeeds = std::vector<uint8_t>{std::begin(chainparams_seed_test), std::end(chainparams_seed_test)};
 
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,111);
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,196);
@@ -754,8 +760,9 @@ public:
         assert(!consensus.fMatMulPOW ||
                ValidateMatMulAsertParams(consensus, consensus.nMatMulAsertHeight));
 
+        // QTC does not operate a public testnet4 network: no DNS or fixed seeds
+        // (chainparams_seed_testnet4 is empty; see contrib/seeds/README.md).
         vSeeds.clear();
-        // QTC: no seed infrastructure yet (see mainnet).
         vFixedSeeds.clear();
 
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,111);

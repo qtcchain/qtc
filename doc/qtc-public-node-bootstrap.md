@@ -47,9 +47,8 @@ prune=0
 minimumchainwork=0
 dnsseed=1
 fixedseeds=1
-addnode=node.qtc.dev:19335
-addnode=node.qtcchain.org:19335
-addnode=node.qtc.tools:19335
+addnode=157.230.194.146:19755
+addnode=167.99.181.131:19755
 addnode=146.190.179.86:19335
 addnode=164.90.246.229:19335
 ```
@@ -59,19 +58,19 @@ Notes:
 - `19335` is the QTC mainnet P2P port.
 - `19334` is the QTC mainnet default RPC port.
 - `addnode=` seeds initial peers while preserving broader peer discovery.
-- the current public DNS bootstrap set is `node.qtc.dev`,
-  `node.qtcchain.org`, and `node.qtc.tools`; direct IP addnodes are optional
+- the DNS seeds are `seed.qtc.gold` and `seed.qtc.exchange` (two providers, two registrars);
+  direct IP addnodes to the two inbound launch nodes are optional
   archive-node hints for controlled troubleshooting
 - `getblocktemplate` enforces an outbound peer floor on mainnet by default
-  (`-miningminoutboundpeers=2`) to reduce isolated-mining orphan risk.
+  (`-miningminoutboundpeers=3`) to reduce isolated-mining orphan risk.
   Set `-miningminoutboundpeers=0` only for intentional isolated lab mining.
-- `getblocktemplate` also enforces that at least one outbound peer is actually
+- `getblocktemplate` also enforces that at least two outbound peers are actually
   near tip on mainnet by default
-  (`-miningminsyncedoutboundpeers=1`, `-miningmaxpeersyncheightlag=2`).
+  (`-miningminsyncedoutboundpeers=2`, `-miningmaxpeersyncheightlag=1`).
   This reduces stale/forked mining when outbound peers are connected but lagging.
   Set `-miningminsyncedoutboundpeers=0` only for intentional isolated lab mining.
 - `getblocktemplate` also enforces a validated-tip/header-lag bound on mainnet
-  by default (`-miningmaxheaderlag=8`) so miners do not work from templates that
+  by default (`-miningmaxheaderlag=3`) so miners do not work from templates that
   are materially behind known headers. Set `-miningmaxheaderlag=0` only for
   intentional isolated lab workflows.
 - Longpoll template requests re-check these guards on wakeup, so miners do not

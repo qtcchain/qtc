@@ -73,7 +73,7 @@ class GenerateAssumeutxoTest(unittest.TestCase):
                 cli_path="/opt/qtc/bin/qtc-cli",
                 rpc_args=["-rpcconnect=127.0.0.1", "-rpcport=19334"],
                 snapshot_type="rollback",
-                asset_url="https://node.qtcchain.org/releases/utxo.dat",
+                asset_url="https://qtc.gold/releases/utxo.dat",
             )
 
             self.assertEqual(report["chain"], "main")
@@ -84,7 +84,7 @@ class GenerateAssumeutxoTest(unittest.TestCase):
             self.assertIn("m_assumeutxo_data", report["chainparams_snippet"])
             self.assertIn("snapshot v9", report["chainparams_snippet"])
             self.assertIn(".shielded_state_commitment", report["chainparams_snippet"])
-            self.assertEqual(report["asset"]["url"], "https://node.qtcchain.org/releases/utxo.dat")
+            self.assertEqual(report["asset"]["url"], "https://qtc.gold/releases/utxo.dat")
             self.assertEqual(report["asset"]["sha256"], "33" * 32)
             self.assertEqual(report["release_asset_manifest"]["snapshot_file_version"], 9)
             self.assertEqual(report["release_asset_manifest"]["shielded_state_pin"], shielded_state_pin)

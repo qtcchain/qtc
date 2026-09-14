@@ -79,6 +79,7 @@ add_executable(test_qtc
   matmul_mining_tests.cpp
   mining_chain_guard_tests.cpp
   mining_crash_guard_tests.cpp
+  mining_template_readiness_tests.cpp
   pq_crypto_tests.cpp
   pq_merkle_tests.cpp
   pq_address_tests.cpp
@@ -111,6 +112,7 @@ add_executable(test_qtc
   policyestimator_tests.cpp
   pool_tests.cpp
   pow_tests.cpp
+  qtc_seed_tests.cpp
   prevector_tests.cpp
   raii_event_tests.cpp
   random_tests.cpp

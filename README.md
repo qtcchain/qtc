@@ -712,9 +712,8 @@ minimumchainwork=0
 retainshieldedcommitmentindex=1
 dnsseed=1
 fixedseeds=1
-addnode=node.qtc.tools:19335
-addnode=146.190.179.86:19335
-addnode=164.90.246.229:19335
+addnode=157.230.194.146:19755
+addnode=167.99.181.131:19755
 ```
 
 Or generate a profile automatically:
@@ -1127,14 +1126,14 @@ qtcd -zmqpubhashtx=tcp://127.0.0.1:28332 \
 ### DNS Seeds (Mainnet)
 
 ```
-node.qtc.tools
+seed.qtc.gold
 ```
 
-Current fixed public fallback peers compiled into `chainparamsseeds.h`:
+Current fixed public fallback peers compiled into `chainparamsseeds.h` (the two inbound launch nodes; DNS seeds `seed.qtc.gold` and `seed.qtc.exchange`):
 
 ```
-146.190.179.86:19335
-164.90.246.229:19335
+157.230.194.146:19755
+167.99.181.131:19755
 ```
 
 ### Custom Regtest / Devnet Identity

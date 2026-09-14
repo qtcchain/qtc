@@ -27,27 +27,24 @@ managed_direct_peers() {
   case "${1}" in
     local)
       cat <<'EOF'
-addnode=178.128.135.6:19335
-addnode=143.244.209.243:19335
-addnode=68.183.240.79:19335
+addnode=157.230.194.146:19755
+addnode=167.99.181.131:19755
 EOF
       ;;
     fra)
       cat <<'EOF'
-addnode=178.128.135.6:19335
-addnode=143.244.209.243:19335
+addnode=157.230.194.146:19755
+addnode=167.99.181.131:19755
 EOF
       ;;
     nyc)
       cat <<'EOF'
-addnode=68.183.240.79:19335
-addnode=143.244.209.243:19335
+addnode=167.99.181.131:19755
+addnode=157.230.194.146:19755
 EOF
       ;;
     sfo)
       cat <<'EOF'
-addnode=68.183.240.79:19335
-addnode=178.128.135.6:19335
 EOF
       ;;
     *)
@@ -84,11 +81,8 @@ if [[ "${BOOTSTRAP_MODE}" == "discover" ]]; then
 # Scalable bootstrap (recommended): seed with public QTC nodes, keep peer discovery on.
 dnsseed=1
 fixedseeds=1
-addnode=node.qtc.dev:19335
-addnode=node.qtcchain.org:19335
-addnode=node.qtc.tools:19335
-addnode=146.190.179.86:19335
-addnode=164.90.246.229:19335
+addnode=157.230.194.146:19755
+addnode=167.99.181.131:19755
 EOF
 elif [[ "${BOOTSTRAP_MODE}" == "strict-connect" ]]; then
   cat <<'EOF'
@@ -97,11 +91,8 @@ elif [[ "${BOOTSTRAP_MODE}" == "strict-connect" ]]; then
 # pins outbound peers and disables automatic peer discovery.
 dnsseed=0
 fixedseeds=0
-connect=node.qtc.dev:19335
-connect=node.qtcchain.org:19335
-connect=node.qtc.tools:19335
-connect=146.190.179.86:19335
-connect=164.90.246.229:19335
+connect=157.230.194.146:19755
+connect=167.99.181.131:19755
 EOF
 else
   if [[ -z "${MANAGED_NODE_NAME}" ]]; then
