@@ -7410,23 +7410,36 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         if (state.fSyncStarted && peer->m_headers_sync_timeout < std::chrono::microseconds::max()) {
             // Detect whether this is a stalling initial-headers-sync peer
             if (m_chainman.m_best_header->Time() <= NodeClock::now() - 24h) {
-                if (current_time > peer->m_headers_sync_timeout && nSyncStarted == 1 && (m_num_preferred_download_peers - state.fPreferredDownload >= 1)) {
+                if (current_time > peer->m_headers_sync_timeout) {
                     // Disconnect a peer (without NetPermissionFlags::NoBan permission) if it is our only sync peer,
                     // and we have others we could be using instead.
                     // Note: If all our peers are inbound, then we won't
                     // disconnect our sync peer for stalling; we have bigger
                     // problems if we can't get any outbound peers.
-                    if (!pto->HasPermission(NetPermissionFlags::NoBan)) {
+                    if (nSyncStarted == 1 &&
+                        (m_num_preferred_download_peers - state.fPreferredDownload >= 1) &&
+                        !pto->HasPermission(NetPermissionFlags::NoBan)) {
                         LogInfo("Timeout downloading headers, %s\n", pto->DisconnectMsg(fLogIPs));
                         pto->fDisconnect = true;
                         return true;
-                    } else {
-                        LogInfo("Timeout downloading headers from noban peer, not %s\n", pto->DisconnectMsg(fLogIPs));
-                        // Reset the headers sync state so that we have a
-                        // chance to try downloading from a different peer.
-                        // Note: this will also result in at least one more
-                        // getheaders message to be sent to
-                        // this peer (eventually).
+                    } else if ((m_num_preferred_download_peers - state.fPreferredDownload >= 1) ||
+                               m_connman.GetNodeCount(ConnectionDirection::Both) > 1) {
+                        // Mirrors the upstream stalled-sync-slot fix: a
+                        // non-delivering peer must not hold the initial
+                        // headers-sync slot forever. Previously the timeout
+                        // was only evaluated when nSyncStarted == 1 AND
+                        // another preferred download peer existed, so a slot
+                        // holder that never delivered was never timed out and
+                        // no other peer could claim the slot (no new
+                        // getheaders went out). The disconnect path above
+                        // keeps its exact previous conditions; every other
+                        // case reclaims the slot in place so another peer can
+                        // claim it. This also results in at least one more
+                        // getheaders message to be sent to this peer
+                        // (eventually). Only reclaim when another peer could
+                        // take the slot; with a single peer the slot stays and
+                        // the chain-sync eviction logic below handles it.
+                        LogInfo("Timeout downloading headers, reclaiming sync slot, not %s\n", pto->DisconnectMsg(fLogIPs));
                         state.fSyncStarted = false;
                         nSyncStarted--;
                         peer->m_headers_sync_timeout = 0us;

@@ -23,7 +23,7 @@ class CChainParams;
 class ValidationSignals;
 
 static constexpr bool DEFAULT_CHECKPOINTS_ENABLED{true};
-static constexpr auto DEFAULT_MAX_TIP_AGE{24h};
+static constexpr auto DEFAULT_MAX_TIP_AGE{30 * 24h}; // QTC: 30 days (was 24 h); a day-long stall must not push every node into initial-sync mode
 //! Fail closed for shielded assumeutxo state unless the snapshot height has a
 //! consensus shielded-state pin, or the operator explicitly opts into trusting an
 //! unpinned shielded snapshot with -allowunpinnedshieldedsnapshot=1.

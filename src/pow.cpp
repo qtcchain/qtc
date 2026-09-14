@@ -934,30 +934,52 @@ MatMulPreHashEpsilonBitsInfo ResolveMatMulPreHashEpsilonBitsInfo(
     return info;
 }
 
+} // namespace
+
+unsigned int MatMulAsertFailClosedBits()
+{
+    // AUDIT D1: a runtime ASERT-configuration invariant breach must NOT weaken
+    // difficulty. Returning powLimit (the EASIEST target) is fail-OPEN and
+    // directly exploitable -- a malformed (even future-dated) parameter set would
+    // collapse CURRENT difficulty the moment the binary starts. Return the hardest
+    // representable target instead so the calculation fails CLOSED: mining halts
+    // (a loud, safe liveness stop) rather than difficulty collapsing. This path is
+    // UNREACHABLE in a validly-configured node because the immutable ASERT
+    // parameters are validated fatally at chain-parameter construction
+    // (kernel/chainparams.cpp -> ValidateMatMulAsertParams); it exists purely as a
+    // defence-in-depth backstop that cannot be turned into a difficulty-weakening
+    // exploit.
+    return arith_uint256{1}.GetCompact();
+}
+
+// AUDIT D1: ValidateMatMulAsertParams is declared in pow.h and invoked from
+// chain-parameter construction so an invalid immutable ASERT schedule aborts
+// node startup instead of surfacing (fail-closed) at some future block height.
+// It is a pure function of the params; next_height is log context only.
 bool ValidateMatMulAsertParams(const Consensus::Params& params, int32_t next_height)
 {
     if (params.nMatMulAsertHalfLife <= 0) {
-        LogWarning("MatMulAsert: invalid half-life=%lld at height %d, failing closed to powLimit\n",
+        LogWarning("MatMulAsert: invalid half-life=%lld at height %d, failing closed to the hardest target\n",
                    static_cast<long long>(params.nMatMulAsertHalfLife), next_height);
         return false;
     }
     if (params.nPowTargetSpacing <= 0) {
-        LogWarning("MatMulAsert: invalid target spacing=%lld at height %d, failing closed to powLimit\n",
+        LogWarning("MatMulAsert: invalid target spacing=%lld at height %d, failing closed to the hardest target\n",
                    static_cast<long long>(params.nPowTargetSpacing), next_height);
         return false;
     }
     if (params.nMatMulAsertBootstrapFactor == 0) {
-        LogWarning("MatMulAsert: bootstrap factor is zero at height %d, failing closed to powLimit\n",
+        LogWarning("MatMulAsert: bootstrap factor is zero at height %d, failing closed to the hardest target\n",
                    next_height);
         return false;
     }
     if (params.nMatMulAsertRetuneHardeningFactor == 0) {
-        LogWarning("MatMulAsert: retune hardening factor is zero at height %d, failing closed to powLimit\n",
+        LogWarning("MatMulAsert: retune hardening factor is zero at height %d, failing closed to the hardest target\n",
                    next_height);
         return false;
     }
     if (params.nMatMulAsertRetune2TargetNum == 0 || params.nMatMulAsertRetune2TargetDen == 0) {
-        LogWarning("MatMulAsert: retune2 ratio is invalid (num=%u den=%u) at height %d, failing closed to powLimit\n",
+        LogWarning("MatMulAsert: retune2 ratio is invalid (num=%u den=%u) at height %d, failing closed to the hardest target\n",
                    params.nMatMulAsertRetune2TargetNum, params.nMatMulAsertRetune2TargetDen, next_height);
         return false;
     }
@@ -965,24 +987,24 @@ bool ValidateMatMulAsertParams(const Consensus::Params& params, int32_t next_hei
     const bool retune_enabled = !IsDisabledHeight(params.nMatMulAsertRetuneHeight);
     const bool retune2_enabled = !IsDisabledHeight(params.nMatMulAsertRetune2Height);
     if (retune_enabled && params.nMatMulAsertRetuneHeight < params.nMatMulAsertHeight) {
-        LogWarning("MatMulAsert: retune height=%d is below ASERT activation=%d at height %d, failing closed to powLimit\n",
+        LogWarning("MatMulAsert: retune height=%d is below ASERT activation=%d at height %d, failing closed to the hardest target\n",
                    params.nMatMulAsertRetuneHeight, params.nMatMulAsertHeight, next_height);
         return false;
     }
     if (retune2_enabled && params.nMatMulAsertRetune2Height < params.nMatMulAsertHeight) {
-        LogWarning("MatMulAsert: retune2 height=%d is below ASERT activation=%d at height %d, failing closed to powLimit\n",
+        LogWarning("MatMulAsert: retune2 height=%d is below ASERT activation=%d at height %d, failing closed to the hardest target\n",
                    params.nMatMulAsertRetune2Height, params.nMatMulAsertHeight, next_height);
         return false;
     }
     if (retune_enabled && retune2_enabled &&
         params.nMatMulAsertRetune2Height < params.nMatMulAsertRetuneHeight) {
-        LogWarning("MatMulAsert: retune2 height=%d is below retune height=%d at height %d, failing closed to powLimit\n",
+        LogWarning("MatMulAsert: retune2 height=%d is below retune height=%d at height %d, failing closed to the hardest target\n",
                    params.nMatMulAsertRetune2Height, params.nMatMulAsertRetuneHeight, next_height);
         return false;
     }
     if (IsMatMulAsertHalfLifeUpgradeConfigured(params)) {
         if (params.nMatMulAsertHalfLifeUpgrade <= 0) {
-            LogWarning("MatMulAsert: half-life upgrade value=%lld is invalid at height %d, failing closed to powLimit\n",
+            LogWarning("MatMulAsert: half-life upgrade value=%lld is invalid at height %d, failing closed to the hardest target\n",
                        static_cast<long long>(params.nMatMulAsertHalfLifeUpgrade), next_height);
             return false;
         }
@@ -995,13 +1017,15 @@ bool ValidateMatMulAsertParams(const Consensus::Params& params, int32_t next_hei
             latest_pre_upgrade_anchor = std::max(latest_pre_upgrade_anchor, params.nMatMulAsertRetune2Height);
         }
         if (params.nMatMulAsertHalfLifeUpgradeHeight <= latest_pre_upgrade_anchor) {
-            LogWarning("MatMulAsert: half-life upgrade height=%d must be above latest prior anchor=%d at height %d, failing closed to powLimit\n",
+            LogWarning("MatMulAsert: half-life upgrade height=%d must be above latest prior anchor=%d at height %d, failing closed to the hardest target\n",
                        params.nMatMulAsertHalfLifeUpgradeHeight, latest_pre_upgrade_anchor, next_height);
             return false;
         }
     }
     return true;
 }
+
+namespace {
 
 bool ShouldEnableAsyncPrepare(matmul::backend::Kind backend, uint32_t configured_batch_size)
 {
@@ -1837,16 +1861,21 @@ arith_uint256 CalculateMatMulAsertTarget(
     if (anchor_target == 0 || anchor_target > pow_limit) {
         return pow_limit;
     }
+    // AUDIT D1: these are "cannot happen on a valid chain" invariant breaches
+    // (a negative height delta, or half-life/spacing that are validated fatally at
+    // construction). Fail CLOSED to the hardest representable target rather than
+    // OPEN to powLimit, so a breach can never weaken difficulty.
+    const arith_uint256 hardest_target{1};
     if (height_diff < 0) {
-        LogWarning("CalculateMatMulAsertTarget: height_diff=%lld is negative, failing closed to powLimit\n",
+        LogWarning("CalculateMatMulAsertTarget: height_diff=%lld is negative, failing closed to the hardest target\n",
                    static_cast<long long>(height_diff));
-        return pow_limit;
+        return hardest_target;
     }
     if (half_life <= 0 || params.nPowTargetSpacing <= 0) {
-        LogWarning("CalculateMatMulAsertTarget: invalid parameters (half_life=%lld target_spacing=%lld), failing closed to powLimit\n",
+        LogWarning("CalculateMatMulAsertTarget: invalid parameters (half_life=%lld target_spacing=%lld), failing closed to the hardest target\n",
                    static_cast<long long>(half_life),
                    static_cast<long long>(params.nPowTargetSpacing));
-        return pow_limit;
+        return hardest_target;
     }
 
     const int64_t target_spacing = params.nPowTargetSpacing;
@@ -2125,7 +2154,10 @@ unsigned int MatMulAsert(const CBlockIndex* pindexLast, const Consensus::Params&
     }
 
     if (!ValidateMatMulAsertParams(params, next_height)) {
-        return pow_limit.GetCompact();
+        // AUDIT D1: fail CLOSED (hardest target), never open to powLimit. Immutable
+        // ASERT params are validated fatally at construction, so this is an
+        // unreachable defence-in-depth backstop for a validly-started node.
+        return MatMulAsertFailClosedBits();
     }
 
     const uint32_t bootstrap_factor = params.nMatMulAsertBootstrapFactor;
@@ -2180,18 +2212,37 @@ unsigned int MatMulAsert(const CBlockIndex* pindexLast, const Consensus::Params&
     //   the new half-life applies prospectively instead of retroactively.
     const MatMulAsertHalfLifeInfo half_life_info = ResolveMatMulAsertHalfLifeInfo(pindexLast, params);
     const int32_t anchor_height = half_life_info.current_anchor_height;
+    // The anchor-height range guard below stays lenient (powLimit) on purpose:
+    // it is reachable from header-sync synthetic-window difficulty replay, and
+    // flipping it to the hardest target would change header-sync abort behaviour
+    // on min-difficulty networks. Left fail-open pending a dedicated analysis.
     if (anchor_height < 0 || pindexLast->nHeight < anchor_height) {
         return pow_limit.GetCompact();
     }
     const CBlockIndex* anchor = pindexLast->GetAncestor(anchor_height);
     if (anchor == nullptr) {
-        return pow_limit.GetCompact();
+        // AUDIT P1.1: a MISSING ASERT anchor must fail CLOSED, not OPEN to powLimit.
+        // LatestMatMulAsertPreUpgradeAnchorHeight only ever returns an anchor height
+        // <= pindexLast->nHeight, and GetNextWorkRequired is computed over a
+        // pprev-linked chain, so anchor == nullptr is UNREACHABLE on any valid
+        // linked chain -- it can arise only from a malformed / synthetic / unlinked
+        // index (e.g. a crafted header-replay attempt). Returning powLimit there
+        // would be fail-OPEN (easiest difficulty); the hardest representable target
+        // instead makes the breach reject-all rather than weaken difficulty.
+        LogWarning("MatMulAsert: missing ASERT anchor at height %d for next height %d, failing closed to the hardest target\n",
+                   anchor_height, next_height);
+        return MatMulAsertFailClosedBits();
     }
 
     arith_uint256 anchor_target{};
     anchor_target.SetCompact(anchor->nBits);
     if (anchor_target == 0 || anchor_target > pow_limit) {
-        anchor_target = pow_limit;
+        // A corrupt anchor target (zero / above powLimit) is likewise a "cannot
+        // happen on a valid chain" breach -- fail CLOSED (D1) instead of clamping
+        // UP to powLimit, so it can only ever harden, never weaken, difficulty.
+        LogWarning("MatMulAsert: corrupt ASERT anchor nBits=0x%08x at height %d, failing closed to the hardest target\n",
+                   anchor->nBits, anchor_height);
+        return MatMulAsertFailClosedBits();
     }
     const int64_t time_diff = pindexLast->GetBlockTime() - anchor->GetBlockTime();
     const int64_t height_diff = static_cast<int64_t>(pindexLast->nHeight) - anchor->nHeight;

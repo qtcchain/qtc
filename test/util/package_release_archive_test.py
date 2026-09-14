@@ -31,6 +31,12 @@ def load_module():
 class PackageReleaseArchiveTest(unittest.TestCase):
     def setUp(self):
         self.module = load_module()
+        self._stub_ship_gate()
+
+    def _stub_ship_gate(self):
+        # The ship gate needs real ELF/Mach-O binaries; these tests package text stubs.
+        self.module.verify_shipped_qtcd = lambda path: None
+        self.module.verify_shipped_cli = lambda path: None
 
     def _build_source_root(self, root: pathlib.Path) -> pathlib.Path:
         source_root = root / "source-root"
@@ -206,6 +212,35 @@ class PackageReleaseArchiveTest(unittest.TestCase):
             archive_a = output_a / "qtc-29.2-x86_64-linux-gnu.tar.gz"
             archive_b = output_b / "qtc-29.2-x86_64-linux-gnu.tar.gz"
             self.assertEqual(archive_a.read_bytes(), archive_b.read_bytes())
+
+
+
+class ShipGateTest(unittest.TestCase):
+    """The ship gate itself, unstubbed: text stubs must be refused, never skipped."""
+
+    def setUp(self):
+        self.module = load_module()
+
+    def test_verify_shipped_qtcd_refuses_unrecognized_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            qtcd = pathlib.Path(tmpdir) / "qtcd"
+            qtcd.write_text("daemon\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "unrecognized file"):
+                self.module.verify_shipped_qtcd(qtcd)
+
+    def test_verify_shipped_cli_refuses_unrecognized_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cli = pathlib.Path(tmpdir) / "qtc-cli"
+            cli.write_text("cli\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "unrecognized file"):
+                self.module.verify_shipped_cli(cli)
+
+    def test_verify_shipped_qtcd_refuses_shell_wrapper(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            qtcd = pathlib.Path(tmpdir) / "qtcd"
+            qtcd.write_text("#!/bin/sh\nexec libexec/qtcd.real\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "wrapper"):
+                self.module.verify_shipped_qtcd(qtcd)
 
 
 if __name__ == "__main__":

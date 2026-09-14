@@ -72,6 +72,9 @@ std::vector<unsigned char> BuildP2MRCLTVMultisigScript(
     uint8_t threshold,
     const std::vector<std::pair<PQAlgorithm, std::vector<unsigned char>>>& pubkeys);
 
+/** True when `sequence` is a BIP68 relative locktime (TYPE_FLAG | MASK only). */
+bool IsP2MRCSVSequenceBIP68Valid(int64_t sequence);
+
 std::vector<unsigned char> BuildP2MRCSVMultisigScript(
     int64_t sequence,
     uint8_t threshold,
@@ -97,10 +100,46 @@ std::vector<unsigned char> BuildP2MRDelegationScript(
     PQAlgorithm checksig_algo,
     Span<const unsigned char> checksig_pubkey);
 
+/** HASH160 + CSFS HTLC. Replayable; parse/spend only. Do not emit new locks. */
 std::vector<unsigned char> BuildP2MRHTLCLeaf(
     Span<const unsigned char> preimage_hash160,
     PQAlgorithm oracle_algo,
     Span<const unsigned char> oracle_pubkey);
+
+/** Transaction-bound HASH160 HTLC. Recovery of pre-existing HASH160 locks only. */
+std::vector<unsigned char> BuildP2MRHTLCTxLeaf(
+    Span<const unsigned char> preimage_hash160,
+    PQAlgorithm claimant_algo,
+    Span<const unsigned char> claimant_pubkey);
+
+/** Transaction-bound SHA-256 HTLC claim leaf (the preferred swap path).
+ *
+ *  Witness stack (bottom->top): <tx_sig> <32-byte preimage>.
+ *  Script: OP_SHA256 <32-byte digest> OP_EQUALVERIFY <pubkey> OP_CHECKSIG_*.
+ *  A 256-bit hashlock gives ~128 bits of Grover preimage margin; HASH160 does not.
+ */
+std::vector<unsigned char> BuildP2MRHTLCSha256Leaf(
+    Span<const unsigned char> preimage_sha256,
+    PQAlgorithm claimant_algo,
+    Span<const unsigned char> claimant_pubkey);
+
+bool ParseP2MRLegacyHTLCLeaf(
+    Span<const unsigned char> script,
+    std::vector<unsigned char>& preimage_hash160,
+    PQAlgorithm& claimant_algo,
+    std::vector<unsigned char>& claimant_pubkey);
+
+bool ParseP2MRHTLCTxLeaf(
+    Span<const unsigned char> script,
+    std::vector<unsigned char>& preimage_hash160,
+    PQAlgorithm& claimant_algo,
+    std::vector<unsigned char>& claimant_pubkey);
+
+bool ParseP2MRHTLCSha256Leaf(
+    Span<const unsigned char> script,
+    std::vector<unsigned char>& preimage_sha256,
+    PQAlgorithm& claimant_algo,
+    std::vector<unsigned char>& claimant_pubkey);
 
 std::vector<unsigned char> BuildP2MRRefundLeaf(
     int64_t timeout,

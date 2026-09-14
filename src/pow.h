@@ -279,4 +279,17 @@ bool SolveKAWPOW(CBlockHeader& block, uint32_t block_height, const Consensus::Pa
 bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t height, uint32_t old_nbits, uint32_t new_nbits);
 MatMulAsertHalfLifeInfo GetMatMulAsertHalfLifeInfo(const CBlockIndex* pindexLast, const Consensus::Params& params);
 
+/** Validate the immutable MatMul-ASERT parameter schedule (half-lives, spacing,
+ *  bootstrap/retune factors, retune/upgrade height ordering). A pure function of
+ *  @p params; @p next_height is log context only. Invoked fatally at chain-parameter
+ *  construction (AUDIT D1: an invalid immutable config aborts node startup rather
+ *  than silently altering difficulty at some future height) and defensively per
+ *  block inside MatMulAsert, where a false result fails CLOSED. */
+bool ValidateMatMulAsertParams(const Consensus::Params& params, int32_t next_height);
+/** AUDIT D1: the fail-CLOSED difficulty result (hardest representable target,
+ *  arith_uint256{1}.GetCompact() == 0x01010000) used when a runtime ASERT
+ *  invariant is breached, so an invalid config can never weaken (fail open to
+ *  powLimit) current difficulty. */
+unsigned int MatMulAsertFailClosedBits();
+
 #endif // BITCOIN_POW_H

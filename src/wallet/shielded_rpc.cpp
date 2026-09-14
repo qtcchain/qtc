@@ -16143,16 +16143,21 @@ RPCHelpMan bridge_buildrefund()
 
 namespace {
 
-// Classification of the leaves found in an mr(internal, {htlc(...), refund(...)}) descriptor.
+// Classification of the leaves found in an mr(htlc_sha256(...),refund(...)) descriptor
+// (or a recovery mr(htlc_tx(...),refund(...)) HASH160 lock).
 struct HtlcDescriptorLeaves {
     uint256 merkle_root;
     CScript script_pub_key;
-    // HTLC (claim) leaf: <20-byte H160> OP_OVER OP_HASH160 OP_EQUALVERIFY <csfs pubkey> OP_CHECKSIGFROMSTACK
+    // HTLC claim leaf: hashlock followed by a transaction-bound PQ CHECKSIG.
     bool has_htlc{false};
+    bool has_htlc_sha256{false};
+    bool has_htlc_tx{false};
+    bool has_legacy_htlc{false};
     std::vector<unsigned char> htlc_leaf_script;
     std::vector<unsigned char> htlc_control_block;
-    std::vector<unsigned char> htlc_hash160; // 20-byte preimage hashlock
-    std::vector<unsigned char> htlc_pubkey;  // the CSFS (claimer) pubkey the wallet must sign with
+    std::vector<unsigned char> htlc_hash160; // 20-byte HASH160 hashlock (htlc_tx recovery)
+    std::vector<unsigned char> htlc_sha256;  // 32-byte SHA-256 hashlock (htlc_sha256)
+    std::vector<unsigned char> htlc_pubkey;  // the transaction-signing claimant pubkey
     // Refund leaf: <locktime> OP_CHECKLOCKTIMEVERIFY OP_DROP <pubkey> OP_CHECKSIG
     bool has_refund{false};
     std::vector<unsigned char> refund_leaf_script;
@@ -16181,15 +16186,30 @@ struct HtlcDescriptorLeaves {
     return false;
 }
 
-// True if `script` matches the BuildP2MRHTLCLeaf layout; also extracts the 20-byte hashlock.
-[[nodiscard]] bool IsHtlcLeafScript(const std::vector<unsigned char>& script, std::vector<unsigned char>& hash160_out)
+[[nodiscard]] bool IsHtlcSha256LeafScript(const std::vector<unsigned char>& script,
+                                         std::vector<unsigned char>& sha256_out,
+                                         std::vector<unsigned char>& pubkey_out)
 {
-    if (script.size() < 25) return false;
-    if (script[0] != 0x14) return false; // push 20 bytes
-    if (script[21] != OP_OVER || script[22] != OP_HASH160 || script[23] != OP_EQUALVERIFY) return false;
-    if (script.back() != OP_CHECKSIGFROMSTACK) return false;
-    hash160_out.assign(script.begin() + 1, script.begin() + 21);
-    return true;
+    PQAlgorithm algo{PQAlgorithm::ML_DSA_44};
+    return ParseP2MRHTLCSha256Leaf(script, sha256_out, algo, pubkey_out);
+}
+
+// True only for the transaction-bound HASH160 htlc_tx() leaf.
+[[nodiscard]] bool IsHtlcTxLeafScript(const std::vector<unsigned char>& script,
+                                     std::vector<unsigned char>& hash160_out,
+                                     std::vector<unsigned char>& pubkey_out)
+{
+    PQAlgorithm algo{PQAlgorithm::ML_DSA_44};
+    return ParseP2MRHTLCTxLeaf(script, hash160_out, algo, pubkey_out);
+}
+
+// Legacy htlc() leaf (HASH160 + OP_CHECKSIGFROMSTACK): replayable and non-standard.
+[[nodiscard]] bool IsLegacyHtlcLeafScript(const std::vector<unsigned char>& script)
+{
+    std::vector<unsigned char> hash160;
+    std::vector<unsigned char> pubkey;
+    PQAlgorithm algo{PQAlgorithm::ML_DSA_44};
+    return ParseP2MRLegacyHTLCLeaf(script, hash160, algo, pubkey);
 }
 
 // True if `script` begins with a CLTV guard (<locktime> OP_CHECKLOCKTIMEVERIFY OP_DROP) and ends in OP_CHECKSIG.
@@ -16254,17 +16274,26 @@ struct HtlcDescriptorLeaves {
     for (const auto& [leaf_script, controls] : spenddata.scripts) {
         if (controls.empty()) continue;
         const std::vector<unsigned char>& control = *controls.begin();
-        std::vector<unsigned char> hash160;
-        if (IsHtlcLeafScript(leaf_script, hash160)) {
+        std::vector<unsigned char> hashlock;
+        std::vector<unsigned char> leaf_pubkey;
+        if (IsHtlcSha256LeafScript(leaf_script, hashlock, leaf_pubkey)) {
             if (out.has_htlc) throw JSONRPCError(RPC_INVALID_PARAMETER, "Descriptor has more than one HTLC leaf");
             out.has_htlc = true;
+            out.has_htlc_sha256 = true;
             out.htlc_leaf_script = leaf_script;
             out.htlc_control_block = control;
-            out.htlc_hash160 = std::move(hash160);
-            // <H160>(0) OP_OVER(1) OP_HASH160(2) OP_EQUALVERIFY(3) <csfs pubkey>(4) OP_CHECKSIGFROMSTACK(5)
-            if (!ExtractLeafPush(leaf_script, 4, out.htlc_pubkey)) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "Could not extract the claimer pubkey from the HTLC leaf");
-            }
+            out.htlc_sha256 = std::move(hashlock);
+            out.htlc_pubkey = std::move(leaf_pubkey);
+        } else if (IsHtlcTxLeafScript(leaf_script, hashlock, leaf_pubkey)) {
+            if (out.has_htlc) throw JSONRPCError(RPC_INVALID_PARAMETER, "Descriptor has more than one HTLC leaf");
+            out.has_htlc = true;
+            out.has_htlc_tx = true;
+            out.htlc_leaf_script = leaf_script;
+            out.htlc_control_block = control;
+            out.htlc_hash160 = std::move(hashlock);
+            out.htlc_pubkey = std::move(leaf_pubkey);
+        } else if (IsLegacyHtlcLeafScript(leaf_script)) {
+            out.has_legacy_htlc = true;
         } else if (IsRefundLeafScript(leaf_script)) {
             if (out.has_refund) throw JSONRPCError(RPC_INVALID_PARAMETER, "Descriptor has more than one refund leaf");
             out.has_refund = true;
@@ -16354,8 +16383,9 @@ RPCHelpMan buildhtlcclaim()
     return RPCHelpMan{
         "buildhtlcclaim",
         "\nBuild, sign, and finalize a transaction that claims a P2MR HTLC output by revealing the preimage.\n"
-        "The descriptor must be of the form mr(<internal>, {htlc(<H160>,<claimerPubkey>), refund(<locktime>,<senderPubkey>)}).\n"
-        "The wallet must hold the claimer's ML-DSA private key (to produce the CSFS signature over the preimage).\n",
+        "The descriptor must be of the form mr(htlc_sha256(<SHA256>,<claimerPubkey>),refund(<locktime>,<senderPubkey>)).\n"
+        "HASH160 htlc_tx() descriptors remain spendable for recovery of any pre-existing lock.\n"
+        "The wallet must hold the claimer's PQ private key to produce a transaction-bound claim signature.\n",
         {
             {"descriptor", RPCArg::Type::STR, RPCArg::Optional::NO, "The mr(...) HTLC descriptor (with or without #checksum)"},
             {"prevout", RPCArg::Type::OBJ, RPCArg::Optional::NO, "The HTLC funding outpoint to spend",
@@ -16363,7 +16393,7 @@ RPCHelpMan buildhtlcclaim()
                     {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Funding txid"},
                     {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO, "Funding output index"},
                 }},
-            {"preimage", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The HTLC preimage (HASH160 must equal the descriptor hashlock)"},
+            {"preimage", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The HTLC preimage (SHA-256 must equal the descriptor hashlock; HASH160 for recovery htlc_tx() locks)"},
             {"destination", RPCArg::Type::STR, RPCArg::Optional::NO, "Address that receives the claimed funds"},
             {"fee", RPCArg::Type::NUM, RPCArg::Optional::NO, "Absolute fee in satoshis"},
         },
@@ -16389,19 +16419,35 @@ RPCHelpMan buildhtlcclaim()
             const int vout = prevout_obj["vout"].getInt<int>();
             if (vout < 0) throw JSONRPCError(RPC_INVALID_PARAMETER, "vout must be non-negative");
             const std::vector<unsigned char> preimage = ParseHexV(request.params[2], "preimage");
+            if (preimage.size() != 32) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "preimage must be exactly 32 bytes");
+            }
             const CTxDestination destination = ParseDestinationOrThrow(request.params[3], "destination");
             const CAmount fee = request.params[4].getInt<int64_t>();
             if (fee < 0) throw JSONRPCError(RPC_INVALID_PARAMETER, "fee must be non-negative");
 
             const HtlcDescriptorLeaves leaves = ParseHtlcDescriptorOrThrow(descriptor);
+            if (leaves.has_legacy_htlc) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    "Legacy htlc() claim leaves are replayable; use htlc_sha256() and roll existing contracts forward");
+            }
             if (!leaves.has_htlc) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "Descriptor does not contain an htlc(...) claim leaf");
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Descriptor does not contain a transaction-bound HTLC claim leaf (htlc_sha256 or htlc_tx)");
             }
 
             // Verify the supplied preimage matches the hashlock before building anything.
-            const uint160 preimage_h160 = Hash160(preimage);
-            if (!std::equal(preimage_h160.begin(), preimage_h160.end(), leaves.htlc_hash160.begin())) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "HASH160(preimage) does not match the descriptor hashlock");
+            if (leaves.has_htlc_sha256) {
+                uint256 preimage_sha256;
+                CSHA256().Write(preimage.data(), preimage.size()).Finalize(preimage_sha256.begin());
+                if (!std::equal(preimage_sha256.begin(), preimage_sha256.end(), leaves.htlc_sha256.begin())) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "SHA256(preimage) does not match the descriptor hashlock");
+                }
+            } else {
+                const uint160 preimage_h160 = Hash160(preimage);
+                if (!std::equal(preimage_h160.begin(), preimage_h160.end(), leaves.htlc_hash160.begin())) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "HASH160(preimage) does not match the descriptor hashlock");
+                }
             }
 
             const COutPoint outpoint{Txid::FromUint256(txid), static_cast<uint32_t>(vout)};
@@ -16425,8 +16471,12 @@ RPCHelpMan buildhtlcclaim()
             input.m_p2mr_merkle_root = leaves.merkle_root;
             input.m_p2mr_leaf_script = leaves.htlc_leaf_script;
             input.m_p2mr_control_block = leaves.htlc_control_block;
-            // Inject the preimage keyed by its HASH160 so the HTLC satisfier can find it.
-            input.hash160_preimages[uint160{leaves.htlc_hash160}] = preimage;
+            // Inject the preimage keyed by its hashlock so the HTLC satisfier can find it.
+            if (leaves.has_htlc_sha256) {
+                input.sha256_preimages[uint256{leaves.htlc_sha256}] = preimage;
+            } else {
+                input.hash160_preimages[uint160{leaves.htlc_hash160}] = preimage;
+            }
 
             bool complete{false};
             const CTransactionRef tx = SignFinalizeHtlcPsbtOrThrow(pwallet, std::move(psbt), leaves.htlc_pubkey, "claimer", complete, "HTLC claim");

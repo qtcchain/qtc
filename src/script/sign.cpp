@@ -523,6 +523,8 @@ enum class P2MRLeafType {
     CSFS_ONLY,
     CSFS_VERIFY_CHECKSIG,
     HTLC,
+    HTLC_TX,
+    HTLC_SHA256,
 };
 
 struct P2MRLeafInfo {
@@ -534,7 +536,10 @@ struct P2MRLeafInfo {
     PQAlgorithm csfs_algo{PQAlgorithm::ML_DSA_44};
     Span<const unsigned char> csfs_pubkey{};
     uint256 ctv_hash{};
-    std::vector<unsigned char> htlc_hash160{}; // HTLC leaf: the 20-byte preimage hashlock
+    std::vector<unsigned char> htlc_hash160{}; // HASH160 HTLC leaf: 20-byte preimage hashlock
+    std::vector<unsigned char> htlc_sha256{};  // SHA-256 HTLC leaf: 32-byte preimage hashlock
+    PQAlgorithm htlc_algo{PQAlgorithm::ML_DSA_44};
+    std::vector<unsigned char> htlc_pubkey{};
 };
 
 static bool ParseP2MRChecksigLeaf(Span<const unsigned char> script, size_t offset, P2MRLeafInfo& info, size_t& consumed)
@@ -680,28 +685,54 @@ static bool ParseP2MRMultisigLeaf(Span<const unsigned char> script, P2MRLeafInfo
 
 static bool ParseP2MRHTLCLeaf(Span<const unsigned char> script, P2MRLeafInfo& info)
 {
-    // BuildP2MRHTLCLeaf layout (src/script/pqm.cpp):
-    //   <20-byte preimage-hash160 push> OP_OVER OP_HASH160 OP_EQUALVERIFY
-    //   <csfs pubkey push> OP_CHECKSIGFROMSTACK
-    if (script.size() < 25) return false;
-    if (script[0] != 0x14) return false;                                    // push of 20 bytes
-    if (script[21] != OP_OVER || script[22] != OP_HASH160 || script[23] != OP_EQUALVERIFY) return false;
-    Span<const unsigned char> pubkey;
+    // Legacy BuildP2MRHTLCLeaf layout (HASH160 lock + OP_CHECKSIGFROMSTACK). Kept so
+    // pre-existing locks remain spendable; new locks use the transaction-bound leaves.
+    std::vector<unsigned char> hash160;
     PQAlgorithm algo{PQAlgorithm::ML_DSA_44};
-    size_t push_consumed{0};
-    if (!ParseP2MRAnyPubkeyPush(script, /*offset=*/24, algo, pubkey, push_consumed)) return false;
-    const size_t tail = 24 + push_consumed;
-    if (script.size() != tail + 1) return false;
-    if (script[tail] != OP_CHECKSIGFROMSTACK) return false;
+    std::vector<unsigned char> pubkey;
+    if (!ParseP2MRLegacyHTLCLeaf(script, hash160, algo, pubkey)) return false;
     info.type = P2MRLeafType::HTLC;
-    info.htlc_hash160.assign(script.begin() + 1, script.begin() + 21);
+    info.htlc_hash160 = std::move(hash160);
     info.csfs_algo = algo;
-    info.csfs_pubkey = pubkey;
+    info.htlc_pubkey = std::move(pubkey);
+    info.csfs_pubkey = info.htlc_pubkey;
+    return true;
+}
+
+static bool ParseP2MRHTLCTxLeafForSigning(Span<const unsigned char> script, P2MRLeafInfo& info)
+{
+    std::vector<unsigned char> hash160;
+    PQAlgorithm algo{PQAlgorithm::ML_DSA_44};
+    std::vector<unsigned char> pubkey;
+    if (!ParseP2MRHTLCTxLeaf(script, hash160, algo, pubkey)) return false;
+    info.type = P2MRLeafType::HTLC_TX;
+    info.htlc_hash160 = std::move(hash160);
+    info.htlc_algo = algo;
+    info.htlc_pubkey = std::move(pubkey);
+    return true;
+}
+
+static bool ParseP2MRHTLCSha256LeafForSigning(Span<const unsigned char> script, P2MRLeafInfo& info)
+{
+    std::vector<unsigned char> sha256;
+    PQAlgorithm algo{PQAlgorithm::ML_DSA_44};
+    std::vector<unsigned char> pubkey;
+    if (!ParseP2MRHTLCSha256Leaf(script, sha256, algo, pubkey)) return false;
+    info.type = P2MRLeafType::HTLC_SHA256;
+    info.htlc_sha256 = std::move(sha256);
+    info.htlc_algo = algo;
+    info.htlc_pubkey = std::move(pubkey);
     return true;
 }
 
 static bool ExtractP2MRLeafInfo(Span<const unsigned char> script, P2MRLeafInfo& info)
 {
+    if (ParseP2MRHTLCSha256LeafForSigning(script, info)) {
+        return true;
+    }
+    if (ParseP2MRHTLCTxLeafForSigning(script, info)) {
+        return true;
+    }
     if (ParseP2MRHTLCLeaf(script, info)) {
         return true;
     }
@@ -998,6 +1029,64 @@ static bool SignP2MR(const SigningProvider& provider,
             // is the single truthy stack element required by cleanstack.
             std::vector<valtype> candidate = Vector(sig_csfs, preimage, script_bytes, *control);
             const int priority = P2MRPriority(leaf_info.csfs_algo, preferred_algo, /*preferred_priority=*/20, /*non_preferred_priority=*/30);
+            commit_candidate(priority, std::move(candidate), script_bytes, *control);
+            continue;
+        }
+        case P2MRLeafType::HTLC_TX: {
+            // Transaction-bound HASH160 claim: <tx_sig> <preimage> <leaf> <control>.
+            const auto it_pre = sigdata.hash160_preimages.find(leaf_info.htlc_hash160);
+            if (it_pre == sigdata.hash160_preimages.end()) continue;
+
+            std::vector<unsigned char> sig;
+            if (!CreateP2MRScriptSig(
+                    creator,
+                    sigdata,
+                    provider,
+                    sig,
+                    leaf_info.htlc_pubkey,
+                    leaf_info.htlc_algo,
+                    leaf_hash,
+                    SigVersion::P2MR)) {
+                continue;
+            }
+            std::vector<valtype> candidate = Vector(sig, it_pre->second, script_bytes, *control);
+            const int priority = P2MRPriority(
+                leaf_info.htlc_algo, preferred_algo, /*preferred_priority=*/0, /*non_preferred_priority=*/10);
+            if (priority == 0) {
+                sigdata.p2mr_leaf_script = script;
+                sigdata.p2mr_control_block = *control;
+                result = std::move(candidate);
+                return true;
+            }
+            commit_candidate(priority, std::move(candidate), script_bytes, *control);
+            continue;
+        }
+        case P2MRLeafType::HTLC_SHA256: {
+            // Transaction-bound SHA-256 claim: <tx_sig> <preimage> <leaf> <control>.
+            const auto it_pre = sigdata.sha256_preimages.find(leaf_info.htlc_sha256);
+            if (it_pre == sigdata.sha256_preimages.end()) continue;
+
+            std::vector<unsigned char> sig;
+            if (!CreateP2MRScriptSig(
+                    creator,
+                    sigdata,
+                    provider,
+                    sig,
+                    leaf_info.htlc_pubkey,
+                    leaf_info.htlc_algo,
+                    leaf_hash,
+                    SigVersion::P2MR)) {
+                continue;
+            }
+            std::vector<valtype> candidate = Vector(sig, it_pre->second, script_bytes, *control);
+            const int priority = P2MRPriority(
+                leaf_info.htlc_algo, preferred_algo, /*preferred_priority=*/0, /*non_preferred_priority=*/10);
+            if (priority == 0) {
+                sigdata.p2mr_leaf_script = script;
+                sigdata.p2mr_control_block = *control;
+                result = std::move(candidate);
+                return true;
+            }
             commit_candidate(priority, std::move(candidate), script_bytes, *control);
             continue;
         }

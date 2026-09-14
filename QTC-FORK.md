@@ -377,3 +377,11 @@ Floor `0x1e013333` (placeholder) → `0x1e033333` (one A6000 at 8,800 digests/s 
 until ASERT settles). Mainnet genesis `9ba00506…b8e2` at the unchanged nTime 1789063200, merkle unchanged; test
 chains untouched. Model: iCloud `QTC/software/QTC_powLimit_Sizing_2026-09-10`; detail QTC-LAUNCH-SAFETY.md §13.
 Consensus-bearing: 0.0.6 nodes cannot follow. H2 closed; re-check after the RTX 4000 Ada measurement.
+
+### DONE — upstream v0.34.6 comparison and hardening port (2026-09-13) ✅
+Six non-consensus items ported from the upstream project's v0.33.1→v0.34.6 range after a full comparison
+(iCloud `QTC/network`, upstream comparison note of 2026-09-13): 30-day max tip age, BIP68 sequence guard, HTLC
+standardness (CHECKSIG leaves `htlc_tx`/`htlc_sha256` standard, CSFS leaf non-standard; descriptor/signer/RPC
+support), fail-closed ASERT with fatal startup validation (F-5), headers-sync slot reclaim, ZMQ default-ON with a
+fail-closed release ship gate (`scripts/release/verify_release_qtcd.py`). Detail: QTC-SECURITY-REVIEW.md
+"Upstream-derived hardening applied". Consensus and genesis unchanged from 0.0.7.

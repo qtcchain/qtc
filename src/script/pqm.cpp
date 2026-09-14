@@ -275,13 +275,23 @@ std::vector<unsigned char> BuildP2MRCLTVMultisigScript(
     return script;
 }
 
+bool IsP2MRCSVSequenceBIP68Valid(int64_t sequence)
+{
+    if (sequence < 1 || sequence > std::numeric_limits<int32_t>::max()) return false;
+    const uint32_t bits = static_cast<uint32_t>(sequence);
+    if ((bits & CTxIn::SEQUENCE_LOCKTIME_DISABLE_FLAG) != 0) return false;
+    // BIP68 consensus only interprets TYPE_FLAG | MASK; all other bits are ignored.
+    // Reject extra bits so the encoded relative delay equals the caller's value
+    // (e.g. 100000 would otherwise enforce 100000 & MASK == 34464).
+    return (bits & ~(CTxIn::SEQUENCE_LOCKTIME_TYPE_FLAG | CTxIn::SEQUENCE_LOCKTIME_MASK)) == 0;
+}
+
 std::vector<unsigned char> BuildP2MRCSVMultisigScript(
     int64_t sequence,
     uint8_t threshold,
     const std::vector<std::pair<PQAlgorithm, std::vector<unsigned char>>>& pubkeys)
 {
-    if (sequence < 1 || sequence > std::numeric_limits<int32_t>::max()) return {};
-    if ((static_cast<uint32_t>(sequence) & CTxIn::SEQUENCE_LOCKTIME_DISABLE_FLAG) != 0) return {};
+    if (!IsP2MRCSVSequenceBIP68Valid(sequence)) return {};
 
     CScript prefix;
     prefix << sequence << OP_CHECKSEQUENCEVERIFY << OP_DROP;
@@ -361,6 +371,124 @@ std::vector<unsigned char> BuildP2MRHTLCLeaf(
     // OP_EQUALVERIFY, and a bad signature yields result 0 which fails the final CastToBool check.)
     script << OP_CHECKSIGFROMSTACK;
     return std::vector<unsigned char>(script.begin(), script.end());
+}
+
+std::vector<unsigned char> BuildP2MRHTLCTxLeaf(
+    Span<const unsigned char> preimage_hash160,
+    PQAlgorithm claimant_algo,
+    Span<const unsigned char> claimant_pubkey)
+{
+    if (preimage_hash160.size() != uint160::size()) return {};
+
+    CScript script;
+    script << std::vector<unsigned char>(preimage_hash160.begin(), preimage_hash160.end())
+           << OP_OVER << OP_HASH160 << OP_EQUALVERIFY << OP_DROP;
+
+    const std::vector<unsigned char> checksig_script = BuildP2MRScript(claimant_algo, claimant_pubkey);
+    if (checksig_script.empty()) return {};
+    script.insert(script.end(), checksig_script.begin(), checksig_script.end());
+    return std::vector<unsigned char>(script.begin(), script.end());
+}
+
+std::vector<unsigned char> BuildP2MRHTLCSha256Leaf(
+    Span<const unsigned char> preimage_sha256,
+    PQAlgorithm claimant_algo,
+    Span<const unsigned char> claimant_pubkey)
+{
+    if (preimage_sha256.size() != uint256::size()) return {};
+
+    CScript script;
+    script << OP_SHA256
+           << std::vector<unsigned char>(preimage_sha256.begin(), preimage_sha256.end())
+           << OP_EQUALVERIFY;
+
+    const std::vector<unsigned char> checksig_script = BuildP2MRScript(claimant_algo, claimant_pubkey);
+    if (checksig_script.empty()) return {};
+    script.insert(script.end(), checksig_script.begin(), checksig_script.end());
+    return std::vector<unsigned char>(script.begin(), script.end());
+}
+
+namespace {
+
+bool ParseP2MRHTLCLeafCommon(
+    Span<const unsigned char> script,
+    bool transaction_bound,
+    std::vector<unsigned char>& preimage_hash160,
+    PQAlgorithm& claimant_algo,
+    std::vector<unsigned char>& claimant_pubkey)
+{
+    const size_t key_offset = transaction_bound ? 25 : 24;
+    if (script.size() <= key_offset) return false;
+    if (script[0] != 0x14 ||
+        script[21] != OP_OVER ||
+        script[22] != OP_HASH160 ||
+        script[23] != OP_EQUALVERIFY) {
+        return false;
+    }
+    if (transaction_bound && script[24] != OP_DROP) return false;
+
+    Span<const unsigned char> pubkey;
+    size_t push_consumed{0};
+    if (!ParseP2MRAnyPubkeyPush(script, key_offset, claimant_algo, pubkey, push_consumed)) return false;
+    const size_t tail = key_offset + push_consumed;
+    if (script.size() != tail + 1) return false;
+    const opcodetype expected = transaction_bound ? GetP2MRChecksigOpcode(claimant_algo)
+                                                  : OP_CHECKSIGFROMSTACK;
+    if (script[tail] != expected) return false;
+
+    preimage_hash160.assign(script.begin() + 1, script.begin() + 21);
+    claimant_pubkey.assign(pubkey.begin(), pubkey.end());
+    return true;
+}
+
+} // namespace
+
+bool ParseP2MRLegacyHTLCLeaf(
+    Span<const unsigned char> script,
+    std::vector<unsigned char>& preimage_hash160,
+    PQAlgorithm& claimant_algo,
+    std::vector<unsigned char>& claimant_pubkey)
+{
+    return ParseP2MRHTLCLeafCommon(
+        script, /*transaction_bound=*/false, preimage_hash160, claimant_algo, claimant_pubkey);
+}
+
+bool ParseP2MRHTLCTxLeaf(
+    Span<const unsigned char> script,
+    std::vector<unsigned char>& preimage_hash160,
+    PQAlgorithm& claimant_algo,
+    std::vector<unsigned char>& claimant_pubkey)
+{
+    return ParseP2MRHTLCLeafCommon(
+        script, /*transaction_bound=*/true, preimage_hash160, claimant_algo, claimant_pubkey);
+}
+
+bool ParseP2MRHTLCSha256Leaf(
+    Span<const unsigned char> script,
+    std::vector<unsigned char>& preimage_sha256,
+    PQAlgorithm& claimant_algo,
+    std::vector<unsigned char>& claimant_pubkey)
+{
+    // OP_SHA256 <32-byte digest> OP_EQUALVERIFY <pubkey> OP_CHECKSIG_*
+    constexpr size_t hash_offset = 2; // after OP_SHA256 + OP_PUSHBYTES_32
+    constexpr size_t key_offset = 35;  // 1 + 1 + 32 + 1
+    if (script.size() <= key_offset) return false;
+    if (script[0] != static_cast<unsigned char>(OP_SHA256) ||
+        script[1] != 0x20 ||
+        script[34] != static_cast<unsigned char>(OP_EQUALVERIFY)) {
+        return false;
+    }
+
+    Span<const unsigned char> pubkey;
+    size_t push_consumed{0};
+    if (!ParseP2MRAnyPubkeyPush(script, key_offset, claimant_algo, pubkey, push_consumed)) return false;
+    const size_t tail = key_offset + push_consumed;
+    if (script.size() != tail + 1) return false;
+    if (script[tail] != GetP2MRChecksigOpcode(claimant_algo)) return false;
+
+    preimage_sha256.assign(script.begin() + hash_offset, script.begin() + hash_offset + uint256::size());
+    claimant_pubkey.assign(pubkey.begin(), pubkey.end());
+    return true;
 }
 
 std::vector<unsigned char> BuildP2MRRefundLeaf(

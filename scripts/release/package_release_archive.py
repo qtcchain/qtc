@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import importlib.util
 import json
 import os
 import shutil
@@ -197,6 +198,44 @@ def resolve_qtc_util_path(explicit_path: Path | None, qtcd_path: Path, qtc_cli_p
     )
 
 
+
+def _load_verify_module():
+    script = Path(__file__).with_name("verify_release_qtcd.py")
+    spec = importlib.util.spec_from_file_location("verify_release_qtcd", script)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"unable to load {script}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def verify_shipped_qtcd(qtcd_path: Path) -> None:
+    """Refuse to package a qtcd that advertises ZMQ without linking it, loads
+    Homebrew dylibs on macOS, or does not launch. The path must be the real
+    ELF/Mach-O/PE (build-tree bin/qtcd or an already-staged libexec/qtcd.real);
+    a packaged #!/bin/sh wrapper is not a binary and ldd/otool on it pass
+    vacuously. An unrecognized file is FAIL, never a skip."""
+    module = _load_verify_module()
+    if module.is_shell_wrapper(qtcd_path):
+        raise RuntimeError(f"{qtcd_path}: pass the real ELF/Mach-O, not the packaged bin/qtcd wrapper")
+    if module.classify(qtcd_path) == "other":
+        raise RuntimeError(
+            f"{qtcd_path}: not an ELF, Mach-O, or PE binary; refusing to package an unrecognized file "
+            "(a skipped gate is how a ZMQ-less daemon ships)"
+        )
+    module.verify_path_for_ship(qtcd_path)
+
+
+def verify_shipped_cli(qtc_cli_path: Path) -> None:
+    """Same portability bar for qtc-cli (no ZMQ or launch requirement)."""
+    module = _load_verify_module()
+    if module.is_shell_wrapper(qtc_cli_path):
+        raise RuntimeError(f"{qtc_cli_path}: pass the real ELF/Mach-O, not the packaged bin/qtc-cli wrapper")
+    if module.classify(qtc_cli_path) == "other":
+        raise RuntimeError(f"{qtc_cli_path}: not an ELF, Mach-O, or PE binary; refusing to package an unrecognized file")
+    module.verify_binary(qtc_cli_path)
+
+
 def archive_filename(version: str, platform_id: str, override: str | None) -> str:
     if override:
         return override
@@ -225,9 +264,11 @@ def stage_release_tree(
     libexec_dir = release_root / "libexec"
     bin_dir.mkdir(parents=True, exist_ok=True)
 
+    verify_shipped_qtcd(ensure_input_file(qtcd_path, "qtcd binary"))
+    verify_shipped_cli(ensure_input_file(qtc_cli_path, "qtc-cli binary"))
     binary_pairs = [
-        (ensure_input_file(qtcd_path, "qtcd binary"), f"qtcd{config['exe_suffix']}"),
-        (ensure_input_file(qtc_cli_path, "qtc-cli binary"), f"qtc-cli{config['exe_suffix']}"),
+        (qtcd_path, f"qtcd{config['exe_suffix']}"),
+        (qtc_cli_path, f"qtc-cli{config['exe_suffix']}"),
         (
             resolve_qtc_util_path(qtc_util_path, qtcd_path, qtc_cli_path, config["exe_suffix"]),
             f"qtc-util{config['exe_suffix']}",

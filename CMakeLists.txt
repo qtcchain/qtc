@@ -199,7 +199,13 @@ if(WITH_MINIUPNPC)
   find_package(MiniUPnPc MODULE REQUIRED)
 endif()
 
-option(WITH_ZMQ "Enable ZMQ notifications." OFF)
+# Default ON. The upstream project twice shipped a daemon that advertised
+# -zmqpubhashblock in its help text while linking no libzmq (the option had
+# defaulted OFF and one native tarball forgot -DWITH_ZMQ=ON); pool operators and
+# indexers got silence with no error. QTC keeps the durable fix: default ON,
+# find_package REQUIRED, and scripts/release/verify_release_qtcd.py refuses to
+# package a qtcd without a real ZeroMQ link. Fuzzing forces this OFF below.
+option(WITH_ZMQ "Enable ZMQ notifications." ON)
 if(WITH_ZMQ)
   find_package(ZeroMQ 4.0.0 MODULE REQUIRED)
 endif()

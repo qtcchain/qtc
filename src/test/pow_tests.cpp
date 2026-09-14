@@ -1057,6 +1057,47 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_option_b_asert_anchored_at_genesis)
     BOOST_CHECK_EQUAL(GetNextWorkRequired(&block_1, &block_2_header, consensus), pow_limit_bits);
 }
 
+BOOST_AUTO_TEST_CASE(ChainParams_all_shipped_asert_schedules_validate)
+{
+    // AUDIT D1: chain-parameter construction asserts ValidateMatMulAsertParams, so
+    // every shipped network (and the default regtest / -test=matmulasert /
+    // -test=matmuldgw configurations) must construct AND report a valid schedule.
+    for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4, ChainType::SIGNET, ChainType::REGTEST, ChainType::SHIELDEDV2DEV}) {
+        const auto params = CreateChainParams(*m_node.args, chain);
+        const auto& consensus = params->GetConsensus();
+        BOOST_CHECK_MESSAGE(ValidateMatMulAsertParams(consensus, consensus.nMatMulAsertHeight),
+                            "ASERT schedule invalid for chain " + ChainTypeToString(chain));
+    }
+    for (const char* test_option : {"matmulasert", "matmuldgw"}) {
+        ArgsManager args;
+        args.ForceSetArg("-test", test_option);
+        const auto consensus = CreateChainParams(args, ChainType::REGTEST)->GetConsensus();
+        BOOST_CHECK_MESSAGE(ValidateMatMulAsertParams(consensus, consensus.nMatMulAsertHeight),
+                            std::string{"ASERT schedule invalid for -test="} + test_option);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(ChainParams_REGTEST_invalid_asert_override_rejected_at_startup)
+{
+    // AUDIT D1: an operator-supplied regtest ASERT override that produces an
+    // invalid schedule (half-life upgrade height at/below the ASERT anchor) must
+    // be rejected when the chain params are constructed, not fail closed at
+    // every block at runtime.
+    CChainParams::RegTestOptions options;
+    options.matmul_asert_half_life_upgrade_height = 0; // == nMatMulAsertHeight (0) => not strictly above anchor
+    options.matmul_asert_half_life_upgrade = 3'600;
+    BOOST_CHECK_THROW(CChainParams::RegTest(options), std::runtime_error);
+
+    // With -test=matmuldgw the anchor moves to height 2; an upgrade at 2 is still invalid...
+    options.matmul_dgw = true;
+    options.matmul_asert_half_life_upgrade_height = 2;
+    BOOST_CHECK_THROW(CChainParams::RegTest(options), std::runtime_error);
+    // ...while an upgrade strictly above the anchor constructs and validates.
+    options.matmul_asert_half_life_upgrade_height = 3;
+    const auto consensus = CChainParams::RegTest(options)->GetConsensus();
+    BOOST_CHECK(ValidateMatMulAsertParams(consensus, consensus.nMatMulAsertHeight));
+}
+
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_genesis_header_fields_frozen)
 {
     const auto params = CreateChainParams(*m_node.args, ChainType::MAIN);

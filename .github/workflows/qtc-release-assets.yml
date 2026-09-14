@@ -117,6 +117,8 @@ jobs:
           python3 scripts/release/cut_local_release.py --help >/dev/null
           python3 scripts/release/sign_release_bundle.py --help >/dev/null
           python3 scripts/release/package_release_archive.py --help >/dev/null
+          python3 scripts/release/verify_release_qtcd.py --help >/dev/null
+          python3 -m unittest test.util.verify_release_qtcd_test
           python3 contrib/faststart/qtc-agent-setup.py --help >/dev/null
 
           workdir="$(mktemp -d)"

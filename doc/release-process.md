@@ -395,3 +395,12 @@ To calculate `m_assumed_chain_state_size`, take the size in GiB of these directo
 Notes:
 - When taking the size for `m_assumed_blockchain_size`, there's no need to exclude the `/chainstate` directory since it's a guideline value and an overhead will be added anyway.
 - The expected overhead for growth may change over time. Consider whether the percentage needs to be changed in response; if so, update it here in this section.
+
+## ZMQ and portability ship gate
+
+`WITH_ZMQ` defaults ON and `find_package(ZeroMQ)` is REQUIRED, so a build without libzmq fails to configure instead
+of silently shipping a daemon that advertises `-zmqpub*` options it cannot honour. `scripts/release/package_release_archive.py`
+refuses to stage a `qtcd` or `qtc-cli` that is not a real ELF/Mach-O/PE, is a packaged shell wrapper, advertises ZMQ
+without a libzmq link, loads Homebrew dylibs on macOS, or fails `qtcd -version`; the checks live in
+`scripts/release/verify_release_qtcd.py` (`--archive <tarball>` gates a finished archive). Unit tests:
+`python3 -m unittest test.util.verify_release_qtcd_test test.util.package_release_archive_test`.

@@ -217,11 +217,13 @@ std::optional<PQAlgorithm> ChecksigAlgoForLeafType(P2MRLeafType leaf_type)
     case P2MRLeafType::CLTV_CHECKSIG_MLDSA:
     case P2MRLeafType::CTV_CHECKSIG_MLDSA:
     case P2MRLeafType::CSFS_VERIFY_CHECKSIG_MLDSA:
+    case P2MRLeafType::HTLC_MLDSA:
         return PQAlgorithm::ML_DSA_44;
     case P2MRLeafType::CHECKSIG_SLHDSA:
     case P2MRLeafType::CLTV_CHECKSIG_SLHDSA:
     case P2MRLeafType::CTV_CHECKSIG_SLHDSA:
     case P2MRLeafType::CSFS_VERIFY_CHECKSIG_SLHDSA:
+    case P2MRLeafType::HTLC_SLHDSA:
         return PQAlgorithm::SLH_DSA_128S;
     default:
         return std::nullopt;
@@ -233,11 +235,9 @@ std::optional<PQAlgorithm> CSFSAlgoForLeafType(P2MRLeafType leaf_type)
     switch (leaf_type) {
     case P2MRLeafType::CSFS_MLDSA:
     case P2MRLeafType::CTV_CSFS_MLDSA:
-    case P2MRLeafType::HTLC_MLDSA:
         return PQAlgorithm::ML_DSA_44;
     case P2MRLeafType::CSFS_SLHDSA:
     case P2MRLeafType::CTV_CSFS_SLHDSA:
-    case P2MRLeafType::HTLC_SLHDSA:
         return PQAlgorithm::SLH_DSA_128S;
     default:
         return std::nullopt;
@@ -389,23 +389,18 @@ P2MRLeafType ParsePolicyP2MRLeafScript(Span<const unsigned char> leaf_script)
         }
     }
 
-    // HTLC leaf: <20-byte H160 push> OP_OVER OP_HASH160 OP_EQUALVERIFY <csfs pubkey> OP_CHECKSIGFROMSTACK
-    // (hashlock + delegated CSFS signature; spent with witness <csfs_sig> <preimage> <leaf> <control>).
-    if (leaf_script.size() > 24 &&
-        leaf_script[0] == 0x14 &&
-        leaf_script[21] == static_cast<unsigned char>(OP_OVER) &&
-        leaf_script[22] == static_cast<unsigned char>(OP_HASH160) &&
-        leaf_script[23] == static_cast<unsigned char>(OP_EQUALVERIFY)) {
-        const Span<const unsigned char> tail = leaf_script.subspan(24);
-        for (const PQAlgorithm algo : GetSupportedPQAlgorithms()) {
-            Span<const unsigned char> pubkey;
-            size_t pk_len{0};
-            if (ParseP2MRPubkeyPush(tail, 0, algo, pubkey, pk_len) &&
-                tail.size() == pk_len + 1 &&
-                tail[pk_len] == static_cast<unsigned char>(OP_CHECKSIGFROMSTACK)) {
-                return HtlcLeafTypeForAlgo(algo);
-            }
-        }
+    // Transaction-bound HTLC claim leaves. SHA-256 is the preferred swap path
+    // (~128-bit Grover preimage margin). HASH160 htlc_tx() remains standard so
+    // any pre-existing lock can still be claimed; new contracts must not use it.
+    // Legacy htlc() leaves ending in OP_CHECKSIGFROMSTACK are intentionally not
+    // standard: their revealed witness can be replayed into a conflicting
+    // transaction.
+    std::vector<unsigned char> htlc_hash;
+    std::vector<unsigned char> htlc_pubkey;
+    PQAlgorithm htlc_algo{PQAlgorithm::ML_DSA_44};
+    if (ParseP2MRHTLCSha256Leaf(leaf_script, htlc_hash, htlc_algo, htlc_pubkey) ||
+        ParseP2MRHTLCTxLeaf(leaf_script, htlc_hash, htlc_algo, htlc_pubkey)) {
+        return HtlcLeafTypeForAlgo(htlc_algo);
     }
 
     for (const PQAlgorithm algo : GetSupportedPQAlgorithms()) {
@@ -1006,9 +1001,7 @@ bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs,
                 break;
             }
             case P2MRLeafType::CSFS_MLDSA:
-            case P2MRLeafType::CSFS_SLHDSA:
-            case P2MRLeafType::HTLC_MLDSA:
-            case P2MRLeafType::HTLC_SLHDSA: {
+            case P2MRLeafType::CSFS_SLHDSA: {
                 // Witness: <csfs_sig> <message-or-preimage> <leaf_script> <control_block>.
                 if (stack.size() != 4) {
                     out_reason = reason_prefix + "p2mr-stack-size";
@@ -1021,6 +1014,24 @@ bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs,
                 }
                 if (stack[1].size() > MAX_SCRIPT_ELEMENT_SIZE) {
                     out_reason = reason_prefix + "p2mr-csfs-msg-size";
+                    return false;
+                }
+                break;
+            }
+            case P2MRLeafType::HTLC_MLDSA:
+            case P2MRLeafType::HTLC_SLHDSA: {
+                // Witness: <tx_sig> <32-byte preimage> <leaf_script> <control_block>.
+                if (stack.size() != 4) {
+                    out_reason = reason_prefix + "p2mr-stack-size";
+                    return false;
+                }
+                const auto algo = ChecksigAlgoForLeafType(leaf_type);
+                if (!algo.has_value() || !IsPolicyP2MRSignatureSize(stack[0], *algo)) {
+                    out_reason = reason_prefix + "p2mr-signature-size";
+                    return false;
+                }
+                if (stack[1].size() != 32) {
+                    out_reason = reason_prefix + "p2mr-htlc-preimage-size";
                     return false;
                 }
                 break;

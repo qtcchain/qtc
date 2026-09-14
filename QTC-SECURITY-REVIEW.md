@@ -205,7 +205,7 @@ counts or remove the options and the test expectations; not consensus.
   (`net_processing.cpp:5676-5683`); compact blocks are effectively dead on mainnet (payload never carried).
 - **P-7** Outbound peers disconnected on a single unconnecting-headers message (`:3233-3235`).
 - **P-8** Mining guard (when enabled) keys off unverified best-known heights (`mining_guard.cpp:281-283`).
-- **F-5** ASERT fail-closed paths return `powLimit`, the easiest target (`pow.cpp:1836-1848`); unreachable on mainnet.
+- **F-5** ASERT fail-closed paths return `powLimit`, the easiest target (`pow.cpp:1836-1848`); unreachable on mainnet. **FIXED 2026-09-13**: every fail path now returns the hardest valid target (`MatMulAsertFailClosedBits`, compact 0x01010000) and `ValidateMatMulAsertParams` runs fatally at chain-params construction (regtest overrides throw with a message).
 - **F-6** Empty-block penalty keys on `pindexPrev->nTx == 1`, which is 0 for headers-only ancestors; live on regtest/testnet.
 - **S-3** Allocate-before-read on shielded length prefixes (`shielded/v2_types.h:180-187`), bounded by the 16 MB message cap.
 - **W-4** Installer script hash optional under a hidden flag; `-autoupdatedevorigin` honoured from config on mainnet.
@@ -282,3 +282,21 @@ functional suites (M-9).
 No fuzzing, no functional-test runs, no dynamic analysis; no review of the miner/pool/stratum tooling outside this tree;
 no re-derivation of the lattice and PQ primitives beyond wiring and canonical-encoding checks; GPU kernels (gated off).
 Subsystem reports with full detail: iCloud `QTC/network/QTC_Security_Review_v2_subsystem_reports_2026-09-09.md`.
+
+## Upstream-derived hardening applied (2026-09-13)
+
+Ported after comparing the tree with the upstream project's v0.34.6 (analysis in iCloud
+`QTC/network`, upstream comparison note of 2026-09-13). None of these changes block validity.
+
+| Item | Change |
+|---|---|
+| Max tip age | `DEFAULT_MAX_TIP_AGE` 24 h → 30 days: a day-long stall no longer pushes every node into initial-sync mode (which would block block templates) |
+| BIP68 guard | `BuildP2MRCSVMultisigScript` rejects sequence values with bits outside `SEQUENCE_LOCKTIME_TYPE_FLAG \| MASK` (they silently shortened the on-chain delay); descriptors reject them too |
+| HTLC standardness | `OP_CHECKSIGFROMSTACK` HTLC leaves are no longer standard (witness replayable into a conflicting transaction); standard leaves use the CHECKSIG family with a HASH160 (`htlc_tx`) or SHA-256 (`htlc_sha256`) lock; witness must be `<sig> <32-byte preimage> <leaf> <control>` (`p2mr-htlc-preimage-size`); descriptors, signer and `buildhtlcclaim` updated; legacy `htlc()` still parses and signs but its spends are non-standard |
+| F-5 | ASERT fails closed to the hardest target; startup validation (see LOW) |
+| Headers sync | A peer holding the headers-sync slot without delivering is timed out and the slot reclaimed when another connected peer could take it (a lone peer is left to the chain-sync eviction logic); disconnect behaviour unchanged |
+| ZMQ ship gate | `WITH_ZMQ` defaults ON and is REQUIRED; `scripts/release/verify_release_qtcd.py` refuses to package a daemon that advertises ZMQ without linking it, loads Homebrew dylibs on macOS, is a shell wrapper, an unrecognized file, or fails `-version`; wired into `package_release_archive.py` and the release workflow |
+
+Not taken, after checking: the libsodium/SLH-DSA symbol clash (QTC links no libsodium), the file-preallocation change
+(QTC has Bitcoin Core's original), and everything tied to upstream's v4 proof-of-work, attestation, trusted-mirror,
+dump-floor and stall-recovery machinery.

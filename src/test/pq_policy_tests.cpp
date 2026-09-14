@@ -3,6 +3,7 @@
 // file COPYING or https://opensource.org/license/mit/.
 
 #include <coins.h>
+#include <crypto/sha256.h>
 #include <hash.h>
 #include <policy/policy.h>
 #include <policy/settings.h>
@@ -934,6 +935,146 @@ BOOST_AUTO_TEST_CASE(p2mr_transaction_accepted_by_mempool)
         result.m_result_type == MempoolAcceptResult::ResultType::VALID,
         "Unexpected mempool result: " << static_cast<int>(result.m_result_type)
                                       << " state=" << result.m_state.ToString());
+}
+
+namespace {
+
+// Builds a single-leaf P2MR HTLC spend whose witness is <tx_sig> <preimage> <leaf> <control>.
+struct HtlcSpendFixture {
+    CMutableTransaction tx_credit;
+    CMutableTransaction tx_spend;
+};
+
+HtlcSpendFixture BuildSignedHtlcSpend(const CPQKey& claimant_key,
+                                      Span<const unsigned char> leaf_script,
+                                      Span<const unsigned char> preimage)
+{
+    const uint256 leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION, leaf_script);
+    const uint256 merkle_root = ComputeP2MRMerkleRoot({leaf_hash});
+
+    HtlcSpendFixture out;
+    out.tx_credit = BuildCreditingTransaction(BuildP2MROutput(merkle_root), /*nValue=*/50'000);
+    out.tx_spend = BuildSpendingTransaction(CScript{}, CScriptWitness{}, CTransaction{out.tx_credit});
+    const auto witness = BuildSignedSingleLeafP2MRWitness(
+        out.tx_spend, out.tx_credit.vout.at(0), claimant_key, leaf_script);
+    assert(witness.has_value());
+    out.tx_spend.vin.at(0).scriptWitness = *witness;
+    out.tx_spend.vin.at(0).scriptWitness.stack.insert(
+        out.tx_spend.vin.at(0).scriptWitness.stack.begin() + 1,
+        std::vector<unsigned char>(preimage.begin(), preimage.end()));
+    return out;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(p2mr_htlc_tx_witness_is_standard)
+{
+    CPQKey claimant_key;
+    claimant_key.MakeNewKey(PQAlgorithm::ML_DSA_44);
+    BOOST_REQUIRE(claimant_key.IsValid());
+
+    const std::vector<unsigned char> preimage(32, 0x42);
+    const uint160 hash160 = Hash160(preimage);
+    const std::vector<unsigned char> hash160_bytes(hash160.begin(), hash160.end());
+    const std::vector<unsigned char> leaf_script = BuildP2MRHTLCTxLeaf(
+        hash160_bytes, PQAlgorithm::ML_DSA_44, claimant_key.GetPubKey());
+    BOOST_REQUIRE(!leaf_script.empty());
+    const HtlcSpendFixture spend = BuildSignedHtlcSpend(claimant_key, leaf_script, preimage);
+
+    CCoinsView coins_view;
+    CCoinsViewCache coins_cache(&coins_view);
+    AddCoins(coins_cache, CTransaction{spend.tx_credit}, /*nHeight=*/0);
+
+    std::string reason;
+    BOOST_CHECK(IsWitnessStandard(CTransaction{spend.tx_spend}, coins_cache, "", reason));
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_htlc_sha256_witness_is_standard)
+{
+    for (const PQAlgorithm algo : {PQAlgorithm::ML_DSA_44, PQAlgorithm::SLH_DSA_128S}) {
+        CPQKey claimant_key;
+        claimant_key.MakeNewKey(algo);
+        BOOST_REQUIRE(claimant_key.IsValid());
+
+        const std::vector<unsigned char> preimage(32, 0x42);
+        uint256 sha256;
+        CSHA256().Write(preimage.data(), preimage.size()).Finalize(sha256.begin());
+        const std::vector<unsigned char> sha256_bytes(sha256.begin(), sha256.end());
+        const std::vector<unsigned char> leaf_script = BuildP2MRHTLCSha256Leaf(
+            sha256_bytes, algo, claimant_key.GetPubKey());
+        BOOST_REQUIRE(!leaf_script.empty());
+        const HtlcSpendFixture spend = BuildSignedHtlcSpend(claimant_key, leaf_script, preimage);
+
+        CCoinsView coins_view;
+        CCoinsViewCache coins_cache(&coins_view);
+        AddCoins(coins_cache, CTransaction{spend.tx_credit}, /*nHeight=*/0);
+
+        std::string reason;
+        BOOST_CHECK_MESSAGE(IsWitnessStandard(CTransaction{spend.tx_spend}, coins_cache, "", reason),
+                            "algo=" << static_cast<int>(algo) << " reason=" << reason);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_htlc_witness_rejects_bad_preimage_size)
+{
+    CPQKey claimant_key;
+    claimant_key.MakeNewKey(PQAlgorithm::ML_DSA_44);
+    BOOST_REQUIRE(claimant_key.IsValid());
+
+    // Consensus would accept any preimage length that hashes correctly; policy
+    // pins the HTLC witness shape to a 32-byte preimage.
+    const std::vector<unsigned char> short_preimage(16, 0x44);
+    uint256 sha256;
+    CSHA256().Write(short_preimage.data(), short_preimage.size()).Finalize(sha256.begin());
+    const std::vector<unsigned char> sha256_bytes(sha256.begin(), sha256.end());
+    const std::vector<unsigned char> leaf_script = BuildP2MRHTLCSha256Leaf(
+        sha256_bytes, PQAlgorithm::ML_DSA_44, claimant_key.GetPubKey());
+    BOOST_REQUIRE(!leaf_script.empty());
+    const HtlcSpendFixture spend = BuildSignedHtlcSpend(claimant_key, leaf_script, short_preimage);
+
+    CCoinsView coins_view;
+    CCoinsViewCache coins_cache(&coins_view);
+    AddCoins(coins_cache, CTransaction{spend.tx_credit}, /*nHeight=*/0);
+
+    std::string reason;
+    BOOST_CHECK(!IsWitnessStandard(CTransaction{spend.tx_spend}, coins_cache, "", reason));
+    BOOST_CHECK_EQUAL(reason, "p2mr-htlc-preimage-size");
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_legacy_htlc_witness_is_nonstandard)
+{
+    CPQKey claimant_key;
+    claimant_key.MakeNewKey(PQAlgorithm::ML_DSA_44);
+    BOOST_REQUIRE(claimant_key.IsValid());
+
+    const std::vector<unsigned char> preimage(32, 0x43);
+    const uint160 hash160 = Hash160(preimage);
+    const std::vector<unsigned char> hash160_bytes(hash160.begin(), hash160.end());
+    const std::vector<unsigned char> leaf_script = BuildP2MRHTLCLeaf(
+        hash160_bytes, PQAlgorithm::ML_DSA_44, claimant_key.GetPubKey());
+    BOOST_REQUIRE(!leaf_script.empty());
+    const uint256 leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION, leaf_script);
+    const uint256 merkle_root = ComputeP2MRMerkleRoot({leaf_hash});
+
+    const CMutableTransaction tx_credit =
+        BuildCreditingTransaction(BuildP2MROutput(merkle_root), /*nValue=*/50'000);
+    CMutableTransaction tx_spend =
+        BuildSpendingTransaction(CScript{}, CScriptWitness{}, CTransaction{tx_credit});
+    // Consensus-valid CSFS claim witness; policy must still refuse the leaf shape.
+    tx_spend.vin.at(0).scriptWitness.stack = {
+        SignCSFSMessage(claimant_key, preimage),
+        preimage,
+        leaf_script,
+        {P2MR_LEAF_VERSION},
+    };
+
+    CCoinsView coins_view;
+    CCoinsViewCache coins_cache(&coins_view);
+    AddCoins(coins_cache, CTransaction{tx_credit}, /*nHeight=*/0);
+
+    std::string reason;
+    BOOST_CHECK(!IsWitnessStandard(CTransaction{tx_spend}, coins_cache, "", reason));
+    BOOST_CHECK_EQUAL(reason, "p2mr-leaf-script");
 }
 
 BOOST_AUTO_TEST_CASE(p2mr_csfs_witness_rejects_oversized_message_policy)

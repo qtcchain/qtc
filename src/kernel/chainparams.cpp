@@ -12,6 +12,7 @@
 #include <hash.h>
 #include <kernel/messagestartchars.h>
 #include <logging.h>
+#include <pow.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
@@ -365,6 +366,12 @@ public:
         consensus.hashGenesisBlock = genesis.GetHash();
         assert(consensus.hashGenesisBlock == uint256{"9ba00506445039aa7315dc1ce61eded19ec75d31edbfed3643cb1e4f3c3db8e2"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
+        // AUDIT D1: validate the immutable MatMul-ASERT schedule at construction so
+        // an invalid parameter set aborts node startup instead of failing closed
+        // (hardest target) at some future block. ValidateMatMulAsertParams is a pure
+        // function of the params; the height argument is log context only.
+        assert(!consensus.fMatMulPOW ||
+               ValidateMatMulAsertParams(consensus, consensus.nMatMulAsertHeight));
 
         // QTC address prefixes (distinct from QTC). PUBKEY 58 → base58 'Q' lead;
         // SECRET = PUBKEY + 128 per convention.
@@ -555,6 +562,12 @@ public:
         consensus.hashGenesisBlock = genesis.GetHash();
         assert(consensus.hashGenesisBlock == uint256{"2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
+        // AUDIT D1: validate the immutable MatMul-ASERT schedule at construction so
+        // an invalid parameter set aborts node startup instead of failing closed
+        // (hardest target) at some future block. ValidateMatMulAsertParams is a pure
+        // function of the params; the height argument is log context only.
+        assert(!consensus.fMatMulPOW ||
+               ValidateMatMulAsertParams(consensus, consensus.nMatMulAsertHeight));
 
         // Testnet DNS seeds mirror mainnet domains; fixed seeds provide fallback.
         vSeeds.clear();
@@ -734,6 +747,12 @@ public:
         consensus.hashGenesisBlock = genesis.GetHash();
         assert(consensus.hashGenesisBlock == uint256{"2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
+        // AUDIT D1: validate the immutable MatMul-ASERT schedule at construction so
+        // an invalid parameter set aborts node startup instead of failing closed
+        // (hardest target) at some future block. ValidateMatMulAsertParams is a pure
+        // function of the params; the height argument is log context only.
+        assert(!consensus.fMatMulPOW ||
+               ValidateMatMulAsertParams(consensus, consensus.nMatMulAsertHeight));
 
         vSeeds.clear();
         // QTC: no seed infrastructure yet (see mainnet).
@@ -943,6 +962,12 @@ public:
         consensus.hashGenesisBlock = genesis.GetHash();
         assert(consensus.hashGenesisBlock == uint256{"2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
+        // AUDIT D1: validate the immutable MatMul-ASERT schedule at construction so
+        // an invalid parameter set aborts node startup instead of failing closed
+        // (hardest target) at some future block. ValidateMatMulAsertParams is a pure
+        // function of the params; the height argument is log context only.
+        assert(!consensus.fMatMulPOW ||
+               ValidateMatMulAsertParams(consensus, consensus.nMatMulAsertHeight));
 
         m_assumeutxo_data = {};
 
@@ -1264,6 +1289,22 @@ public:
         assert(consensus.hashGenesisBlock == uint256{"25d0b1c272072b56bb0e79aea8566b16378648775e7a517d9d022720f6a1fca6"});
         }
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
+        // AUDIT D1: the -regtestmatmulaserthalflife* / -regtestmatmulpowtargetspacing
+        // overrides above are applied before this point, so validate the FINAL
+        // regtest ASERT schedule here. An operator-supplied invalid combination
+        // (e.g. -regtestmatmulaserthalflifeupgradeheight at/below the ASERT anchor)
+        // must fail at startup with a clear message, not fail closed (hardest
+        // target) at every block at runtime.
+        if (consensus.fMatMulPOW &&
+            !ValidateMatMulAsertParams(consensus, consensus.nMatMulAsertHeight)) {
+            throw std::runtime_error(strprintf(
+                "Invalid regtest MatMul ASERT schedule: half-life %lld s, upgrade height %d / upgrade half-life %lld s, "
+                "target spacing %lld s (see debug log for the failing check).",
+                static_cast<long long>(consensus.nMatMulAsertHalfLife),
+                consensus.nMatMulAsertHalfLifeUpgradeHeight,
+                static_cast<long long>(consensus.nMatMulAsertHalfLifeUpgrade),
+                static_cast<long long>(consensus.nPowTargetSpacing)));
+        }
 
         vFixedSeeds.clear(); //!< Regtest mode doesn't have any fixed seeds.
         vSeeds.clear();
@@ -1454,6 +1495,12 @@ public:
             uint256{});
         consensus.hashGenesisBlock = genesis.GetHash();
         assert(consensus.hashGenesisBlock == uint256{"309ae3de50712d4520cec19066979473a70de4a4b73d89b3327a07c845336e1f"});
+        // AUDIT D1: validate the immutable MatMul-ASERT schedule at construction so
+        // an invalid parameter set aborts node startup instead of failing closed
+        // (hardest target) at some future block. ValidateMatMulAsertParams is a pure
+        // function of the params; the height argument is log context only.
+        assert(!consensus.fMatMulPOW ||
+               ValidateMatMulAsertParams(consensus, consensus.nMatMulAsertHeight));
 
         vFixedSeeds.clear();
         vSeeds.clear();

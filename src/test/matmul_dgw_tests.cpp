@@ -740,8 +740,71 @@ BOOST_AUTO_TEST_CASE(asert_zero_and_negative_time_diff_are_bounded)
     BOOST_CHECK(target_negative <= pow_limit);
 }
 
-BOOST_AUTO_TEST_CASE(asert_invalid_params_fail_closed_to_powlimit)
+BOOST_AUTO_TEST_CASE(asert_fail_closed_bits_is_hardest_valid_target)
 {
+    // AUDIT D1: the fail-closed result is the hardest representable target
+    // (arith_uint256{1}), encoded as compact 0x01010000. It must be a valid,
+    // non-zero, non-negative, non-overflowing compact that decodes back to 1 and
+    // is strictly harder than every network's powLimit.
+    const uint32_t fail_closed_bits = MatMulAsertFailClosedBits();
+    BOOST_CHECK_EQUAL(fail_closed_bits, 0x01010000U);
+    bool negative{false};
+    bool overflow{false};
+    arith_uint256 decoded{};
+    decoded.SetCompact(fail_closed_bits, &negative, &overflow);
+    BOOST_CHECK(!negative);
+    BOOST_CHECK(!overflow);
+    BOOST_CHECK(decoded == arith_uint256{1});
+    for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4, ChainType::SIGNET, ChainType::REGTEST}) {
+        const auto params = CreateChainParams(ArgsManager{}, chain)->GetConsensus();
+        BOOST_CHECK(decoded < UintToArith256(params.powLimit));
+        BOOST_CHECK(fail_closed_bits != UintToArith256(params.powLimit).GetCompact());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(asert_invalid_half_life_fails_closed_to_hardest_target)
+{
+    // AUDIT D1: an invalid half-life must fail CLOSED to the hardest target,
+    // never OPEN to powLimit (the easiest target).
+    auto params = MatMulRetargetParams();
+    params.nFastMineHeight = 10;
+    params.nMatMulAsertHeight = 10;
+
+    std::vector<CBlockIndex> blocks(12);
+    SeedFixedDifficultyChain(blocks, 0x1f00ffffU, 1'700'000'000, 90);
+    CBlockHeader next{};
+    next.nTime = blocks.back().GetBlockTime() + 90;
+    const uint32_t powlimit_bits = UintToArith256(params.powLimit).GetCompact();
+    const uint32_t hardest_bits = MatMulAsertFailClosedBits();
+    BOOST_REQUIRE(hardest_bits != powlimit_bits);
+
+    // Sanity: the valid schedule does NOT fail closed.
+    BOOST_CHECK(GetNextWorkRequired(&blocks.back(), &next, params) != hardest_bits);
+
+    params.nMatMulAsertHalfLife = 0;
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), hardest_bits);
+    params.nMatMulAsertHalfLife = -1;
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), hardest_bits);
+
+    // The upgrade half-life is validated the same way once an upgrade height is set.
+    params.nMatMulAsertHalfLife = 14'400;
+    params.nMatMulAsertHalfLifeUpgradeHeight = 16;
+    params.nMatMulAsertHalfLifeUpgrade = 0;
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), hardest_bits);
+    params.nMatMulAsertHalfLifeUpgrade = -3'600;
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), hardest_bits);
+
+    // The validator itself reports the breach.
+    params.nMatMulAsertHalfLifeUpgradeHeight = std::numeric_limits<int32_t>::max();
+    params.nMatMulAsertHalfLife = 0;
+    BOOST_CHECK(!ValidateMatMulAsertParams(params, 11));
+    params.nMatMulAsertHalfLife = 14'400;
+    BOOST_CHECK(ValidateMatMulAsertParams(params, 11));
+}
+
+BOOST_AUTO_TEST_CASE(asert_invalid_params_fail_closed_to_hardest_target)
+{
+    // AUDIT D1: every invalid-schedule path fails CLOSED to the hardest target.
     auto params = MatMulRetargetParams();
     params.nFastMineHeight = 10;
     params.nMatMulAsertHeight = 10;
@@ -751,26 +814,43 @@ BOOST_AUTO_TEST_CASE(asert_invalid_params_fail_closed_to_powlimit)
     SeedFixedDifficultyChain(blocks, 0x1f00ffffU, 1'700'000'000, 90);
     CBlockHeader next{};
     next.nTime = blocks.back().GetBlockTime() + 90;
-    const uint32_t powlimit_bits = UintToArith256(params.powLimit).GetCompact();
-    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), powlimit_bits);
+    const uint32_t hardest_bits = MatMulAsertFailClosedBits();
+    BOOST_REQUIRE(hardest_bits != UintToArith256(params.powLimit).GetCompact());
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), hardest_bits);
 
     params.nMatMulAsertHalfLife = 14'400;
     params.nMatMulAsertRetuneHeight = 9; // below activation => invalid schedule
-    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), powlimit_bits);
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), hardest_bits);
 
     params.nMatMulAsertRetuneHeight = 16;
     params.nMatMulAsertRetune2Height = 14; // below retune => invalid schedule
-    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), powlimit_bits);
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), hardest_bits);
 
     params.nMatMulAsertRetune2Height = std::numeric_limits<int32_t>::max();
     params.nMatMulAsertHalfLifeUpgradeHeight = 16;
     params.nMatMulAsertHalfLifeUpgrade = 0;
-    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), powlimit_bits);
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), hardest_bits);
 
     params.nMatMulAsertHalfLifeUpgrade = 3'600;
     params.nMatMulAsertRetune2Height = 16;
     params.nMatMulAsertHalfLifeUpgradeHeight = 16; // upgrade must be strictly after latest retune anchor
-    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), powlimit_bits);
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), hardest_bits);
+
+    params.nMatMulAsertHalfLifeUpgradeHeight = 17;
+    params.nMatMulAsertBootstrapFactor = 0;
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), hardest_bits);
+
+    params.nMatMulAsertBootstrapFactor = 1;
+    params.nMatMulAsertRetuneHardeningFactor = 0;
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), hardest_bits);
+
+    params.nMatMulAsertRetuneHardeningFactor = 1;
+    params.nMatMulAsertRetune2TargetDen = 0;
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), hardest_bits);
+
+    params.nMatMulAsertRetune2TargetDen = 1;
+    params.nPowTargetSpacing = 0;
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), hardest_bits);
 }
 
 // QTC Option B launch vector: no fast phase; ASERT is live from block 1 with the
@@ -845,7 +925,7 @@ BOOST_AUTO_TEST_CASE(asert_mainnet_option_b_no_fast_phase_retargets_from_genesis
     BOOST_CHECK(observed_target > pow_limit / 2); // one early block: ~0.4% tighter, not a cliff
 }
 
-BOOST_AUTO_TEST_CASE(asert_missing_anchor_fails_closed_to_powlimit)
+BOOST_AUTO_TEST_CASE(asert_missing_anchor_fails_closed_to_hardest_target)
 {
     auto params = MatMulRetargetParams();
     params.nFastMineHeight = 100;
@@ -859,8 +939,13 @@ BOOST_AUTO_TEST_CASE(asert_missing_anchor_fails_closed_to_powlimit)
 
     CBlockHeader next{};
     next.nTime = blocks.back().GetBlockTime() + 90;
+    // A missing anchor means the difficulty schedule cannot be derived; the node must not hand
+    // out the easiest target (that is how a corrupted index would weaken the chain) but the
+    // hardest one, so no block can be built on the broken state until it is repaired.
     const uint32_t powlimit_bits = UintToArith256(params.powLimit).GetCompact();
-    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &next, params), powlimit_bits);
+    const uint32_t observed = GetNextWorkRequired(&blocks.back(), &next, params);
+    BOOST_CHECK_EQUAL(observed, MatMulAsertFailClosedBits());
+    BOOST_CHECK(observed != powlimit_bits);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
