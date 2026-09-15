@@ -250,6 +250,15 @@ class VerifyReleaseQtcdTest(unittest.TestCase):
             self.assertIn(b"FAIL", proc.stderr)
             self.assertEqual(self.mod.main([str(qtcd)]), 1)
 
+    def test_gate_passes_with_statically_linked_libzmq(self) -> None:
+        # Release binaries from the depends set carry libzmq inside the executable: ldd shows no
+        # libzmq, but the library's internal symbol strings are present after stripping.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            qtcd = pathlib.Path(tmpdir) / "qtcd"
+            qtcd.write_bytes(b"\x7fELF" + b"\x00" * 16 + self.mod.ENABLE_ZMQ_HELP + b"\x00int zmq::msg_t::init_buffer(const void*, size_t)\x00")
+            with mock.patch.object(self.mod, "elf_needed_ldd", return_value=["libc.so.6"]):
+                self.mod.verify_linux(qtcd)  # must not raise
+
     def test_gate_fails_when_help_present_but_libzmq_not_linked(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             qtcd = pathlib.Path(tmpdir) / "qtcd"

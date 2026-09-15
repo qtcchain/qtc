@@ -50,6 +50,9 @@ from pathlib import Path
 
 
 ENABLE_ZMQ_HELP = b"Enable publish hash block"
+# QTC release binaries link libzmq statically from the depends set, so DT_NEEDED never names it;
+# the library's own internal symbol strings survive stripping and prove it is compiled in.
+STATIC_LIBZMQ_MARKERS = (b"zmq::msg_t", b"zmq::socket_base_t", b"zmq::ctx_t")
 ELF_MAGIC = b"\x7fELF"
 MACHO_MAGIC_64LE = 0xFEEDFACF
 LC_LOAD_DYLIB = 0xC
@@ -65,6 +68,11 @@ class VerifyError(RuntimeError):
 def read_prefix(path: Path, n: int = 5) -> bytes:
     with path.open("rb") as handle:
         return handle.read(n)
+
+
+def has_static_libzmq(path: Path) -> bool:
+    data = path.read_bytes()
+    return any(marker in data for marker in STATIC_LIBZMQ_MARKERS)
 
 
 def has_enable_zmq_help(path: Path) -> bool:
@@ -134,11 +142,14 @@ def verify_linux(path: Path) -> None:
             "-zmqpubhashblock without compiling bitcoin_zmq (the upstream failure shape)"
         )
     needed = elf_needed_ldd(path)
-    if not any("libzmq" in name for name in needed):
-        raise VerifyError(
-            f"{path}: ldd does not show libzmq; WITH_ZMQ was OFF or libzmq was not linked. "
-            f"NEEDED={needed}"
-        )
+    if any("libzmq" in name for name in needed):
+        return
+    if has_static_libzmq(path):
+        return
+    raise VerifyError(
+        f"{path}: no libzmq linked — neither DT_NEEDED nor a statically linked libzmq "
+        f"(WITH_ZMQ was OFF or libzmq was not linked). NEEDED={needed}"
+    )
 
 
 def verify_windows(path: Path) -> None:
