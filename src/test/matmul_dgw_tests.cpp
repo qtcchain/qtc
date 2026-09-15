@@ -150,7 +150,7 @@ BOOST_AUTO_TEST_CASE(testnet_genesis_uses_powlimit_compact)
 {
     const auto params = CreateChainParams(ArgsManager{}, ChainType::TESTNET)->GetConsensus();
     const arith_uint256 pow_limit = UintToArith256(params.powLimit);
-    const uint32_t testnet_genesis_nbits = 0x20027525U;
+    const uint32_t testnet_genesis_nbits = 0x1e011da5U; // launch floor candidate D (test chains aligned to mainnet, 2026-09-15)
 
     BOOST_CHECK_EQUAL(testnet_genesis_nbits, pow_limit.GetCompact());
 

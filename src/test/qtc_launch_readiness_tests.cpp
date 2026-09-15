@@ -230,19 +230,18 @@ BOOST_AUTO_TEST_CASE(lr13_matmul_pow_parameters)
 }
 
 // =========================================================================
-// LR-14: Fast-mine phase is enabled through the bootstrap window; ASERT activates at boundary
+// LR-14: No fast-mine phase on any chain; ASERT is anchored at genesis (QTC Option B)
 // =========================================================================
 BOOST_AUTO_TEST_CASE(lr14_fast_mine_window)
 {
-    for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4, ChainType::REGTEST}) {
+    // 2026-09-15 (QTC-LAUNCH-SAFETY.md S14): the test chains mirror mainnet's
+    // Option B, so every chain anchors ASERT at genesis with no bootstrap window.
+    for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4, ChainType::SIGNET, ChainType::REGTEST}) {
         ArgsManager args;
         const auto params = CreateChainParams(args, chain);
         const auto& consensus = params->GetConsensus();
 
-        const int32_t expected_fast_height =
-            chain == ChainType::REGTEST ? 0 :
-            chain == ChainType::MAIN ? 0 : // QTC Option B: no fast phase
-            61'000;
+        constexpr int32_t expected_fast_height = 0;
         BOOST_CHECK_EQUAL(consensus.nFastMineHeight, expected_fast_height);
         BOOST_CHECK_EQUAL(consensus.nMatMulAsertHeight, expected_fast_height);
         BOOST_CHECK_LT(consensus.nPowTargetSpacingFastMs,

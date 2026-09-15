@@ -434,12 +434,14 @@ public:
         consensus.CSVHeight = 0;
         consensus.SegwitHeight = 0;
         consensus.MinBIP9WarningHeight = 0;
-        // MatMul powLimit calibrated assuming T_attempt ~0.6ms per solve attempt (n=256)
-        // targeting ~0.25s fast-phase blocks on single modern GPU reference hardware.
-        consensus.powLimit = uint256{"027525460aa64c2f837b4a2339c0ebedfa43fe5c91d14e3bcd35a858793dd970"};
+        // QTC 2026-09-15 (QTC-LAUNCH-SAFETY.md S14): every MatMul / ASERT / drift /
+        // timewarp / pre-hash / payload field below mirrors CMainParams so the burn-in
+        // rehearses the launch consensus. powLimit is launch floor candidate D
+        // (0x011da5 * 2^216, compact 0x1e011da5); genesis nBits MUST equal compact(powLimit).
+        consensus.powLimit = uint256{"0000011da5000000000000000000000000000000000000000000000000000000"}; // compact 0x1e011da5, launch floor candidate D
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
         consensus.nPowTargetSpacing = 600; // QTC: 10-minute blocks (Bitcoin)
-        consensus.fPowAllowMinDifficultyBlocks = true;
+        consensus.fPowAllowMinDifficultyBlocks = false; // as mainnet
         consensus.enforce_BIP94 = true;
         consensus.fPowNoRetargeting = false;
         consensus.fKAWPOW = false;
@@ -448,38 +450,38 @@ public:
         consensus.fEnforceP2MROnlyOutputs = true;
         consensus.nKAWPOWHeight = std::numeric_limits<int>::max();
         consensus.fMatMulPOW = true;
-        consensus.nMatMulDimension = 256;
-        consensus.nMatMulTranscriptBlockSize = 8;
-        consensus.nMatMulNoiseRank = 4;
-        consensus.nMatMulValidationWindow = 500;
-        consensus.nMatMulPhase2FailBanThreshold = std::numeric_limits<uint32_t>::max();
+        consensus.nMatMulDimension = 512;
+        consensus.nMatMulTranscriptBlockSize = 16;
+        consensus.nMatMulNoiseRank = 8;
+        consensus.nMatMulValidationWindow = 1000;
+        consensus.nMatMulPhase2FailBanThreshold = 1;
         consensus.fMatMulStrictPunishment = false;
         consensus.nMatMulSnapshotInterval = 10'000;
         consensus.nMatMulProofPruneDepth = 10'000;
         consensus.fMatMulFreivaldsEnabled = true;
         consensus.nMatMulFreivaldsRounds = 2;
-        consensus.fMatMulRequireProductPayload = true;
+        consensus.fMatMulRequireProductPayload = false; // as mainnet: payload is consensus-required from genesis via nMatMulProductDigestHeight = 0
         consensus.fMatMulRejectLegacyPayloadVectors = true; // QTC security review N-5
-        consensus.nMatMulFreivaldsBindingHeight = 61'000;
-        consensus.nMatMulProductDigestHeight = 61'000;
+        consensus.nMatMulFreivaldsBindingHeight = 0; // QTC D8, as mainnet
+        consensus.nMatMulProductDigestHeight = 0; // QTC D8, as mainnet
         consensus.nMaxReorgDepth = 12;
         consensus.nReorgProtectionStartHeight = 61'000;
         consensus.nEmptyBlockSubsidyPenaltyHeight = QTC_EMPTY_BLOCK_SUBSIDY_PENALTY_HEIGHT;
         consensus.nEmptyBlockSubsidyStrictPenaltyHeight = QTC_V03210_HARDENING_HEIGHT;
         consensus.nEmptyBlockSubsidyPenaltyEndHeight = QTC_V03211_HARDENING_HEIGHT;
         consensus.nPowTargetSpacingFastMs = 250;
-        consensus.nFastMineDifficultyScale = 4;
+        consensus.nFastMineDifficultyScale = 6; // inert with nFastMineHeight = 0
         consensus.nPowTargetSpacingNormal = 600;
-        consensus.nFastMineHeight = 61'000;
+        consensus.nFastMineHeight = 0; // QTC Option B: no fast-mine bootstrap phase
         // DGW is NOT used for MatMul mining -- ASERT only. See pow.cpp.
         consensus.nDgwAsymmetricClampHeight = std::numeric_limits<int32_t>::max();
         consensus.nDgwEasingBoostHeight = std::numeric_limits<int32_t>::max();
         consensus.nDgwWindowAlignmentHeight = std::numeric_limits<int32_t>::max();
         consensus.nDgwSlewGuardHeight = std::numeric_limits<int32_t>::max();
         // ASERT activates at nFastMineHeight. This MUST equal nFastMineHeight.
-        consensus.nMatMulAsertHeight = 61'000;
+        consensus.nMatMulAsertHeight = 0; // genesis anchor, as mainnet
         consensus.nMatMulAsertHalfLife = 172'800; // QTC: 2 days at 600 s
-        consensus.nMatMulAsertBootstrapFactor = 180;
+        consensus.nMatMulAsertBootstrapFactor = 1; // inert with a genesis anchor
         // No retune or half-life upgrade needed — fresh chain starts with
         // the target 3,600s half-life directly.
         consensus.nMatMulAsertRetuneHeight = std::numeric_limits<int32_t>::max();
@@ -489,11 +491,16 @@ public:
         consensus.nMatMulAsertRetune2TargetDen = 1;
         consensus.nMatMulAsertHalfLifeUpgradeHeight = std::numeric_limits<int32_t>::max();
         consensus.nMatMulAsertHalfLifeUpgrade = 172'800;
-        // Hardened pre-hash epsilon (18 bits) active from ASERT activation.
-        consensus.nMatMulPreHashEpsilonBitsUpgradeHeight = 61'000;
+        // QTC Option B (D4): MTP drift bound and a5 timewarp reconciliation from genesis, as mainnet.
+        consensus.nMatMulMaxFutureMtpDriftHeight = 0;
+        consensus.nMatMulMaxFutureMtpDrift = 43'200; // tau / 4 at 600 s
+        consensus.nMatMulTimewarpReconcileHeight = 0;
+        // QTC Option B (D5): hardened 18-bit header gate from block 0, as mainnet.
+        consensus.nMatMulPreHashEpsilonBits = 18;
+        consensus.nMatMulPreHashEpsilonBitsUpgradeHeight = 0;
         consensus.nMatMulPreHashEpsilonBitsUpgrade = 18;
-        consensus.nMatMulNonceSeedHeight = 125'000;
-        consensus.nMatMulParentMtpSeedHeight = QTC_V03210_HARDENING_HEIGHT;
+        consensus.nMatMulNonceSeedHeight = 0; // QTC D8, as mainnet
+        consensus.nMatMulParentMtpSeedHeight = 0; // QTC D8, as mainnet
         consensus.nMaxBlockWeight = 24'000'000;
         consensus.nMaxBlockSerializedSize = 24'000'000;
         consensus.nMaxBlockSigOpsCost = 480'000;
@@ -557,13 +564,13 @@ public:
             1789063200,  // Sep 10, 2026 18:00:00 UTC — consensus fork v0.0.5 (REGENERATE AGAIN within hours of the real launch, security review H1)
             0,
             238,
-            0x20027525,
+            0x1e011da5,  // == compact(powLimit); launch floor candidate D
             1,
             consensus.nInitialSubsidy,
             static_cast<uint16_t>(consensus.nMatMulDimension),
             uint256{"00230371b05217711a10cf44983c2ffc3d82da06369fd0e640b6d20c033e38da"});
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb"});
+        assert(consensus.hashGenesisBlock == uint256{"6da52defc708089bc721409fccf224c549288b242cadc39243b6d12a37e7397c"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
         // AUDIT D1: validate the immutable MatMul-ASERT schedule at construction so
         // an invalid parameter set aborts node startup instead of failing closed
@@ -623,12 +630,14 @@ public:
         consensus.CSVHeight = 0;
         consensus.SegwitHeight = 0;
         consensus.MinBIP9WarningHeight = 0;
-        // MatMul powLimit calibrated assuming T_attempt ~0.6ms per solve attempt (n=256)
-        // targeting ~0.25s fast-phase blocks on single modern GPU reference hardware.
-        consensus.powLimit = uint256{"027525460aa64c2f837b4a2339c0ebedfa43fe5c91d14e3bcd35a858793dd970"};
+        // QTC 2026-09-15 (QTC-LAUNCH-SAFETY.md S14): every MatMul / ASERT / drift /
+        // timewarp / pre-hash / payload field below mirrors CMainParams so the burn-in
+        // rehearses the launch consensus. powLimit is launch floor candidate D
+        // (0x011da5 * 2^216, compact 0x1e011da5); genesis nBits MUST equal compact(powLimit).
+        consensus.powLimit = uint256{"0000011da5000000000000000000000000000000000000000000000000000000"}; // compact 0x1e011da5, launch floor candidate D
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
         consensus.nPowTargetSpacing = 600; // QTC: 10-minute blocks (Bitcoin)
-        consensus.fPowAllowMinDifficultyBlocks = true;
+        consensus.fPowAllowMinDifficultyBlocks = false; // as mainnet
         consensus.enforce_BIP94 = true;
         consensus.fPowNoRetargeting = false;
         consensus.fKAWPOW = false;
@@ -637,38 +646,38 @@ public:
         consensus.fEnforceP2MROnlyOutputs = true;
         consensus.nKAWPOWHeight = std::numeric_limits<int>::max();
         consensus.fMatMulPOW = true;
-        consensus.nMatMulDimension = 256;
-        consensus.nMatMulTranscriptBlockSize = 8;
-        consensus.nMatMulNoiseRank = 4;
-        consensus.nMatMulValidationWindow = 500;
-        consensus.nMatMulPhase2FailBanThreshold = std::numeric_limits<uint32_t>::max();
+        consensus.nMatMulDimension = 512;
+        consensus.nMatMulTranscriptBlockSize = 16;
+        consensus.nMatMulNoiseRank = 8;
+        consensus.nMatMulValidationWindow = 1000;
+        consensus.nMatMulPhase2FailBanThreshold = 1;
         consensus.fMatMulStrictPunishment = false;
         consensus.nMatMulSnapshotInterval = 10'000;
         consensus.nMatMulProofPruneDepth = 10'000;
         consensus.fMatMulFreivaldsEnabled = true;
         consensus.nMatMulFreivaldsRounds = 2;
-        consensus.fMatMulRequireProductPayload = true;
+        consensus.fMatMulRequireProductPayload = false; // as mainnet: payload is consensus-required from genesis via nMatMulProductDigestHeight = 0
         consensus.fMatMulRejectLegacyPayloadVectors = true; // QTC security review N-5
-        consensus.nMatMulFreivaldsBindingHeight = 61'000;
-        consensus.nMatMulProductDigestHeight = 61'000;
+        consensus.nMatMulFreivaldsBindingHeight = 0; // QTC D8, as mainnet
+        consensus.nMatMulProductDigestHeight = 0; // QTC D8, as mainnet
         consensus.nMaxReorgDepth = 12;
         consensus.nReorgProtectionStartHeight = 61'000;
         consensus.nEmptyBlockSubsidyPenaltyHeight = QTC_EMPTY_BLOCK_SUBSIDY_PENALTY_HEIGHT;
         consensus.nEmptyBlockSubsidyStrictPenaltyHeight = QTC_V03210_HARDENING_HEIGHT;
         consensus.nEmptyBlockSubsidyPenaltyEndHeight = QTC_V03211_HARDENING_HEIGHT;
         consensus.nPowTargetSpacingFastMs = 250;
-        consensus.nFastMineDifficultyScale = 4;
+        consensus.nFastMineDifficultyScale = 6; // inert with nFastMineHeight = 0
         consensus.nPowTargetSpacingNormal = 600;
-        consensus.nFastMineHeight = 61'000;
+        consensus.nFastMineHeight = 0; // QTC Option B: no fast-mine bootstrap phase
         // DGW is NOT used for MatMul mining -- ASERT only. See pow.cpp.
         consensus.nDgwAsymmetricClampHeight = std::numeric_limits<int32_t>::max();
         consensus.nDgwEasingBoostHeight = std::numeric_limits<int32_t>::max();
         consensus.nDgwWindowAlignmentHeight = std::numeric_limits<int32_t>::max();
         consensus.nDgwSlewGuardHeight = std::numeric_limits<int32_t>::max();
         // ASERT activates at nFastMineHeight. This MUST equal nFastMineHeight.
-        consensus.nMatMulAsertHeight = 61'000;
+        consensus.nMatMulAsertHeight = 0; // genesis anchor, as mainnet
         consensus.nMatMulAsertHalfLife = 172'800; // QTC: 2 days at 600 s
-        consensus.nMatMulAsertBootstrapFactor = 180;
+        consensus.nMatMulAsertBootstrapFactor = 1; // inert with a genesis anchor
         // No retune or half-life upgrade needed — fresh chain starts with
         // the target 3,600s half-life directly.
         consensus.nMatMulAsertRetuneHeight = std::numeric_limits<int32_t>::max();
@@ -678,11 +687,16 @@ public:
         consensus.nMatMulAsertRetune2TargetDen = 1;
         consensus.nMatMulAsertHalfLifeUpgradeHeight = std::numeric_limits<int32_t>::max();
         consensus.nMatMulAsertHalfLifeUpgrade = 172'800;
-        // Hardened pre-hash epsilon (18 bits) active from ASERT activation.
-        consensus.nMatMulPreHashEpsilonBitsUpgradeHeight = 61'000;
+        // QTC Option B (D4): MTP drift bound and a5 timewarp reconciliation from genesis, as mainnet.
+        consensus.nMatMulMaxFutureMtpDriftHeight = 0;
+        consensus.nMatMulMaxFutureMtpDrift = 43'200; // tau / 4 at 600 s
+        consensus.nMatMulTimewarpReconcileHeight = 0;
+        // QTC Option B (D5): hardened 18-bit header gate from block 0, as mainnet.
+        consensus.nMatMulPreHashEpsilonBits = 18;
+        consensus.nMatMulPreHashEpsilonBitsUpgradeHeight = 0;
         consensus.nMatMulPreHashEpsilonBitsUpgrade = 18;
-        consensus.nMatMulNonceSeedHeight = 125'000;
-        consensus.nMatMulParentMtpSeedHeight = QTC_V03210_HARDENING_HEIGHT;
+        consensus.nMatMulNonceSeedHeight = 0; // QTC D8, as mainnet
+        consensus.nMatMulParentMtpSeedHeight = 0; // QTC D8, as mainnet
         consensus.nMaxBlockWeight = 24'000'000;
         consensus.nMaxBlockSerializedSize = 24'000'000;
         consensus.nMaxBlockSigOpsCost = 480'000;
@@ -745,13 +759,13 @@ public:
             1789063200,  // Sep 10, 2026 18:00:00 UTC — consensus fork v0.0.5 (REGENERATE AGAIN within hours of the real launch, security review H1)
             0,
             238,
-            0x20027525,
+            0x1e011da5,  // == compact(powLimit); launch floor candidate D
             1,
             consensus.nInitialSubsidy,
             static_cast<uint16_t>(consensus.nMatMulDimension),
             uint256{"00230371b05217711a10cf44983c2ffc3d82da06369fd0e640b6d20c033e38da"});
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb"});
+        assert(consensus.hashGenesisBlock == uint256{"6da52defc708089bc721409fccf224c549288b242cadc39243b6d12a37e7397c"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
         // AUDIT D1: validate the immutable MatMul-ASERT schedule at construction so
         // an invalid parameter set aborts node startup instead of failing closed
@@ -855,38 +869,38 @@ public:
         consensus.fEnforceP2MROnlyOutputs = true;
         consensus.nKAWPOWHeight = std::numeric_limits<int>::max();
         consensus.fMatMulPOW = true;
-        consensus.nMatMulDimension = 256;
-        consensus.nMatMulTranscriptBlockSize = 8;
-        consensus.nMatMulNoiseRank = 4;
-        consensus.nMatMulValidationWindow = 500;
-        consensus.nMatMulPhase2FailBanThreshold = std::numeric_limits<uint32_t>::max();
+        consensus.nMatMulDimension = 512;
+        consensus.nMatMulTranscriptBlockSize = 16;
+        consensus.nMatMulNoiseRank = 8;
+        consensus.nMatMulValidationWindow = 1000;
+        consensus.nMatMulPhase2FailBanThreshold = 1;
         consensus.fMatMulStrictPunishment = false;
         consensus.nMatMulSnapshotInterval = 10'000;
         consensus.nMatMulProofPruneDepth = 10'000;
         consensus.fMatMulFreivaldsEnabled = true;
         consensus.nMatMulFreivaldsRounds = 2;
-        consensus.fMatMulRequireProductPayload = true;
+        consensus.fMatMulRequireProductPayload = false; // as mainnet: payload is consensus-required from genesis via nMatMulProductDigestHeight = 0
         consensus.fMatMulRejectLegacyPayloadVectors = true; // QTC security review N-5
-        consensus.nMatMulFreivaldsBindingHeight = 61'000;
-        consensus.nMatMulProductDigestHeight = 61'000;
+        consensus.nMatMulFreivaldsBindingHeight = 0; // QTC D8, as mainnet
+        consensus.nMatMulProductDigestHeight = 0; // QTC D8, as mainnet
         consensus.nMaxReorgDepth = 12;
         consensus.nReorgProtectionStartHeight = 61'000;
         consensus.nEmptyBlockSubsidyPenaltyHeight = QTC_EMPTY_BLOCK_SUBSIDY_PENALTY_HEIGHT;
         consensus.nEmptyBlockSubsidyStrictPenaltyHeight = QTC_V03210_HARDENING_HEIGHT;
         consensus.nEmptyBlockSubsidyPenaltyEndHeight = QTC_V03211_HARDENING_HEIGHT;
         consensus.nPowTargetSpacingFastMs = 250;
-        consensus.nFastMineDifficultyScale = 4;
-        consensus.nPowTargetSpacingNormal = 90;
-        consensus.nFastMineHeight = 61'000;
+        consensus.nFastMineDifficultyScale = 6; // inert with nFastMineHeight = 0
+        consensus.nPowTargetSpacingNormal = 600; // as mainnet
+        consensus.nFastMineHeight = 0; // QTC Option B: no fast-mine bootstrap phase
         // DGW is NOT used for MatMul mining -- ASERT only. See pow.cpp.
         consensus.nDgwAsymmetricClampHeight = std::numeric_limits<int32_t>::max();
         consensus.nDgwEasingBoostHeight = std::numeric_limits<int32_t>::max();
         consensus.nDgwWindowAlignmentHeight = std::numeric_limits<int32_t>::max();
         consensus.nDgwSlewGuardHeight = std::numeric_limits<int32_t>::max();
         // ASERT activates at nFastMineHeight. This MUST equal nFastMineHeight.
-        consensus.nMatMulAsertHeight = 61'000;
-        consensus.nMatMulAsertHalfLife = 3'600;
-        consensus.nMatMulAsertBootstrapFactor = 180;
+        consensus.nMatMulAsertHeight = 0; // genesis anchor, as mainnet
+        consensus.nMatMulAsertHalfLife = 172'800; // as mainnet: 2 days at 600 s
+        consensus.nMatMulAsertBootstrapFactor = 1; // inert with a genesis anchor
         // No retune or half-life upgrade needed — fresh chain starts with
         // the target 3,600s half-life directly.
         consensus.nMatMulAsertRetuneHeight = std::numeric_limits<int32_t>::max();
@@ -895,12 +909,17 @@ public:
         consensus.nMatMulAsertRetune2TargetNum = 1;
         consensus.nMatMulAsertRetune2TargetDen = 1;
         consensus.nMatMulAsertHalfLifeUpgradeHeight = std::numeric_limits<int32_t>::max();
-        consensus.nMatMulAsertHalfLifeUpgrade = 3'600;
-        // Hardened pre-hash epsilon (18 bits) active from ASERT activation.
-        consensus.nMatMulPreHashEpsilonBitsUpgradeHeight = 61'000;
+        consensus.nMatMulAsertHalfLifeUpgrade = 172'800;
+        // QTC Option B (D4): MTP drift bound and a5 timewarp reconciliation from genesis, as mainnet.
+        consensus.nMatMulMaxFutureMtpDriftHeight = 0;
+        consensus.nMatMulMaxFutureMtpDrift = 43'200; // tau / 4 at 600 s
+        consensus.nMatMulTimewarpReconcileHeight = 0;
+        // QTC Option B (D5): hardened 18-bit header gate from block 0, as mainnet.
+        consensus.nMatMulPreHashEpsilonBits = 18;
+        consensus.nMatMulPreHashEpsilonBitsUpgradeHeight = 0;
         consensus.nMatMulPreHashEpsilonBitsUpgrade = 18;
-        consensus.nMatMulNonceSeedHeight = 125'000;
-        consensus.nMatMulParentMtpSeedHeight = QTC_V03210_HARDENING_HEIGHT;
+        consensus.nMatMulNonceSeedHeight = 0; // QTC D8, as mainnet
+        consensus.nMatMulParentMtpSeedHeight = 0; // QTC D8, as mainnet
         consensus.nMaxBlockWeight = 24'000'000;
         consensus.nMaxBlockSerializedSize = 24'000'000;
         consensus.nMaxBlockSigOpsCost = 480'000;
@@ -935,7 +954,11 @@ public:
         consensus.nRuleChangeActivationThreshold = 1512; // 75% for testchains
         consensus.nMinerConfirmationWindow = 2016; // nPowTargetTimespan / nPowTargetSpacing
         consensus.MinBIP9WarningHeight = 0;
-        consensus.powLimit = uint256{"027525460aa64c2f837b4a2339c0ebedfa43fe5c91d14e3bcd35a858793dd970"};
+        // QTC 2026-09-15 (QTC-LAUNCH-SAFETY.md S14): every MatMul / ASERT / drift /
+        // timewarp / pre-hash / payload field below mirrors CMainParams so the burn-in
+        // rehearses the launch consensus. powLimit is launch floor candidate D
+        // (0x011da5 * 2^216, compact 0x1e011da5); genesis nBits MUST equal compact(powLimit).
+        consensus.powLimit = uint256{"0000011da5000000000000000000000000000000000000000000000000000000"}; // compact 0x1e011da5, launch floor candidate D
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
@@ -961,13 +984,13 @@ public:
             1789063200,  // Sep 10, 2026 18:00:00 UTC — consensus fork v0.0.5 (REGENERATE AGAIN within hours of the real launch, security review H1)
             0,
             238,
-            0x20027525,
+            0x1e011da5,  // == compact(powLimit); launch floor candidate D
             1,
             consensus.nInitialSubsidy,
             static_cast<uint16_t>(consensus.nMatMulDimension),
             uint256{"00230371b05217711a10cf44983c2ffc3d82da06369fd0e640b6d20c033e38da"});
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb"});
+        assert(consensus.hashGenesisBlock == uint256{"6da52defc708089bc721409fccf224c549288b242cadc39243b6d12a37e7397c"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
         // AUDIT D1: validate the immutable MatMul-ASERT schedule at construction so
         // an invalid parameter set aborts node startup instead of failing closed

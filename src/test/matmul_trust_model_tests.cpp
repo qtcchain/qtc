@@ -53,8 +53,9 @@ BOOST_AUTO_TEST_CASE(trust_model_validation_window_default)
 
 BOOST_AUTO_TEST_CASE(trust_model_validation_window_testnet)
 {
+    // 2026-09-15: testnet mirrors mainnet's window so the burn-in rehearses launch.
     const auto params = TestnetParams();
-    BOOST_CHECK_EQUAL(params.nMatMulValidationWindow, 500U);
+    BOOST_CHECK_EQUAL(params.nMatMulValidationWindow, 1000U);
 }
 
 BOOST_AUTO_TEST_CASE(trust_model_validation_window_regtest)
@@ -274,40 +275,34 @@ BOOST_AUTO_TEST_CASE(validation_skip_mode)
     BOOST_CHECK(!ShouldRunMatMulPhase2ForHeight(1, 5000, params));
 }
 
-BOOST_AUTO_TEST_CASE(validation_phase2_softfail_testnet)
+// 2026-09-15 (QTC-LAUNCH-SAFETY.md S14): testnet's Phase-2 punishment mirrors
+// mainnet (ban threshold 1) so the burn-in rehearses launch peer policy. The
+// soft-fail (never-ban) profile these two cases used to pin is now regtest-only;
+// see validation_phase2_softfail_regtest below.
+BOOST_AUTO_TEST_CASE(validation_phase2_strict_testnet_matches_mainnet)
 {
     const auto params = TestnetParams();
-    BOOST_CHECK_EQUAL(EffectivePhase2BanThreshold(params), std::numeric_limits<uint32_t>::max());
+    const auto main_params = MainParams();
+    BOOST_CHECK_EQUAL(params.nMatMulPhase2FailBanThreshold, 1U);
+    BOOST_CHECK_EQUAL(EffectivePhase2BanThreshold(params), EffectivePhase2BanThreshold(main_params));
+    BOOST_CHECK_EQUAL(EffectivePhase2BanThreshold(params), 1U);
 
     MatMulPeerVerificationBudget budget;
-    const auto now = std::chrono::steady_clock::now();
-
-    auto action = RegisterMatMulPhase2Failure(budget, params, now);
-    BOOST_CHECK(action == MatMulPhase2Punishment::DISCONNECT);
-
-    action = RegisterMatMulPhase2Failure(budget, params, now + std::chrono::minutes{1});
-    BOOST_CHECK(action == MatMulPhase2Punishment::DISCOURAGE);
-
-    for (int i = 0; i < 8; ++i) {
-        action = RegisterMatMulPhase2Failure(
-            budget,
-            params,
-            now + std::chrono::minutes{2 + i});
-        BOOST_CHECK(action == MatMulPhase2Punishment::DISCOURAGE);
-    }
-    BOOST_CHECK_EQUAL(budget.phase2_failures, 10U);
+    const auto action = RegisterMatMulPhase2Failure(budget, params, std::chrono::steady_clock::now());
+    BOOST_CHECK(action == MatMulPhase2Punishment::BAN);
+    BOOST_CHECK_EQUAL(budget.phase2_failures, 1U);
 }
 
-BOOST_AUTO_TEST_CASE(validation_phase2_softfail_testnet_ignores_strict_flag)
+BOOST_AUTO_TEST_CASE(validation_phase2_strict_testnet_strict_flag_is_noop)
 {
     auto params = TestnetParams();
     params.fMatMulStrictPunishment = true;
 
-    BOOST_CHECK_EQUAL(EffectivePhase2BanThreshold(params), std::numeric_limits<uint32_t>::max());
+    BOOST_CHECK_EQUAL(EffectivePhase2BanThreshold(params), 1U);
 
     MatMulPeerVerificationBudget budget;
     const auto action = RegisterMatMulPhase2Failure(budget, params, std::chrono::steady_clock::now());
-    BOOST_CHECK(action == MatMulPhase2Punishment::DISCONNECT);
+    BOOST_CHECK(action == MatMulPhase2Punishment::BAN);
 }
 
 BOOST_AUTO_TEST_CASE(validation_phase2_softfail_regtest)

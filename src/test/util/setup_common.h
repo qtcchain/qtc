@@ -105,9 +105,12 @@ struct BasicTestingSetup {
 
 /** QTC: mainnet activates every QTC hardening at genesis (QTC-LAUNCH-SAFETY.md §9),
  *  so the pre-activation state that the flag-day transition tests exercise no
- *  longer exists on MAIN. Testnet still carries QTC's schedule (61k / 88k / 125k
- *  / 128k / 130k-135k), so those suites select it. If testnet is later aligned
- *  with mainnet, point this at REGTEST with the -regtest*height overrides.
+ *  longer exists on MAIN. Testnet still carries QTC's *shielded* schedule (61k /
+ *  88k / 125k / 128k / 130k-135k), so those suites select it. Since 2026-09-15
+ *  (§14) testnet's MatMul / PoW / difficulty fields mirror mainnet, so nothing
+ *  here may rely on a testnet-specific MatMul flag day. If the shielded schedule
+ *  is later aligned as well, point this at REGTEST with the -regtest*height
+ *  overrides.
  */
 struct LegacyScheduleTestingSetup : public BasicTestingSetup {
     explicit LegacyScheduleTestingSetup(TestOpts opts = {})

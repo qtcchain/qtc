@@ -562,6 +562,10 @@ BOOST_AUTO_TEST_CASE(freivalds_binding_accepts_valid_transcript_digest_once_acti
 {
     auto consensus = Params().GetConsensus();
     consensus.fMatMulFreivaldsEnabled = true;
+    // These cases exercise the legacy transcript digest path explicitly; the test chains now use the
+    // product digest from genesis like mainnet, so pin the transcript schedule locally.
+    consensus.nMatMulProductDigestHeight = std::numeric_limits<int32_t>::max();
+    consensus.fMatMulRejectLegacyPayloadVectors = false;
     consensus.nMatMulTranscriptBlockSize = 4;
     consensus.nMatMulNoiseRank = 2;
     consensus.nMatMulDimension = 8;
@@ -642,6 +646,10 @@ BOOST_AUTO_TEST_CASE(freivalds_payload_accepts_valid_transcript_digest_before_bi
 {
     auto consensus = Params().GetConsensus();
     consensus.fMatMulFreivaldsEnabled = true;
+    // These cases exercise the legacy transcript digest path explicitly; the test chains now use the
+    // product digest from genesis like mainnet, so pin the transcript schedule locally.
+    consensus.nMatMulProductDigestHeight = std::numeric_limits<int32_t>::max();
+    consensus.fMatMulRejectLegacyPayloadVectors = false;
     consensus.nMatMulTranscriptBlockSize = 4;
     consensus.nMatMulNoiseRank = 2;
     consensus.nMatMulDimension = 8;
@@ -681,6 +689,10 @@ BOOST_AUTO_TEST_CASE(freivalds_uses_height_aware_prehash_epsilon_bits)
 {
     auto consensus = Params().GetConsensus();
     consensus.fMatMulFreivaldsEnabled = true;
+    // These cases exercise the legacy transcript digest path explicitly; the test chains now use the
+    // product digest from genesis like mainnet, so pin the transcript schedule locally.
+    consensus.nMatMulProductDigestHeight = std::numeric_limits<int32_t>::max();
+    consensus.fMatMulRejectLegacyPayloadVectors = false;
     consensus.fMatMulRequireProductPayload = false;
     consensus.nMatMulFreivaldsBindingHeight = std::numeric_limits<int32_t>::max();
     consensus.nMatMulTranscriptBlockSize = 4;

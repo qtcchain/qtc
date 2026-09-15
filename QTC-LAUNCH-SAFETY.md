@@ -386,7 +386,7 @@ Halving table (block, year, coins/block): 0 → 50; 210,000 → 25 (y4); 420,000
 
 **Genesis regenerated** (the coinbase value is the subsidy, nBits = compact(powLimit)):
 - main    `9ba00506445039aa7315dc1ce61eded19ec75d31edbfed3643cb1e4f3c3db8e2` (bits `1e033333`)
-- test/testnet4/signet `2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb`
+- test/testnet4/signet `6da52defc708089bc721409fccf224c549288b242cadc39243b6d12a37e7397c`
 - regtest `25d0b1c272072b56bb0e79aea8566b16378648775e7a517d9d022720f6a1fca6`
 - shieldedv2dev `309ae3de50712d4520cec19066979473a70de4a4b73d89b3327a07c845336e1f`
 - merkle `68668615…` (shared coinbase)
@@ -476,3 +476,48 @@ Applied: mainnet `powLimit = 0x033333·2^216`, genesis `nBits 0x1e033333`, mainn
 with an easy floor by design; the mainnet value itself (5.2 M digests per block) cannot be run on a CPU regtest.
 Re-run the model if the RTX 4000 Ada measurement or a fleet change moves R materially; genesis is regenerated again at
 launch (H1) and the floor carries over.
+
+## 14. Test chains aligned to mainnet consensus (2026-09-15)
+
+**Why.** The testnet burn-in exists to rehearse mainnet, but `test`, `testnet4` and `signet` still carried the
+upstream project's *test* configuration for the MatMul proof-of-work and difficulty: n = 256, transcript block 8,
+noise rank 4, fast-mine bootstrap to 61,000 with ASERT anchored there (bootstrap factor 180), and the Freivalds
+product digest / binding only from 61,000. Below 61,000 that is the CPU-only *transcript-digest* scheme, so on the
+first burn-in attempt the GPU miner had nothing to accelerate and fell back to CPU — the burn-in was not exercising
+the launch consensus at all. The drift bound, a5 timewarp reconciliation and the hardened 18-bit pre-hash gate were
+also unset or scheduled at 61,000 / 125,000 / 130,500 instead of genesis.
+
+**Applied** (all three test chains, field for field with `CMainParams`; mainnet untouched):
+
+| Field | was (test/testnet4/signet) | now |
+|---|---|---|
+| `powLimit` | `0x027525…` (compact `0x20027525`) | `0x011da5·2^216`, compact **`0x1e011da5`** — launch floor candidate D, so the burn-in exercises the mainnet floor decision; mainnet stays `0x1e033333` until launch day |
+| genesis `nBits` | `0x20027525` | `0x1e011da5` (== `compact(powLimit)`, §7 requirement); `nTime` unchanged |
+| `fPowAllowMinDifficultyBlocks` | true (test, testnet4) | false |
+| `nMatMulDimension` / `nMatMulTranscriptBlockSize` / `nMatMulNoiseRank` | 256 / 8 / 4 | 512 / 16 / 8 |
+| `nMatMulValidationWindow` | 500 | 1,000 |
+| `nMatMulPhase2FailBanThreshold` | never-ban | 1 |
+| `fMatMulRequireProductPayload` | true | false (payload consensus-required from 0 via `nMatMulProductDigestHeight`) |
+| `nMatMulFreivaldsBindingHeight`, `nMatMulProductDigestHeight` | 61,000 | 0 |
+| `nFastMineHeight`, `nMatMulAsertHeight` | 61,000 | 0 (`nFastMineDifficultyScale` 4 → 6, inert) |
+| `nMatMulAsertBootstrapFactor` | 180 | 1 |
+| `nMatMulAsertHalfLife`, `…HalfLifeUpgrade` (signet only) | 3,600 | 172,800 |
+| `nPowTargetSpacingNormal` (signet only) | 90 | 600 |
+| `nMatMulMaxFutureMtpDriftHeight` / `nMatMulMaxFutureMtpDrift` | unset (never / 3,600) | 0 / 43,200 |
+| `nMatMulTimewarpReconcileHeight` | unset (never) | 0 |
+| `nMatMulPreHashEpsilonBits` / `…UpgradeHeight` / `…Upgrade` | 10 (default) / 61,000 / 18 | 18 / 0 / 18 |
+| `nMatMulNonceSeedHeight`, `nMatMulParentMtpSeedHeight` | 125,000, 130,500 | 0, 0 |
+
+Per-chain identity (magic, ports, bech32, seeds, signet challenge, checkpoints, assumed sizes, `nMinimumChainWork`,
+`defaultAssumeValid`, BIP9 threshold) is unchanged. **Deliberately not aligned:** the shielded schedule
+(`nShielded*`, `fShieldedPoolDisabled`), `nReorgProtectionStartHeight` and the empty-block subsidy penalty heights —
+17 unit-test suites select testnet through `LegacyScheduleTestingSetup` precisely to exercise those flag days, and
+none of them is on the GPU/consensus path the burn-in must rehearse. Aligning them is a separate change (point the
+fixture at regtest with `-regtest*height` overrides first).
+
+Genesis: because `nBits` changed, the three genesis hashes change. The `assert(hashGenesisBlock == …)` lines are
+temporarily replaced by `[QTC-REGEN] netN genesis … merkle …` stderr hooks (`QTC-REGEN-G-TEMP net2/net3/net4`);
+`genesis_bake4.py` restores the asserts and the `ChainParams_TESTNET*_genesis_hashes_frozen` pins from the printed
+hashes. Merkle roots are unchanged. Unit tests updated: `pow_tests` (TESTNET activation pins, `"1e011da5"`),
+`matmul_dgw_tests` (`0x1e011da5U`), `matmul_trust_model_tests` (window 1,000; Phase-2 ban-threshold 1 replaces the
+soft-fail cases), `qtc_launch_readiness_tests` LR-14 (no fast phase on any chain).

@@ -842,12 +842,35 @@ BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_matmul_activation)
     BOOST_CHECK_EQUAL(consensus.nMaxTxoutScriptPubKeyBytes, 34U);
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacing, 600);
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacingFastMs, 250);
-    BOOST_CHECK_EQUAL(consensus.nFastMineDifficultyScale, 4U);
+    // 2026-09-15 (QTC-LAUNCH-SAFETY.md S14): testnet's MatMul / ASERT / drift /
+    // timewarp / pre-hash / payload fields mirror mainnet so the burn-in rehearses
+    // the launch consensus.
+    BOOST_CHECK_EQUAL(consensus.nFastMineDifficultyScale, 6U);
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacingNormal, 600);
-    BOOST_CHECK_EQUAL(consensus.nFastMineHeight, 61'000);
-    BOOST_CHECK_EQUAL(consensus.nMatMulDimension, 256U);
-    BOOST_CHECK_EQUAL(consensus.nMatMulTranscriptBlockSize, 8U);
-    BOOST_CHECK_EQUAL(consensus.nMatMulNoiseRank, 4U);
+    BOOST_CHECK_EQUAL(consensus.nFastMineHeight, 0); // Option B: no fast phase
+    BOOST_CHECK_EQUAL(consensus.nMatMulAsertHeight, 0);
+    BOOST_CHECK_EQUAL(consensus.nMatMulAsertHalfLife, 172'800);
+    BOOST_CHECK_EQUAL(consensus.nMatMulAsertBootstrapFactor, 1U);
+    BOOST_CHECK_EQUAL(consensus.nMatMulDimension, 512U);
+    BOOST_CHECK_EQUAL(consensus.nMatMulTranscriptBlockSize, 16U);
+    BOOST_CHECK_EQUAL(consensus.nMatMulNoiseRank, 8U);
+    BOOST_CHECK_EQUAL(consensus.nMatMulValidationWindow, 1000U);
+    BOOST_CHECK_EQUAL(consensus.nMatMulPhase2FailBanThreshold, 1U);
+    BOOST_CHECK(!consensus.fMatMulRequireProductPayload);
+    BOOST_CHECK(consensus.IsMatMulProductPayloadRequired(0));
+    BOOST_CHECK_EQUAL(consensus.nMatMulFreivaldsBindingHeight, 0);
+    BOOST_CHECK_EQUAL(consensus.nMatMulProductDigestHeight, 0);
+    BOOST_CHECK_EQUAL(consensus.nMatMulMaxFutureMtpDriftHeight, 0);
+    BOOST_CHECK_EQUAL(consensus.nMatMulMaxFutureMtpDrift, 43'200);
+    BOOST_CHECK_EQUAL(consensus.nMatMulTimewarpReconcileHeight, 0);
+    BOOST_CHECK_EQUAL(consensus.nMatMulPreHashEpsilonBits, 18U);
+    BOOST_CHECK_EQUAL(consensus.nMatMulPreHashEpsilonBitsUpgradeHeight, 0);
+    BOOST_CHECK_EQUAL(consensus.nMatMulPreHashEpsilonBitsUpgrade, 18U);
+    BOOST_CHECK_EQUAL(consensus.nMatMulNonceSeedHeight, 0);
+    BOOST_CHECK_EQUAL(consensus.nMatMulParentMtpSeedHeight, 0);
+    BOOST_CHECK(!consensus.fPowAllowMinDifficultyBlocks);
+    BOOST_CHECK_EQUAL(UintToArith256(consensus.powLimit).GetCompact(), 0x1e011da5U); // launch floor candidate D
+    BOOST_CHECK_EQUAL(CreateChainParams(*m_node.args, ChainType::TESTNET)->GenesisBlock().nBits, 0x1e011da5U); // == compact(powLimit)
     BOOST_CHECK_EQUAL(consensus.BIP34Height, 0);
     BOOST_CHECK_EQUAL(consensus.BIP65Height, 0);
     BOOST_CHECK_EQUAL(consensus.BIP66Height, 0);
@@ -1171,7 +1194,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_REGTEST_genesis_reduced_data_compliant)
 BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_genesis_header_fields_frozen)
 {
     const auto params = CreateChainParams(*m_node.args, ChainType::TESTNET);
-    assert_qtc_genesis_header_fields(*params, 1789063200U, 0U, "20027525", 238U);
+    assert_qtc_genesis_header_fields(*params, 1789063200U, 0U, "1e011da5", 238U); // nBits == compact(powLimit), launch floor candidate D
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_genesis_hashes_frozen)
@@ -1179,7 +1202,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_genesis_hashes_frozen)
     const auto params = CreateChainParams(*m_node.args, ChainType::TESTNET);
     assert_qtc_genesis_hashes(
         *params,
-        "2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb",
+        "6da52defc708089bc721409fccf224c549288b242cadc39243b6d12a37e7397c",
         "68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23");
 }
 
@@ -1188,7 +1211,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_TESTNET4_genesis_hashes_frozen)
     const auto params = CreateChainParams(*m_node.args, ChainType::TESTNET4);
     assert_qtc_genesis_hashes(
         *params,
-        "2532b4988c5ac1fed137503686a9d77c3d80f601d4a703bccfd6874d327870cb",
+        "6da52defc708089bc721409fccf224c549288b242cadc39243b6d12a37e7397c",
         "68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23");
 }
 
