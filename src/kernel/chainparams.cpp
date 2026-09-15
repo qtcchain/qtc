@@ -561,7 +561,7 @@ public:
         m_assumed_chain_state_size = 0;
 
         genesis = CreateQTCGenesisBlock(
-            1789063200,  // Sep 10, 2026 18:00:00 UTC — consensus fork v0.0.5 (REGENERATE AGAIN within hours of the real launch, security review H1)
+            1789462800,  // Sep 15, 2026 09:00:00 UTC — v0.1.0-rc3 burn-in genesis (test chains regenerate per burn-in; keep within the 12 h drift window of the first block)
             0,
             238,
             0x1e011da5,  // == compact(powLimit); launch floor candidate D
@@ -570,7 +570,7 @@ public:
             static_cast<uint16_t>(consensus.nMatMulDimension),
             uint256{"00230371b05217711a10cf44983c2ffc3d82da06369fd0e640b6d20c033e38da"});
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"6da52defc708089bc721409fccf224c549288b242cadc39243b6d12a37e7397c"});
+        assert(consensus.hashGenesisBlock == uint256{"efcba50d2de7cb16fd92423df899eba29e750b2271ef0ea64efe8cfeb4382ddf"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
         // AUDIT D1: validate the immutable MatMul-ASERT schedule at construction so
         // an invalid parameter set aborts node startup instead of failing closed
@@ -756,7 +756,7 @@ public:
         m_assumed_chain_state_size = 0;
 
         genesis = CreateQTCGenesisBlock(
-            1789063200,  // Sep 10, 2026 18:00:00 UTC — consensus fork v0.0.5 (REGENERATE AGAIN within hours of the real launch, security review H1)
+            1789462800,  // Sep 15, 2026 09:00:00 UTC — v0.1.0-rc3 burn-in genesis (test chains regenerate per burn-in; keep within the 12 h drift window of the first block)
             0,
             238,
             0x1e011da5,  // == compact(powLimit); launch floor candidate D
@@ -765,7 +765,7 @@ public:
             static_cast<uint16_t>(consensus.nMatMulDimension),
             uint256{"00230371b05217711a10cf44983c2ffc3d82da06369fd0e640b6d20c033e38da"});
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"6da52defc708089bc721409fccf224c549288b242cadc39243b6d12a37e7397c"});
+        assert(consensus.hashGenesisBlock == uint256{"efcba50d2de7cb16fd92423df899eba29e750b2271ef0ea64efe8cfeb4382ddf"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
         // AUDIT D1: validate the immutable MatMul-ASERT schedule at construction so
         // an invalid parameter set aborts node startup instead of failing closed
@@ -981,7 +981,7 @@ public:
 
         // Reuse the testnet genesis block for signet.
         genesis = CreateQTCGenesisBlock(
-            1789063200,  // Sep 10, 2026 18:00:00 UTC — consensus fork v0.0.5 (REGENERATE AGAIN within hours of the real launch, security review H1)
+            1789462800,  // Sep 15, 2026 09:00:00 UTC — v0.1.0-rc3 burn-in genesis (test chains regenerate per burn-in; keep within the 12 h drift window of the first block)
             0,
             238,
             0x1e011da5,  // == compact(powLimit); launch floor candidate D
@@ -990,7 +990,7 @@ public:
             static_cast<uint16_t>(consensus.nMatMulDimension),
             uint256{"00230371b05217711a10cf44983c2ffc3d82da06369fd0e640b6d20c033e38da"});
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"6da52defc708089bc721409fccf224c549288b242cadc39243b6d12a37e7397c"});
+        assert(consensus.hashGenesisBlock == uint256{"efcba50d2de7cb16fd92423df899eba29e750b2271ef0ea64efe8cfeb4382ddf"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
         // AUDIT D1: validate the immutable MatMul-ASERT schedule at construction so
         // an invalid parameter set aborts node startup instead of failing closed

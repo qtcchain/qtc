@@ -1194,7 +1194,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_REGTEST_genesis_reduced_data_compliant)
 BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_genesis_header_fields_frozen)
 {
     const auto params = CreateChainParams(*m_node.args, ChainType::TESTNET);
-    assert_qtc_genesis_header_fields(*params, 1789063200U, 0U, "1e011da5", 238U); // nBits == compact(powLimit), launch floor candidate D
+    assert_qtc_genesis_header_fields(*params, 1789462800U, 0U, "1e011da5", 238U); // nBits == compact(powLimit), launch floor candidate D
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_genesis_hashes_frozen)
@@ -1202,7 +1202,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_genesis_hashes_frozen)
     const auto params = CreateChainParams(*m_node.args, ChainType::TESTNET);
     assert_qtc_genesis_hashes(
         *params,
-        "6da52defc708089bc721409fccf224c549288b242cadc39243b6d12a37e7397c",
+        "efcba50d2de7cb16fd92423df899eba29e750b2271ef0ea64efe8cfeb4382ddf",
         "68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23");
 }
 
@@ -1211,7 +1211,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_TESTNET4_genesis_hashes_frozen)
     const auto params = CreateChainParams(*m_node.args, ChainType::TESTNET4);
     assert_qtc_genesis_hashes(
         *params,
-        "6da52defc708089bc721409fccf224c549288b242cadc39243b6d12a37e7397c",
+        "efcba50d2de7cb16fd92423df899eba29e750b2271ef0ea64efe8cfeb4382ddf",
         "68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23");
 }
 

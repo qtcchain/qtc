@@ -386,7 +386,7 @@ Halving table (block, year, coins/block): 0 → 50; 210,000 → 25 (y4); 420,000
 
 **Genesis regenerated** (the coinbase value is the subsidy, nBits = compact(powLimit)):
 - main    `9ba00506445039aa7315dc1ce61eded19ec75d31edbfed3643cb1e4f3c3db8e2` (bits `1e033333`)
-- test/testnet4/signet `6da52defc708089bc721409fccf224c549288b242cadc39243b6d12a37e7397c`
+- test/testnet4/signet `efcba50d2de7cb16fd92423df899eba29e750b2271ef0ea64efe8cfeb4382ddf` (nTime 1789462800, 2026-09-15 09:00 UTC, regenerated for the v0.1.0-rc3 burn-in: a test-chain genesis must lie within the 12 h future-MTP drift window of its first block, and miners now clamp their periodic header-time refresh to that bound)
 - regtest `25d0b1c272072b56bb0e79aea8566b16378648775e7a517d9d022720f6a1fca6`
 - shieldedv2dev `309ae3de50712d4520cec19066979473a70de4a4b73d89b3327a07c845336e1f`
 - merkle `68668615…` (shared coinbase)
