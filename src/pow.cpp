@@ -1420,14 +1420,25 @@ void MaybeRefreshMinerHeaderTime(
     CBlockHeader& block,
     uint32_t& attempts_since_refresh,
     uint32_t refresh_attempt_interval,
-    bool allow_min_difficulty)
+    bool allow_min_difficulty,
+    const Consensus::Params& params,
+    std::optional<int64_t> parent_median_time_past)
 {
     if (allow_min_difficulty || refresh_attempt_interval == 0 || attempts_since_refresh < refresh_attempt_interval) {
         return;
     }
 
     attempts_since_refresh = 0;
-    const int64_t now_seconds{GetTime()};
+    int64_t now_seconds{GetTime()};
+    // The template's timestamp was clamped to the future-MTP drift bound (UpdateTime); a refresh
+    // during a long solve must honour the same bound, otherwise every block solved more than
+    // nMatMulMaxFutureMtpDrift after the parent's median time (a genesis older than the bound, or
+    // any stall longer than it) is rejected by the miner's own node with time-mtp-too-new.
+    if (parent_median_time_past.has_value()) {
+        if (const auto limit{params.MatMulFutureBlockTimeLimit(*parent_median_time_past)}; limit.has_value()) {
+            now_seconds = std::min<int64_t>(now_seconds, *limit);
+        }
+    }
     if (now_seconds <= static_cast<int64_t>(block.nTime)) {
         return;
     }
@@ -3403,7 +3414,9 @@ bool SolveMatMulNonceSeeded(CBlockHeader& block,
                 block,
                 attempts_since_time_refresh,
                 header_time_refresh_interval,
-                params.fPowAllowMinDifficultyBlocks);
+                params.fPowAllowMinDifficultyBlocks,
+                params,
+                parent_median_time_past);
             return true;
         };
 
@@ -3430,7 +3443,9 @@ bool SolveMatMulNonceSeeded(CBlockHeader& block,
                 block,
                 attempts_since_time_refresh,
                 header_time_refresh_interval,
-                params.fPowAllowMinDifficultyBlocks);
+                params.fPowAllowMinDifficultyBlocks,
+                params,
+                parent_median_time_past);
             return true;
         };
 
@@ -4309,7 +4324,9 @@ bool SolveMatMul(CBlockHeader& block, const Consensus::Params& params, uint64_t&
                 block,
                 attempts_since_time_refresh,
                 header_time_refresh_interval,
-                params.fPowAllowMinDifficultyBlocks);
+                params.fPowAllowMinDifficultyBlocks,
+                params,
+                parent_median_time_past);
             continue;
         }
 
@@ -4495,7 +4512,9 @@ bool SolveMatMul(CBlockHeader& block, const Consensus::Params& params, uint64_t&
             block,
             attempts_since_time_refresh,
             header_time_refresh_interval,
-            params.fPowAllowMinDifficultyBlocks);
+            params.fPowAllowMinDifficultyBlocks,
+            params,
+            parent_median_time_past);
     }
 
     return false;
@@ -4570,7 +4589,9 @@ bool SolveKAWPOW(CBlockHeader& block, uint32_t block_height, const Consensus::Pa
             block,
             attempts_since_time_refresh,
             header_time_refresh_interval,
-            params.fPowAllowMinDifficultyBlocks);
+            params.fPowAllowMinDifficultyBlocks,
+            params,
+            /*parent_median_time_past=*/std::nullopt); // KAWPOW path: no MatMul drift bound
     }
 
     return false;

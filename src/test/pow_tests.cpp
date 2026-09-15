@@ -3197,6 +3197,57 @@ BOOST_AUTO_TEST_CASE(matmul_solve_refreshes_header_time_when_configured_interval
     BOOST_CHECK_EQUAL(candidate.nTime, refreshed_time);
 }
 
+BOOST_AUTO_TEST_CASE(matmul_solve_header_time_refresh_respects_future_mtp_drift)
+{
+    // Regression: the periodic header-time refresh during a long solve rewrote nTime to the wall
+    // clock. Once the parent's median time plus the drift bound lies in the past (a genesis older
+    // than the bound, or any stall longer than it), every solved block was rejected by the miner's
+    // own node with time-mtp-too-new. The refresh must clamp like UpdateTime does.
+    ScopedBatchSizeEnv batch_size_env("1");
+    ScopedHeaderTimeRefreshEnv header_refresh_env("1");
+
+    auto consensus = CreateChainParams(*m_node.args, ChainType::REGTEST)->GetConsensus();
+    consensus.fMatMulPOW = true;
+    consensus.fPowAllowMinDifficultyBlocks = false;
+    consensus.nMatMulDimension = 16;
+    consensus.nMatMulTranscriptBlockSize = 8;
+    consensus.nMatMulNoiseRank = 4;
+    consensus.nMatMulMaxFutureMtpDriftHeight = 0;
+    consensus.nMatMulMaxFutureMtpDrift = 43'200;
+    consensus.powLimit = uint256{"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+
+    const int64_t parent_mtp{1'700'000'000};
+    const int64_t drift_limit{parent_mtp + consensus.nMatMulMaxFutureMtpDrift};
+
+    CBlockHeader candidate{};
+    candidate.nVersion = 4;
+    candidate.hashPrevBlock = uint256{"000000000000000000000000000000000000000000000000000000000000000d"};
+    candidate.hashMerkleRoot = uint256{"000000000000000000000000000000000000000000000000000000000000000e"};
+    candidate.nTime = static_cast<uint32_t>(drift_limit); // what UpdateTime hands the miner
+    candidate.nBits = arith_uint256{1}.GetCompact();
+    candidate.nNonce64 = 0;
+    candidate.nNonce = 0;
+    candidate.matmul_dim = static_cast<uint16_t>(consensus.nMatMulDimension);
+    candidate.seed_a = DeterministicMatMulSeed(candidate.hashPrevBlock, /*height=*/0, /*which=*/0);
+    candidate.seed_b = DeterministicMatMulSeed(candidate.hashPrevBlock, /*height=*/0, /*which=*/1);
+    candidate.matmul_digest.SetNull();
+
+    // Wall clock 110 hours past the bound, as on the first testnet burn-in attempt.
+    ScopedNodeMockTime mock_time{static_cast<uint32_t>(drift_limit + 110 * 3600)};
+
+    uint64_t max_tries{1};
+    const bool solved = SolveMatMul(candidate, consensus, max_tries, /*block_height=*/1, nullptr, nullptr, nullptr, parent_mtp);
+    BOOST_CHECK(!solved);
+    BOOST_CHECK_EQUAL(max_tries, 0U);
+    BOOST_CHECK_EQUAL(candidate.nTime, static_cast<uint32_t>(drift_limit));
+
+    // Without a parent median time (pool/share paths) the refresh keeps its previous behaviour.
+    candidate.nTime = static_cast<uint32_t>(drift_limit);
+    max_tries = 1;
+    (void)SolveMatMul(candidate, consensus, max_tries, /*block_height=*/1);
+    BOOST_CHECK_EQUAL(candidate.nTime, static_cast<uint32_t>(drift_limit + 110 * 3600));
+}
+
 BOOST_AUTO_TEST_CASE(matmul_solve_skips_header_time_refresh_on_min_difficulty_networks)
 {
     ScopedBatchSizeEnv batch_size_env("1");
