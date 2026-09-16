@@ -34,7 +34,7 @@ std::vector<std::string> DecodeFixedSeeds(const std::vector<uint8_t>& blob)
     return out;
 }
 
-const std::vector<std::string> kLaunchHosts{"157.230.194.146", "167.99.181.131"};
+const std::vector<std::string> kLaunchHosts{"157.230.194.146", "167.99.181.131", "209.38.113.122"};
 
 } // namespace
 
@@ -59,7 +59,7 @@ BOOST_AUTO_TEST_CASE(testnet_dns_seeds)
 BOOST_AUTO_TEST_CASE(mainnet_fixed_seeds_decode_to_launch_nodes)
 {
     const auto params = CreateChainParams(*m_node.args, ChainType::MAIN);
-    const std::vector<std::string> expected{"157.230.194.146:19755", "167.99.181.131:19755"};
+    const std::vector<std::string> expected{"157.230.194.146:19755", "167.99.181.131:19755", "209.38.113.122:19755"};
     const auto decoded = DecodeFixedSeeds(params->FixedSeeds());
     BOOST_CHECK_EQUAL_COLLECTIONS(decoded.begin(), decoded.end(), expected.begin(), expected.end());
 }
@@ -67,7 +67,7 @@ BOOST_AUTO_TEST_CASE(mainnet_fixed_seeds_decode_to_launch_nodes)
 BOOST_AUTO_TEST_CASE(testnet_fixed_seeds_decode_to_launch_nodes)
 {
     const auto params = CreateChainParams(*m_node.args, ChainType::TESTNET);
-    const std::vector<std::string> expected{"157.230.194.146:29755", "167.99.181.131:29755"};
+    const std::vector<std::string> expected{"157.230.194.146:29755", "167.99.181.131:29755", "209.38.113.122:29755"};
     const auto decoded = DecodeFixedSeeds(params->FixedSeeds());
     BOOST_CHECK_EQUAL_COLLECTIONS(decoded.begin(), decoded.end(), expected.begin(), expected.end());
 }

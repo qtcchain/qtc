@@ -27,8 +27,8 @@ QTC bootstraps through two independent layers, both compiled into the binary
 
    | Network | File             | Entries                                            |
    |---------|------------------|----------------------------------------------------|
-   | mainnet | `nodes_main.txt` | `157.230.194.146:19755`, `167.99.181.131:19755`     |
-   | testnet | `nodes_test.txt` | `157.230.194.146:29755`, `167.99.181.131:29755`     |
+   | mainnet | `nodes_main.txt` | `157.230.194.146:19755`, `167.99.181.131:19755`, `209.38.113.122:19755`     |
+   | testnet | `nodes_test.txt` | `157.230.194.146:29755`, `167.99.181.131:29755`, `209.38.113.122:29755`     |
 
    Only nodes that accept inbound connections belong in these lists; an
    outbound-only node must never be added. testnet4 and signet have no public

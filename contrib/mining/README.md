@@ -67,7 +67,7 @@ Best practices:
 - Daemon-only mining nodes also get peer recovery now. When
   `getblocktemplate`, MatMul challenge, or the background mining watcher sees
   an unhealthy chain guard, `qtcd` periodically enrolls
-  the built-in launch mesh (`157.230.194.146`, `167.99.181.131` — the two inbound launch nodes; DNS seeds `seed.qtc.gold` and `seed.qtc.exchange` bootstrap peer discovery) in the runtime addnode set in addition to requesting extra
+  the built-in launch mesh (`157.230.194.146`, `167.99.181.131`, `209.38.113.122` — the three inbound launch nodes; DNS seeds `seed.qtc.gold` and `seed.qtc.exchange` bootstrap peer discovery) in the runtime addnode set in addition to requesting extra
   automatic outbound and block-relay peers. Use
   `-miningchainguarddefaultmesh=0` only for controlled deployments with an
   explicit peer policy, or adjust
@@ -139,7 +139,7 @@ receives only the JSON summary. The summary also includes
 The supervisor actively re-seeds peer discovery when
 `getmininginfo.chain_guard.reason=insufficient_peer_consensus` or the healthy
 peer mix drops too low. By default it uses the public QTC bootstrap mesh
-`157.230.194.146:19755,167.99.181.131:19755`. Override that
+`157.230.194.146:19755,167.99.181.131:19755,209.38.113.122:19755`. Override that
 with `QTC_MINING_BOOTSTRAP_PEERS` (or the legacy
 `QTC_MINING_BOOTSTRAP_ADDNODES`) or the `--bootstrap-peers=` option. Set
 `QTC_MINING_USE_DEFAULT_BOOTSTRAP_PEERS=0` or pass

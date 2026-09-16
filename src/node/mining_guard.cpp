@@ -49,6 +49,7 @@ const std::vector<std::string>& DefaultMiningPeerMesh()
     static const std::vector<std::string> default_mesh{
         "157.230.194.146", // relay node, Singapore
         "167.99.181.131",  // mining node, Toronto
+        "209.38.113.122",  // relay and seed, Frankfurt
     };
     return default_mesh;
 }

@@ -714,6 +714,7 @@ dnsseed=1
 fixedseeds=1
 addnode=157.230.194.146:19755
 addnode=167.99.181.131:19755
+addnode=209.38.113.122:19755
 ```
 
 Or generate a profile automatically:
@@ -1134,6 +1135,7 @@ Current fixed public fallback peers compiled into `chainparamsseeds.h` (the two 
 ```
 157.230.194.146:19755
 167.99.181.131:19755
+209.38.113.122:19755
 ```
 
 ### Custom Regtest / Devnet Identity

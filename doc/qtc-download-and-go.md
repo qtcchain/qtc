@@ -90,6 +90,7 @@ dnsseed=1
 fixedseeds=1
 addnode=157.230.194.146:19755
 addnode=167.99.181.131:19755
+addnode=209.38.113.122:19755
 
 # Miner fast-start posture.
 prune=4096

@@ -66,6 +66,7 @@ dnsseed=1
 fixedseeds=1
 addnode=157.230.194.146:19755
 addnode=167.99.181.131:19755
+addnode=209.38.113.122:19755
 prune=4096
 blockfilterindex=1
 coinstatsindex=1
