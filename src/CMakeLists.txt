@@ -536,8 +536,18 @@ function(add_legacy_target_alias alias_name target_name)
   endif()
 endfunction()
 
+# GNU ld resolves symbols from static archives in command-line order, and our archives depend on each
+# other in a cycle (bitcoin_common's shielded bundle code needs bitcoin_shielded and vice versa), so every
+# GNU-ld host (Linux and MinGW-w64) links them inside --start-group/--end-group. Apple's ld64 rescans
+# archives on its own and does not accept --start-group.
+if((UNIX AND NOT APPLE) OR MINGW)
+  set(QTC_LINK_ARCHIVE_GROUP TRUE)
+else()
+  set(QTC_LINK_ARCHIVE_GROUP FALSE)
+endif()
+
 function(target_link_qtc_linux_archive_group target)
-  if(UNIX AND NOT APPLE)
+  if(QTC_LINK_ARCHIVE_GROUP)
     target_link_libraries(${target}
       -Wl,--start-group
       ${ARGN}
@@ -594,7 +604,7 @@ if(ENABLE_WALLET)
       core_interface
       Boost::headers
     )
-    if(UNIX AND NOT APPLE)
+    if(QTC_LINK_ARCHIVE_GROUP)
       target_link_qtc_linux_archive_group(qtc-wallet ${QTC_NODE_WALLET_ARCHIVES})
     else()
       target_link_libraries(qtc-wallet bitcoin_wallet)
@@ -735,7 +745,7 @@ if(BUILD_DAEMON)
   target_link_libraries(qtcd
     core_interface
   )
-  if(UNIX AND NOT APPLE)
+  if(QTC_LINK_ARCHIVE_GROUP)
     if(TARGET bitcoin_wallet)
       target_link_qtc_linux_archive_group(qtcd ${QTC_NODE_WALLET_ARCHIVES})
     else()
@@ -761,7 +771,7 @@ if(WITH_MULTIPROCESS AND BUILD_DAEMON)
     core_interface
     bitcoin_ipc
   )
-  if(UNIX AND NOT APPLE)
+  if(QTC_LINK_ARCHIVE_GROUP)
     if(TARGET bitcoin_wallet)
       target_link_qtc_linux_archive_group(qtc-node ${QTC_NODE_WALLET_ARCHIVES})
     else()
@@ -834,7 +844,7 @@ if(BUILD_TX)
   target_link_libraries(qtc-tx
     core_interface
   )
-  if(UNIX AND NOT APPLE)
+  if(QTC_LINK_ARCHIVE_GROUP)
     target_link_qtc_linux_archive_group(qtc-tx ${QTC_BASE_ARCHIVES})
   else()
     target_link_libraries(qtc-tx
@@ -854,7 +864,7 @@ if(BUILD_UTIL)
   target_link_libraries(qtc-util
     core_interface
   )
-  if(UNIX AND NOT APPLE)
+  if(QTC_LINK_ARCHIVE_GROUP)
     target_link_qtc_linux_archive_group(qtc-util ${QTC_BASE_ARCHIVES})
   else()
     target_link_libraries(qtc-util
@@ -869,7 +879,7 @@ if(BUILD_UTIL)
   target_link_libraries(qtc-matmul-backend-info
     core_interface
   )
-  if(UNIX AND NOT APPLE)
+  if(QTC_LINK_ARCHIVE_GROUP)
     target_link_qtc_linux_archive_group(qtc-matmul-backend-info ${QTC_BASE_ARCHIVES})
   else()
     target_link_libraries(qtc-matmul-backend-info bitcoin_common)
@@ -880,7 +890,7 @@ if(BUILD_UTIL)
   target_link_libraries(qtc-matmul-metal-bench
     core_interface
   )
-  if(UNIX AND NOT APPLE)
+  if(QTC_LINK_ARCHIVE_GROUP)
     target_link_qtc_linux_archive_group(qtc-matmul-metal-bench ${QTC_BASE_ARCHIVES})
   else()
     target_link_libraries(qtc-matmul-metal-bench bitcoin_common)
@@ -894,7 +904,7 @@ if(BUILD_UTIL)
   target_link_libraries(qtc-matmul-solve-bench
     core_interface
   )
-  if(UNIX AND NOT APPLE)
+  if(QTC_LINK_ARCHIVE_GROUP)
     target_link_qtc_linux_archive_group(qtc-matmul-solve-bench ${QTC_BASE_ARCHIVES})
   else()
     target_link_libraries(qtc-matmul-solve-bench
@@ -910,7 +920,7 @@ if(BUILD_UTIL)
   target_link_libraries(qtc-matmul-cost-bench
     core_interface
   )
-  if(UNIX AND NOT APPLE)
+  if(QTC_LINK_ARCHIVE_GROUP)
     target_link_qtc_linux_archive_group(qtc-matmul-cost-bench ${QTC_BASE_ARCHIVES})
   else()
     target_link_libraries(qtc-matmul-cost-bench
@@ -923,7 +933,7 @@ if(BUILD_UTIL)
   target_link_libraries(qtc-genesis
     core_interface
   )
-  if(UNIX AND NOT APPLE)
+  if(QTC_LINK_ARCHIVE_GROUP)
     target_link_qtc_linux_archive_group(qtc-genesis ${QTC_BASE_ARCHIVES})
   else()
     target_link_libraries(qtc-genesis

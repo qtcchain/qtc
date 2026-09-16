@@ -286,7 +286,7 @@ target_link_libraries(test_qtc
   Boost::headers
   libevent::extra
 )
-if(UNIX AND NOT APPLE)
+if(QTC_LINK_ARCHIVE_GROUP)
   if(TARGET bitcoin_wallet)
     target_link_qtc_linux_archive_group(test_qtc
       test_util
@@ -321,7 +321,7 @@ function(link_shielded_report_target target)
   target_link_libraries(${target}
     core_interface
   )
-  if(UNIX AND NOT APPLE)
+  if(QTC_LINK_ARCHIVE_GROUP)
     target_link_qtc_linux_archive_group(${target} ${QTC_NODE_ARCHIVES})
   else()
     target_link_libraries(${target} bitcoin_node)

@@ -78,7 +78,7 @@ target_link_libraries(bench_qtc
   $<TARGET_NAME_IF_EXISTS:bitcoinconsensus>
   Boost::headers
 )
-if(UNIX AND NOT APPLE)
+if(QTC_LINK_ARCHIVE_GROUP)
   if(ENABLE_WALLET)
     target_link_qtc_linux_archive_group(bench_qtc
       test_util
