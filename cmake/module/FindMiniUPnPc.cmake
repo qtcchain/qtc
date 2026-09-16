@@ -76,6 +76,13 @@ if(MiniUPnPc_FOUND AND NOT TARGET MiniUPnPc::MiniUPnPc)
   set_property(TARGET MiniUPnPc::MiniUPnPc PROPERTY
     INTERFACE_COMPILE_DEFINITIONS USE_UPNP=1 $<$<PLATFORM_ID:Windows>:MINIUPNP_STATICLIB>
   )
+  if(WIN32)
+    # The static miniupnpc archive calls inet_pton/getifaddrs-style Winsock and IP Helper APIs; with GNU ld
+    # the system libraries must follow the archive on the link line, so attach them to the imported target.
+    set_property(TARGET MiniUPnPc::MiniUPnPc APPEND PROPERTY
+      INTERFACE_LINK_LIBRARIES iphlpapi ws2_32
+    )
+  endif()
 endif()
 
 mark_as_advanced(
