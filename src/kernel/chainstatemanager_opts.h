@@ -58,7 +58,7 @@ enum class ReorgProtectionProfile {
     STANDARD,
     ARCHIVE,
     BALANCED,
-    STRICT,
+    STRICT_MODE, // not STRICT: the Windows headers define that name as a macro
     EMERGENCY,
 };
 
@@ -103,7 +103,7 @@ inline ReorgProtectionProfileSettings GetReorgProtectionProfileSettings(ReorgPro
             .hysteresis_depth = 0,
             .hysteresis_work_margin = 2,
         };
-    case ReorgProtectionProfile::STRICT:
+    case ReorgProtectionProfile::STRICT_MODE:
         return {
             .action = DeepReorgAction::WARN,
             .warn_depth = 3,
@@ -131,7 +131,7 @@ inline const char* ReorgProtectionProfileName(ReorgProtectionProfile profile)
     case ReorgProtectionProfile::STANDARD: return "standard";
     case ReorgProtectionProfile::ARCHIVE: return "archive";
     case ReorgProtectionProfile::BALANCED: return "balanced";
-    case ReorgProtectionProfile::STRICT: return "strict";
+    case ReorgProtectionProfile::STRICT_MODE: return "strict";
     case ReorgProtectionProfile::EMERGENCY: return "emergency";
     }
     return "unknown";

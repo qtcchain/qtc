@@ -3450,7 +3450,7 @@ bool SolveMatMulNonceSeeded(CBlockHeader& block,
         };
 
         enum class DigestCandidateOutcome {
-            ERROR,
+            FAILURE, // not ERROR: the Windows headers define that name as a macro
             MISS,
             SOLVED,
         };
@@ -3476,12 +3476,12 @@ bool SolveMatMulNonceSeeded(CBlockHeader& block,
             std::vector<matmul::accelerated::DigestResult> digest_batch =
                 matmul::accelerated::WaitForSubmittedMatMulDigestBatch(std::move(digest_submission));
             if (digest_batch.size() != 1 || !digest_batch[0].ok) {
-                return DigestCandidateOutcome::ERROR;
+                return DigestCandidateOutcome::FAILURE;
             }
 
             const auto& digest_result = digest_batch[0];
             if (!CheckRequiredMatMulDigestBackend(backend_requirement, digest_result, "nonce_seeded_single_digest")) {
-                return DigestCandidateOutcome::ERROR;
+                return DigestCandidateOutcome::FAILURE;
             }
             std::optional<uint256> compared_cpu_digest;
             if (cpu_vs_metal_compare && active_backend == matmul::backend::Kind::METAL) {
@@ -3569,10 +3569,10 @@ bool SolveMatMulNonceSeeded(CBlockHeader& block,
             const matmul::accelerated::DigestResult& digest_result,
             uint256& accepted_digest) -> DigestCandidateOutcome {
             if (!digest_result.ok) {
-                return DigestCandidateOutcome::ERROR;
+                return DigestCandidateOutcome::FAILURE;
             }
             if (!CheckRequiredMatMulDigestBackend(backend_requirement, digest_result, "nonce_seeded_batch_digest")) {
-                return DigestCandidateOutcome::ERROR;
+                return DigestCandidateOutcome::FAILURE;
             }
 
             if (const arith_uint256 digest_value = UintToArith256(digest_result.digest); digest_value < best_digest_seen) {
@@ -3747,7 +3747,7 @@ bool SolveMatMulNonceSeeded(CBlockHeader& block,
                                 prepared_batch[i],
                                 digest_batch[i],
                                 accepted_digest);
-                            if (outcome == DigestCandidateOutcome::ERROR) {
+                            if (outcome == DigestCandidateOutcome::FAILURE) {
                                 RegisterMatMulSolveRuntimeSample(false, std::chrono::steady_clock::now() - solve_start);
                                 return false;
                             }
@@ -3791,7 +3791,7 @@ bool SolveMatMulNonceSeeded(CBlockHeader& block,
 
             uint256 accepted_digest;
             const DigestCandidateOutcome outcome = digest_candidate(header, accepted_digest);
-            if (outcome == DigestCandidateOutcome::ERROR) {
+            if (outcome == DigestCandidateOutcome::FAILURE) {
                 RegisterMatMulSolveRuntimeSample(false, std::chrono::steady_clock::now() - solve_start);
                 return false;
             }

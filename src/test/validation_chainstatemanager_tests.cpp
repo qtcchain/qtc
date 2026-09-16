@@ -4060,7 +4060,7 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_args, BasicTestingSetup)
     BOOST_CHECK_EQUAL(balanced_profile.hysteresis_work_margin, 2U);
 
     const auto strict_opts = get_valid_opts({"-reorgprotectionprofile=STRICT"});
-    BOOST_CHECK(strict_opts.reorg_protection_profile == kernel::ReorgProtectionProfile::STRICT);
+    BOOST_CHECK(strict_opts.reorg_protection_profile == kernel::ReorgProtectionProfile::STRICT_MODE);
     BOOST_CHECK(strict_opts.deep_reorg_action == kernel::DeepReorgAction::WARN);
     const auto strict_profile = kernel::GetReorgProtectionProfileSettings(strict_opts.reorg_protection_profile);
     BOOST_CHECK_EQUAL(strict_profile.warn_depth, 3U);

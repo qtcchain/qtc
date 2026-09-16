@@ -36,7 +36,7 @@ std::optional<kernel::ReorgProtectionProfile> ParseReorgProtectionProfile(std::s
     if (profile == "standard" || profile == "miner") return kernel::ReorgProtectionProfile::STANDARD;
     if (profile == "archive") return kernel::ReorgProtectionProfile::ARCHIVE;
     if (profile == "balanced") return kernel::ReorgProtectionProfile::BALANCED;
-    if (profile == "strict") return kernel::ReorgProtectionProfile::STRICT;
+    if (profile == "strict") return kernel::ReorgProtectionProfile::STRICT_MODE;
     if (profile == "emergency") return kernel::ReorgProtectionProfile::EMERGENCY;
     return std::nullopt;
 }
