@@ -17,7 +17,7 @@
 
 #include <boost/test/unit_test.hpp>
 
-#include <arpa/inet.h>
+#include <compat/compat.h> // in_addr on every platform (arpa/inet.h does not exist on Windows)
 
 #include <map>
 #include <set>

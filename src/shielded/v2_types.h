@@ -5,6 +5,7 @@
 #ifndef QTC_SHIELDED_V2_TYPES_H
 #define QTC_SHIELDED_V2_TYPES_H
 
+#include <compat/compat.h> // Windows headers first, so the OPAQUE macro they define is undone once (below) for every TU
 #include <consensus/amount.h>
 #include <serialize.h>
 #include <span.h>
@@ -49,7 +50,7 @@ enum class NoteClass : uint8_t {
 };
 
 #ifdef OPAQUE
-#undef OPAQUE
+#undef OPAQUE // wingdi.h background mode; collides with ScanDomain::OPAQUE
 #endif
 
 enum class ScanDomain : uint8_t {

@@ -74,20 +74,28 @@ public:
         if (existing != nullptr) {
             m_original = std::string(existing);
         }
+#if defined(WIN32)
+        _putenv_s(name, value != nullptr ? value : "");
+#else
         if (value != nullptr) {
             setenv(name, value, 1);
         } else {
             unsetenv(name);
         }
+#endif
     }
 
     ~ScopedEnvVar()
     {
+#if defined(WIN32)
+        _putenv_s(m_name, m_original.has_value() ? m_original->c_str() : "");
+#else
         if (m_original.has_value()) {
             setenv(m_name, m_original->c_str(), 1);
         } else {
             unsetenv(m_name);
         }
+#endif
     }
 
 private:

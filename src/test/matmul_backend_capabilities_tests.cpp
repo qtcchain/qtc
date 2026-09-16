@@ -21,7 +21,11 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#if defined(WIN32)
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -43,20 +47,28 @@ public:
             m_original = current;
         }
 
+#if defined(WIN32)
+        _putenv_s(name, value != nullptr ? value : "");
+#else
         if (value != nullptr) {
             setenv(name, value, 1);
         } else {
             unsetenv(name);
         }
+#endif
     }
 
     ~ScopedEnvVar()
     {
+#if defined(WIN32)
+        _putenv_s(m_name, m_had_original ? m_original.c_str() : "");
+#else
         if (m_had_original) {
             setenv(m_name, m_original.c_str(), 1);
         } else {
             unsetenv(m_name);
         }
+#endif
     }
 
 private:
@@ -1058,17 +1070,28 @@ BOOST_AUTO_TEST_CASE(metal_zero_copy_profile_reports_aligned_input_wrap)
     const auto noise = matmul::noise::Generate(sigma, kN, kR);
     const auto compress_vec = matmul::transcript::DeriveCompressionVector(sigma, kB);
 
+#if defined(WIN32)
+    SYSTEM_INFO system_info{};
+    GetSystemInfo(&system_info);
+    const size_t sys_page = static_cast<size_t>(system_info.dwPageSize);
+#else
     const size_t sys_page = static_cast<size_t>(sysconf(_SC_PAGE_SIZE));
+#endif
+    using AlignedDeleter = void (*)(void*);
     const auto aligned_alloc = [sys_page](size_t bytes) {
         // Round up to page boundary so Metal's zero-copy view stays within
         // the actual allocation.
         const size_t alloc_bytes = ((bytes + sys_page - 1) / sys_page) * sys_page;
         void* raw{nullptr};
-        if (posix_memalign(&raw, sys_page, alloc_bytes) != 0) {
-            return std::unique_ptr<matmul::field::Element, decltype(&std::free)>(nullptr, &std::free);
-        }
-        return std::unique_ptr<matmul::field::Element, decltype(&std::free)>(
-            static_cast<matmul::field::Element*>(raw), &std::free);
+#if defined(WIN32)
+        raw = _aligned_malloc(alloc_bytes, sys_page);
+        const AlignedDeleter deleter{&_aligned_free};
+#else
+        if (posix_memalign(&raw, sys_page, alloc_bytes) != 0) raw = nullptr;
+        const AlignedDeleter deleter{&std::free};
+#endif
+        return std::unique_ptr<matmul::field::Element, AlignedDeleter>(
+            static_cast<matmul::field::Element*>(raw), deleter);
     };
 
     const size_t matrix_bytes = static_cast<size_t>(kN) * kN * sizeof(matmul::field::Element);
