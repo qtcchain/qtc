@@ -499,18 +499,10 @@ function(add_legacy_binary_alias target_name legacy_binary)
   endif()
 
   if(WIN32)
-    add_custom_command(
-      TARGET ${target_name} POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        $<TARGET_FILE:${target_name}>
-        $<TARGET_FILE_DIR:${target_name}>/${legacy_binary}${CMAKE_EXECUTABLE_SUFFIX}
-      VERBATIM
-    )
-    install(FILES $<TARGET_FILE:${target_name}>
-      DESTINATION ${CMAKE_INSTALL_BINDIR}
-      RENAME ${legacy_binary}${CMAKE_EXECUTABLE_SUFFIX}
-      COMPONENT ${target_name}
-    )
+    # No symlinks on Windows. A copy would double the package, and install(FILES) ships the
+    # unstripped build-tree binary (the v0.1.0-rc3 Windows zip was 1 GB, 2 GB of it one alias),
+    # so Windows packages carry the canonical qtc-* names only.
+    return()
   else()
     add_custom_command(
       TARGET ${target_name} POST_BUILD
