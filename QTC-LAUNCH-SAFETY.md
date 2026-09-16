@@ -521,3 +521,20 @@ temporarily replaced by `[QTC-REGEN] netN genesis … merkle …` stderr hooks (
 hashes. Merkle roots are unchanged. Unit tests updated: `pow_tests` (TESTNET activation pins, `"1e011da5"`),
 `matmul_dgw_tests` (`0x1e011da5U`), `matmul_trust_model_tests` (window 1,000; Phase-2 ban-threshold 1 replaces the
 soft-fail cases), `qtc_launch_readiness_tests` LR-14 (no fast phase on any chain).
+
+## 15. Launch floor decision D5 — signed off 2026-09-16
+
+**Decision:** mainnet `powLimit` = `0x011da5·2^216` (compact **`0x1e011da5`**, candidate D of the sizing note), applied
+together with the launch-day genesis regeneration (H1) by `genesis_launch_regen_dryrun.sh` made real. Mainnet stays at
+`0x1e033333` in the tree until that day so no throwaway mainnet genesis is created.
+
+**Basis:** one RTX 6000 Ada (Node B, 25,060 digests/s) alone holds 600 s at this floor; the two-card launch fleet
+(40,090 digests/s) starts near 375 s and ASERT settles within about a week (≈ 187 blocks overshoot). Burn-in evidence
+from the test chains, which run this floor since v0.1.0-rc2: 83 blocks in the first 11.2 h at bits `1e011da5`
+(≈ 484 s spacing with both miners, the floor pinned as modelled), no stalls, all nodes in agreement. The alternatives
+(G: L40 alone at 600 s, `0x1e01dc65`; E: fleet at 300 s, `0x1e016525`) would give 220–300 s launch blocks and larger
+overshoot for no safety gain.
+
+**Consequences:** launch-day checklist item "floor + genesis regen" is a single script run; the test chains already
+carry the value, so the burn-in is a faithful rehearsal of mainnet difficulty behaviour. Revisit only if the launch
+fleet changes below one RTX 6000 Ada equivalent.
