@@ -206,7 +206,17 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& argsman, const CChainP
     mempool_opts.reject_tokens = argsman.GetBoolArg("-rejecttokens", DEFAULT_REJECT_TOKENS);
 
     if (argsman.GetBoolArg("-datacarrier", DEFAULT_ACCEPT_DATACARRIER)) {
-        mempool_opts.max_datacarrier_bytes = argsman.GetIntArg("-datacarriersize", MAX_OP_RETURN_RELAY);
+        unsigned int max_datacarrier_bytes{static_cast<unsigned int>(argsman.GetIntArg("-datacarriersize", MAX_OP_RETURN_RELAY))};
+        // QTC: OP_RETURN script size is consensus-capped on chains with fReducedDataLimits
+        // (CheckReducedDataOutputLimits). Never let relay policy exceed consensus, or the
+        // mempool accepts and relays transactions no block can ever include.
+        const auto& consensus{chainparams.GetConsensus()};
+        if (consensus.fReducedDataLimits && max_datacarrier_bytes > consensus.nMaxOpReturnBytes) {
+            LogPrintf("Warning: -datacarriersize=%u exceeds the consensus OP_RETURN limit of %u bytes on this chain; clamping\n",
+                      max_datacarrier_bytes, consensus.nMaxOpReturnBytes);
+            max_datacarrier_bytes = consensus.nMaxOpReturnBytes;
+        }
+        mempool_opts.max_datacarrier_bytes = max_datacarrier_bytes;
     } else {
         mempool_opts.max_datacarrier_bytes = std::nullopt;
     }
