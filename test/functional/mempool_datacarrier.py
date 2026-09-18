@@ -46,10 +46,10 @@ class DataCarrierTest(BitcoinTestFramework):
     def run_test(self):
         self.wallet = MiniWallet(self.nodes[0])
 
-        # By default, only 80 bytes are used for data (+1 for OP_RETURN, +2 for the pushdata opcodes).
-        default_size_data = randbytes(MAX_OP_RETURN_RELAY - 3)
-        too_long_data = randbytes(MAX_OP_RETURN_RELAY - 2)
-        small_data = randbytes(MAX_OP_RETURN_RELAY - 4)
+        # By default, 1000 bytes are used for data (+1 for OP_RETURN, +3 for OP_PUSHDATA2 and its length).
+        default_size_data = randbytes(MAX_OP_RETURN_RELAY - 4)
+        too_long_data = randbytes(MAX_OP_RETURN_RELAY - 3)
+        small_data = randbytes(MAX_OP_RETURN_RELAY - 5)
         one_byte = randbytes(1)
         zero_bytes = randbytes(0)
 

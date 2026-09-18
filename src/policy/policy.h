@@ -151,13 +151,15 @@ static constexpr unsigned int DEFAULT_DESCENDANT_LIMIT{100};
 static constexpr unsigned int DEFAULT_DESCENDANT_SIZE_LIMIT_KVB{1024};
 /** Default for -datacarrier */
 static const bool DEFAULT_ACCEPT_DATACARRIER = true;
-/**
- * Default setting for -datacarriersize. 80 bytes of data, +1 for OP_RETURN,
- * +2 for the pushdata opcodes.
- */
 /** Default for -permitbaredatacarrier */
 static const bool DEFAULT_PERMITBAREDATACARRIER{false};
-static const unsigned int MAX_OP_RETURN_RELAY = 83;
+/**
+ * Default setting for -datacarriersize. 1000 bytes of data, +1 for OP_RETURN,
+ * +3 for the OP_PUSHDATA2 opcode and length. Policy only (consensus caps a
+ * script at MAX_SCRIPT_SIZE); sized for QTP token messages and issuer
+ * metadata rather than the 80-byte upstream default.
+ */
+static const unsigned int MAX_OP_RETURN_RELAY = 1004;
 /** Default for -datacarrierfullcount */
 static constexpr bool DEFAULT_DATACARRIER_FULLCOUNT{true};
 /**
