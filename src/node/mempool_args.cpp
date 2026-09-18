@@ -212,8 +212,10 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& argsman, const CChainP
         // mempool accepts and relays transactions no block can ever include.
         const auto& consensus{chainparams.GetConsensus()};
         if (consensus.fReducedDataLimits && max_datacarrier_bytes > consensus.nMaxOpReturnBytes) {
-            LogPrintf("Warning: -datacarriersize=%u exceeds the consensus OP_RETURN limit of %u bytes on this chain; clamping\n",
-                      max_datacarrier_bytes, consensus.nMaxOpReturnBytes);
+            if (argsman.IsArgSet("-datacarriersize")) {
+                LogPrintf("Warning: -datacarriersize=%u exceeds the consensus OP_RETURN limit of %u bytes on this chain; clamping\n",
+                          max_datacarrier_bytes, consensus.nMaxOpReturnBytes);
+            }
             max_datacarrier_bytes = consensus.nMaxOpReturnBytes;
         }
         mempool_opts.max_datacarrier_bytes = max_datacarrier_bytes;

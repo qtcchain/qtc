@@ -173,6 +173,7 @@ public:
         consensus.fKAWPOW = false;
         consensus.fSkipKAWPOWValidation = false;
         consensus.fReducedDataLimits = true;
+        consensus.nMaxOpReturnBytes = 1'004; // 1,000-byte payload + OP_RETURN + OP_PUSHDATA2 + 2-byte length (approved 2026-09-18)
         consensus.fEnforceP2MROnlyOutputs = true;
         consensus.nKAWPOWHeight = std::numeric_limits<int>::max();
         consensus.fMatMulPOW = true;
@@ -1043,6 +1044,7 @@ public:
         consensus.fKAWPOW = false;
         consensus.fSkipKAWPOWValidation = !opts.matmul_strict;
         consensus.fReducedDataLimits = true;
+        consensus.nMaxOpReturnBytes = 1'004; // mirror mainnet so tests exercise the launch value
         consensus.fEnforceP2MROnlyOutputs = false;
         consensus.nKAWPOWHeight = std::numeric_limits<int>::max();
         consensus.fMatMulPOW = true;
