@@ -33,6 +33,7 @@ from test_framework.messages import (
     CTxInWitness,
     CTxOut,
     hash256,
+    tx_from_hex,
 )
 from test_framework.script import (
     CScript,
@@ -54,6 +55,7 @@ from test_framework.util import (
     assert_greater_than_or_equal,
     get_fee,
 )
+from test_framework.authproxy import JSONRPCException
 from test_framework.wallet_util import generate_keypair
 
 DEFAULT_FEE = Decimal("0.0001")
@@ -79,11 +81,30 @@ class MiniWalletMode(Enum):
     RAW_OP_TRUE     | anyone-can-spend  |  - (raw)  |   no     |    yes     |   no
     RAW_P2PK        | pay-to-public-key |  - (raw)  |   yes    |    yes     |   yes
     RAW_P2PKH       | pay-to-pubkey-hash|  - (raw)  |   yes    |    yes     |   yes
+    ADDRESS_P2MR    | witness v2 P2MR   |  bech32m  |  yes(*)  |    no      | node wallet
+
+    (*) QTC relay policy (IsStandard) only accepts witness v2 P2MR and OP_RETURN
+    outputs, so on this chain ADDRESS_OP_TRUE (P2TR) transactions are rejected
+    with "scriptpubkey" unless the node runs with -acceptnonstdtxn=1. The
+    ADDRESS_P2MR mode instead pays to a P2MR address owned by the test node's
+    wallet and signs spends through signrawtransactionwithwallet (there is no
+    Python ML-DSA signer). Because the witness carries a real post-quantum
+    signature, any change to a transaction after create_self_transfer*() must
+    be followed by sign_tx(). The pre-mined test chain has no P2MR coins, so
+    tests using this mode must call generate() first.
     """
     ADDRESS_OP_TRUE = 1
     RAW_OP_TRUE = 2
     RAW_P2PK = 3
     RAW_P2PKH = 4
+    ADDRESS_P2MR = 5
+
+
+# Python-side vsize (BIP141 weight) of a 1-in-1-out ADDRESS_P2MR self-transfer signed
+# by the default QTC wallet descriptor: witness = [ML-DSA-44 sig (2420), leaf script
+# (1316), control block (33)]. Fixed-size PQ signatures make this deterministic.
+P2MR_SELF_TRANSFER_VSIZE = 1039
+P2MR_WALLET_LABEL = "miniwallet_p2mr"
 
 
 class MiniWallet:
@@ -111,6 +132,17 @@ class MiniWallet:
             internal_key = None if tag_name is None else compute_xonly_pubkey(hash256(tag_name.encode()))[0]
             self._address, self._taproot_info = create_deterministic_address_bcrt1_p2tr_op_true(internal_key)
             self._scriptPubKey = address_to_scriptpubkey(self._address)
+        elif mode == MiniWalletMode.ADDRESS_P2MR:
+            self._wallet_rpc = self._get_p2mr_wallet_rpc(test_node)
+            label = P2MR_WALLET_LABEL if tag_name is None else f"{P2MR_WALLET_LABEL}_{tag_name}"
+            # Reuse the same address across MiniWallet instances on the same node
+            # (mirrors the deterministic addresses of the other modes).
+            try:
+                existing = list(self._wallet_rpc.getaddressesbylabel(label).keys())
+            except JSONRPCException:
+                existing = []
+            self._address = existing[0] if existing else self._wallet_rpc.getnewaddress(label=label, address_type="p2mr")
+            self._scriptPubKey = address_to_scriptpubkey(self._address)
 
         # When the pre-mined test framework chain is used, it contains coinbase
         # outputs to the MiniWallet's default address in blocks 76-100
@@ -121,6 +153,18 @@ class MiniWallet:
 
     def _create_utxo(self, *, txid, vout, value, height, coinbase, confirmations):
         return {"txid": txid, "vout": vout, "value": value, "height": height, "coinbase": coinbase, "confirmations": confirmations}
+
+    @staticmethod
+    def _get_p2mr_wallet_rpc(test_node):
+        """Return a wallet RPC on test_node for ADDRESS_P2MR mode, creating a
+        dedicated wallet if none is loaded."""
+        wallets = test_node.listwallets()
+        if P2MR_WALLET_LABEL in wallets:
+            return test_node.get_wallet_rpc(P2MR_WALLET_LABEL)
+        if wallets:
+            return test_node.get_wallet_rpc(wallets[0])
+        test_node.createwallet(wallet_name=P2MR_WALLET_LABEL, descriptors=True)
+        return test_node.get_wallet_rpc(P2MR_WALLET_LABEL)
 
     def _bulk_tx(self, tx, target_vsize):
         """Pad a transaction with extra outputs until it reaches a target vsize.
@@ -256,6 +300,14 @@ class MiniWallet:
         elif self._mode == MiniWalletMode.RAW_OP_TRUE:
             for i in tx.vin:
                 i.scriptSig = CScript([OP_NOP] * 43)  # pad to identical size
+        elif self._mode == MiniWalletMode.ADDRESS_P2MR:
+            # Real PQ signatures: sign via the node wallet that owns the P2MR
+            # key. Prevouts are resolved from the chain or the node's mempool.
+            tx.wit.vtxinwit = [CTxInWitness() for _ in tx.vin]
+            res = self._wallet_rpc.signrawtransactionwithwallet(tx.serialize().hex())
+            assert res["complete"], res
+            tx.wit = tx_from_hex(res["hex"]).wit
+            tx.rehash()
         elif self._mode == MiniWalletMode.ADDRESS_OP_TRUE:
             tx.wit.vtxinwit = [CTxInWitness()] * len(tx.vin)
             for i in tx.wit.vtxinwit:
@@ -288,7 +340,7 @@ class MiniWallet:
         return descsum_create(f'raw({self._scriptPubKey.hex()})')
 
     def get_address(self):
-        assert_equal(self._mode, MiniWalletMode.ADDRESS_OP_TRUE)
+        assert self._mode in (MiniWalletMode.ADDRESS_OP_TRUE, MiniWalletMode.ADDRESS_P2MR)
         return self._address
 
     def get_utxo(self, *, txid: str = '', vout: Optional[int] = None, mark_as_spent=True, confirmed_only=False) -> dict:
@@ -405,6 +457,9 @@ class MiniWallet:
 
         if target_vsize:
             self._bulk_tx(tx, target_vsize)
+            if self._mode == MiniWalletMode.ADDRESS_P2MR:
+                # padding outputs invalidate the real signature; witness size is fixed
+                self.sign_tx(tx)
 
         txid = tx.rehash()
         return {
@@ -444,6 +499,8 @@ class MiniWallet:
             vsize = Decimal(168)  # P2PK (73 bytes scriptSig + 35 bytes scriptPubKey + 60 bytes other)
         elif self._mode == MiniWalletMode.RAW_P2PKH:
             vsize = Decimal(192)  # P2PKH (107 bytes scriptSig + 25 bytes scriptPubKey + 60 bytes other)
+        elif self._mode == MiniWalletMode.ADDRESS_P2MR:
+            vsize = Decimal(P2MR_SELF_TRANSFER_VSIZE)
         else:
             assert False
         if target_vsize and not fee:  # respect fee_rate if target vsize is passed
