@@ -7,26 +7,33 @@
 from decimal import Decimal
 import time
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     COIN,
-    MAX_BLOCK_WEIGHT,
 )
 from test_framework.test_framework import BitcoinTestFramework, SkipTest
 from test_framework.util import (
     assert_equal,
     assert_raises_rpc_error,
-    create_lots_of_big_transactions,
-    gen_return_txouts,
 )
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 
 class PrioritiseTransactionTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
+        self.block_max_weight = 2_000_000
         self.extra_args = [[
             "-printpriority=1",
             "-datacarriersize=100000",
+            f"-blockmaxweight={self.block_max_weight}",  # QTC: 24M-weight blocks would need far more P2MR coins than the test has
+            "-walletbroadcast=0",  # QTC: keep the P2MR signing wallet from re-adding its txs to the mempool on restart
         ]] * self.num_nodes
         self.supports_cli = False
 
@@ -35,6 +42,23 @@ class PrioritiseTransactionTest(BitcoinTestFramework):
             delta = info["fee_delta"]
             node.prioritisetransaction(txid, 0, -delta)
         assert_equal(node.getprioritisedtransactions(), {})
+
+    def create_big_transactions(self, fee, utxos):
+        """QTC: pad with many P2MR outputs (multi-OP_RETURN is non-standard) and re-sign for the exact fee."""
+        txids = []
+        fee_sat = int(fee * COIN)
+        for utxo in utxos:
+            num_outputs = 800
+            tx_res = self.wallet.create_self_transfer_multi(
+                utxos_to_spend=[utxo],
+                num_outputs=num_outputs,
+                amount_per_output=(int(utxo["value"] * COIN) - fee_sat) // num_outputs,
+            )
+            tx = tx_res["tx"]
+            tx.vout[0].nValue += int(tx_res["fee"] * COIN) - fee_sat  # rounding remainder back to an output
+            self.wallet.sign_tx(tx)
+            txids.append(self.wallet.sendrawtransaction(from_node=self.nodes[0], tx_hex=tx.serialize().hex()))
+        return txids
 
     def test_replacement(self):
         self.log.info("Test tx prioritisation stays after a tx is replaced")
@@ -118,7 +142,7 @@ class PrioritiseTransactionTest(BitcoinTestFramework):
         self.clear_prioritisation(node=self.nodes[0])
 
         self.log.info("Test priority while txs are not in mempool")
-        self.restart_node(0, extra_args=["-nopersistmempool"])
+        self.restart_node(0, extra_args=["-nopersistmempool", "-walletbroadcast=0"])
         self.nodes[0].setmocktime(mock_time)
         assert_equal(self.nodes[0].getmempoolinfo()["size"], 0)
         self.nodes[0].prioritisetransaction(txid=txid_b, fee_delta=int(fee_delta_b * COIN))
@@ -140,9 +164,12 @@ class PrioritiseTransactionTest(BitcoinTestFramework):
         # Use default extra_args
         self.restart_node(0)
         assert_equal(self.nodes[0].getprioritisedtransactions(), {})
+        # QTC: the P2MR MiniWallet signs through the node's RPC, which changed on restart
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
 
         # QTC policy can reject legacy MiniWallet output scripts via "scriptpubkey"
         # (P2MR-only policy). In that configuration, fee-delta behavior is orthogonal
@@ -176,7 +203,6 @@ class PrioritiseTransactionTest(BitcoinTestFramework):
         self.test_replacement()
         self.test_diamond()
 
-        self.txouts = gen_return_txouts()
         self.relayfee = self.nodes[0].getnetworkinfo()['relayfee']
 
         utxo_count = 90
@@ -193,16 +219,10 @@ class PrioritiseTransactionTest(BitcoinTestFramework):
             txids.append([])
             start_range = i * range_size
             end_range = start_range + range_size
-            txids[i] = create_lots_of_big_transactions(
-                self.wallet,
-                self.nodes[0],
-                (i+1) * base_fee,
-                end_range - start_range,
-                self.txouts,
-                utxos[start_range:end_range])
+            txids[i] = self.create_big_transactions((i+1) * base_fee, utxos[start_range:end_range])
 
         # Make sure that the size of each group of transactions exceeds
-        # MAX_BLOCK_WEIGHT // 4 -- otherwise the test needs to be revised to
+        # block_max_weight // 4 -- otherwise the test needs to be revised to
         # create more transactions.
         mempool = self.nodes[0].getrawmempool(True)
         sizes = [0, 0, 0]
@@ -210,7 +230,7 @@ class PrioritiseTransactionTest(BitcoinTestFramework):
             for j in txids[i]:
                 assert j in mempool
                 sizes[i] += mempool[j]['vsize']
-            assert sizes[i] > MAX_BLOCK_WEIGHT // 4  # Fail => raise utxo_count
+            assert sizes[i] > self.block_max_weight // 4  # Fail => raise utxo_count
 
         assert_equal(self.nodes[0].getprioritisedtransactions(), {})
         # add a fee delta to something in the cheapest bucket and make sure it gets mined
@@ -283,23 +303,24 @@ class PrioritiseTransactionTest(BitcoinTestFramework):
         assert_raises_rpc_error(-26, "min relay fee not met", self.nodes[0].sendrawtransaction, tx_hex)
         assert tx_id not in self.nodes[0].getrawmempool()
 
-        # This is a less than 1000-byte transaction, so just set the fee
-        # to be the minimum for a 1000-byte transaction and check that it is
-        # accepted.
-        self.nodes[0].prioritisetransaction(txid=tx_id, fee_delta=int(self.relayfee*COIN))
-        assert_equal(self.nodes[0].getprioritisedtransactions()[tx_id], { "fee_delta" : self.relayfee*COIN, "in_mempool" : False})
+        # QTC: a P2MR spend is ~3.9 kvB on the node, so set the fee to be the
+        # minimum for that many whole kilobytes and check that it is accepted.
+        free_tx_kvb = -(-self.nodes[0].decoderawtransaction(tx_hex)["vsize"] // 1000)
+        free_tx_delta = free_tx_kvb * self.relayfee * COIN
+        self.nodes[0].prioritisetransaction(txid=tx_id, fee_delta=int(free_tx_delta))
+        assert_equal(self.nodes[0].getprioritisedtransactions()[tx_id], { "fee_delta" : free_tx_delta, "in_mempool" : False})
 
         self.log.info("Assert that prioritised free transaction is accepted to mempool")
         assert_equal(self.nodes[0].sendrawtransaction(tx_hex), tx_id)
         assert tx_id in self.nodes[0].getrawmempool()
-        assert_equal(self.nodes[0].getprioritisedtransactions()[tx_id], { "fee_delta" : self.relayfee*COIN, "in_mempool" : True, "modified_fee": int(self.relayfee*COIN + COIN * tx_res["fee"])})
+        assert_equal(self.nodes[0].getprioritisedtransactions()[tx_id], { "fee_delta" : free_tx_delta, "in_mempool" : True, "modified_fee": int(free_tx_delta + COIN * tx_res["fee"])})
 
         # Test that calling prioritisetransaction is sufficient to trigger
         # getblocktemplate to (eventually) return a new block.
         mock_time = int(time.time())
         self.nodes[0].setmocktime(mock_time)
         template = self.nodes[0].getblocktemplate({'rules': ['segwit']})
-        self.nodes[0].prioritisetransaction(txid=tx_id, fee_delta=-int(self.relayfee*COIN))
+        self.nodes[0].prioritisetransaction(txid=tx_id, fee_delta=-int(free_tx_delta))
 
         # Calling prioritisetransaction with the inverse amount should delete its prioritisation entry
         assert tx_id not in self.nodes[0].getprioritisedtransactions()

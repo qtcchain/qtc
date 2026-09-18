@@ -12,6 +12,7 @@ import time
 from test_framework.mempool_util import (
     fill_mempool,
 )
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     CInv,
     MSG_TX,
@@ -33,7 +34,7 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
 )
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 
 class TestP2PConn(P2PInterface):
@@ -66,9 +67,23 @@ class ConnectionType(Enum):
     WHITELIST = 2
 
 class TxDownloadTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 2
-        self.extra_args= [['-datacarriersize=100000', '-maxmempool=5', '-persistmempool=0']] * self.num_nodes
+        self.extra_args= [[
+            '-datacarriersize=100000',
+            '-maxmempool=5',
+            '-persistmempool=0',
+            # QTC: the default 1024 kvB descendant limit needs -maxmempool >= 41 MB
+            '-limitdescendantsize=125',
+            # QTC: fill_mempool() floods with default-mode (P2TR) MiniWallet txs, which policy rejects
+            '-acceptnonstdtxn=1',
+        ]] * self.num_nodes
 
     def test_tx_requests(self):
         self.log.info("Test that we request transactions from all our peers, eventually")
@@ -381,7 +396,8 @@ class TxDownloadTest(BitcoinTestFramework):
         wtxidrelay_on_peer.wait_for_getdata([int(random_tx['wtxid'], 16)])
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
 
         # Run tests without mocktime that only need one peer-connection first, to avoid restarting the nodes
         self.test_expiry_fallback()
@@ -408,6 +424,8 @@ class TxDownloadTest(BitcoinTestFramework):
             self.stop_nodes()
             self.start_nodes()
             self.connect_nodes(1, 0)
+            # QTC: the P2MR MiniWallet signs through the node's RPC, which changed on restart
+            self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
             # Setup the p2p connections
             self.peers = []
             if with_inbounds:

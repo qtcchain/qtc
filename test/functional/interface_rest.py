@@ -13,9 +13,11 @@ import typing
 import urllib.parse
 
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     BLOCK_HEADER_SIZE,
     COIN,
+    CTxOut,
     deser_block_spent_outputs,
 )
 from test_framework.test_framework import BitcoinTestFramework
@@ -26,7 +28,7 @@ from test_framework.util import (
 )
 from test_framework.wallet import (
     MiniWallet,
-    getnewdestination,
+    MiniWalletMode,
 )
 from typing import Optional
 
@@ -49,6 +51,16 @@ def filter_output_indices_by_value(vouts, value):
     for vout in vouts:
         if vout['value'] == value:
             yield vout['n']
+
+def p2mr_send_to(wallet, node, scriptPubKey, amount, fee=1000):
+    """QTC: MiniWallet.send_to() with a re-signed PQ witness (adding the
+    destination output invalidates the ML-DSA signature)."""
+    tx = wallet.create_self_transfer(fee_rate=0)["tx"]
+    tx.vout[0].nValue -= amount + fee
+    tx.vout.append(CTxOut(amount, scriptPubKey))
+    wallet.sign_tx(tx)
+    txid = wallet.sendrawtransaction(from_node=node, tx_hex=tx.serialize().hex())
+    return {"txid": txid, "hex": tx.serialize().hex(), "tx": tx}
 
 class RESTTest (BitcoinTestFramework):
     def add_options(self, parser):
@@ -98,10 +110,13 @@ class RESTTest (BitcoinTestFramework):
 
     def run_test(self):
         self.url = urllib.parse.urlparse(self.nodes[0].url)
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
+        # QTC: relay policy only accepts P2MR outputs, so use a second (tagged) P2MR script as the destination
+        self.dest_script = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR, tag_name="rest_dest").get_output_script()
 
         self.log.info("Broadcast test transaction and sync nodes")
-        txid = self.wallet.send_to(from_node=self.nodes[0], scriptPubKey=getnewdestination()[1], amount=int(0.1 * COIN))["txid"]
+        txid = p2mr_send_to(self.wallet, self.nodes[0], self.dest_script, int(0.1 * COIN))["txid"]
         self.sync_all()
 
         self.log.info("Test the /tx URI")
@@ -170,7 +185,7 @@ class RESTTest (BitcoinTestFramework):
         response_hash = bin_response[4:36][::-1].hex()
 
         assert_equal(bb_hash, response_hash)  # check if getutxo's chaintip during calculation was fine
-        assert_equal(chain_height, 201)  # chain height must be 201 (pre-mined chain [200] + generated block [1])
+        assert_equal(chain_height, 200 + COINBASE_MATURITY + 25 + 1)  # pre-mined chain [200] + QTC P2MR coins + generated block [1]
 
         self.log.info("Test the /getutxos URI with and without /checkmempool")
         # Create a transaction, check that it's found with /checkmempool, but
@@ -178,7 +193,7 @@ class RESTTest (BitcoinTestFramework):
         # found with or without /checkmempool.
 
         # do a tx and don't sync
-        txid = self.wallet.send_to(from_node=self.nodes[0], scriptPubKey=getnewdestination()[1], amount=int(0.1 * COIN))["txid"]
+        txid = p2mr_send_to(self.wallet, self.nodes[0], self.dest_script, int(0.1 * COIN))["txid"]
         json_obj = self.test_rest_request(f"/tx/{txid}")
         # get the spent output to later check for utxo (should be spent by then)
         spent = (json_obj['vin'][0]['txid'], json_obj['vin'][0]['vout'])
@@ -300,7 +315,7 @@ class RESTTest (BitcoinTestFramework):
         # See if we can get 5 headers in one response
         self.generate(self.nodes[1], 5)
         expected_filter = {
-            'basic block filter index': {'synced': True, 'best_block_height': 208},
+            'basic block filter index': {'synced': True, 'best_block_height': self.nodes[0].getblockcount()},
         }
         self.wait_until(lambda: self.nodes[0].getindexinfo() == expected_filter)
         json_obj = self.test_rest_request(f"/headers/{bb_hash}", query_params={"count": 5})
@@ -476,22 +491,19 @@ class RESTTest (BitcoinTestFramework):
         resp = self.test_rest_request(f"/deploymentinfo/{INVALID_PARAM}", ret_type=RetType.OBJ, status=400)
         assert_equal(resp.read().decode('utf-8').rstrip(), f"Invalid hash: {INVALID_PARAM}")
 
-        if self.is_wallet_compiled():
-            self.import_deterministic_coinbase_privkeys()
-
-            # Random address so node1's balance doesn't increase
-            not_related_address = "2MxqoHEdNQTyYeX1mHcbrrpzgojbosTpCvJ"
-
-            # Prepare for Fee estimation
-            for i in range(18):
-                self.nodes[0].sendtoaddress(self.nodes[1].getnewaddress(), 0.1)
-                self.sync_all()
-                self.generatetoaddress(self.nodes[1], 1, not_related_address)
+        # QTC: the cached chain's legacy coinbase coins are not relay-standard,
+        # so feed the fee estimator with MiniWallet (P2MR) transactions instead
+        # of the node wallet.
+        self.log.info("Test the /fee URI")
+        for i in range(18):
+            self.wallet.send_self_transfer(from_node=self.nodes[0])
             self.sync_all()
+            self.generate(self.nodes[1], 1)
+        self.sync_all()
 
-            json_obj = self.test_rest_request("/fee/conservative/1")
-            assert_greater_than(float(json_obj["feerate"]), 0)
-            assert_greater_than(int(json_obj["blocks"]), 0)
+        json_obj = self.test_rest_request("/fee/conservative/1")
+        assert_greater_than(float(json_obj["feerate"]), 0)
+        assert_greater_than(int(json_obj["blocks"]), 0)
 
 
 if __name__ == '__main__':

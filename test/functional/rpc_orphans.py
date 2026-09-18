@@ -10,11 +10,19 @@ from test_framework.mempool_util import (
     ORPHAN_TX_EXPIRE_TIME,
     tx_in_orphanage,
 )
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     CInv,
+    COIN,
+    COutPoint,
+    CTransaction,
+    CTxIn,
+    CTxInWitness,
+    CTxOut,
     msg_inv,
     msg_tx,
     MSG_WTX,
+    tx_from_hex,
 )
 from test_framework.p2p import P2PInterface
 from test_framework.util import (
@@ -22,15 +30,36 @@ from test_framework.util import (
     assert_raises_rpc_error,
 )
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 
 class OrphanRPCsTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
 
+    def create_child(self, parent):
+        # QTC: the node wallet cannot resolve the prevout of an unbroadcast parent,
+        # so sign the child explicitly with prevtxs (like create_self_transfer).
+        utxo = parent["new_utxo"]
+        tx = CTransaction()
+        tx.vin = [CTxIn(COutPoint(int(utxo["txid"], 16), utxo["vout"]))]
+        tx.vout = [CTxOut(int(utxo["value"] * COIN) - 1000, self.wallet.get_output_script())]
+        tx.wit.vtxinwit = [CTxInWitness()]
+        prevtxs = [{"txid": utxo["txid"], "vout": utxo["vout"], "scriptPubKey": self.wallet.get_output_script().hex(), "amount": utxo["value"]}]
+        res = self.wallet._wallet_rpc.signrawtransactionwithwallet(tx.serialize().hex(), prevtxs)
+        assert res["complete"], res
+        tx = tx_from_hex(res["hex"])
+        return {"txid": tx.rehash(), "wtxid": tx.getwtxid(), "hex": res["hex"], "tx": tx}
+
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 4)  # QTC: the cached chain has no P2MR coins
         self.test_orphan_activity()
         self.test_orphan_details()
         self.test_misc()
@@ -41,9 +70,9 @@ class OrphanRPCsTest(BitcoinTestFramework):
 
         self.log.info("Create two 1P1C packages, but only broadcast the children")
         tx_parent_1 = self.wallet.create_self_transfer()
-        tx_child_1 = self.wallet.create_self_transfer(utxo_to_spend=tx_parent_1["new_utxo"])
+        tx_child_1 = self.create_child(tx_parent_1)
         tx_parent_2 = self.wallet.create_self_transfer()
-        tx_child_2 = self.wallet.create_self_transfer(utxo_to_spend=tx_parent_2["new_utxo"])
+        tx_child_2 = self.create_child(tx_parent_2)
         peer = node.add_p2p_connection(P2PInterface())
         peer.send_and_ping(msg_tx(tx_child_1["tx"]))
         peer.send_and_ping(msg_tx(tx_child_2["tx"]))
@@ -95,9 +124,9 @@ class OrphanRPCsTest(BitcoinTestFramework):
 
         self.log.info("Create two orphans, from different peers")
         tx_parent_1 = self.wallet.create_self_transfer()
-        tx_child_1 = self.wallet.create_self_transfer(utxo_to_spend=tx_parent_1["new_utxo"])
+        tx_child_1 = self.create_child(tx_parent_1)
         tx_parent_2 = self.wallet.create_self_transfer()
-        tx_child_2 = self.wallet.create_self_transfer(utxo_to_spend=tx_parent_2["new_utxo"])
+        tx_child_2 = self.create_child(tx_parent_2)
         peer_1 = node.add_p2p_connection(P2PInterface())
         peer_2 = node.add_p2p_connection(P2PInterface())
         entry_time = int(time.time())
@@ -142,9 +171,11 @@ class OrphanRPCsTest(BitcoinTestFramework):
         assert_equal(orphan["wtxid"], tx["wtxid"])
 
         self.log.info("Check the sizes of orphan")
+        # QTC: the node weighs PQ witness bytes differently from tx.get_vsize()
+        decoded = self.nodes[0].decoderawtransaction(tx["hex"])
         assert_equal(orphan["bytes"], len(tx["tx"].serialize()))
-        assert_equal(orphan["vsize"], tx["tx"].get_vsize())
-        assert_equal(orphan["weight"], tx["tx"].get_weight())
+        assert_equal(orphan["vsize"], decoded["vsize"])
+        assert_equal(orphan["weight"], decoded["weight"])
 
         if verbosity == 2:
             self.log.info("Check the transaction hex of orphan")

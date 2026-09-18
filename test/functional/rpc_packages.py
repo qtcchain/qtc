@@ -26,13 +26,26 @@ from test_framework.wallet import (
     COIN,
     DEFAULT_FEE,
     MiniWallet,
+    MiniWalletMode,
 )
 
 
 MAX_PACKAGE_COUNT = 25
 
 
+def node_feerate(fee, vsize):
+    """QTC: the node's CFeeRate math (fee * 1000 // vsize, truncated to sat/kvB) in BTC/kvB.
+    P2MR txs are large enough that Decimal division here would neither be exact nor round-trip."""
+    return Decimal(int(fee * COIN) * 1000 // vsize) / COIN
+
+
 class RPCPackagesTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
         self.setup_clean_chain = True
@@ -65,7 +78,7 @@ class RPCPackagesTest(BitcoinTestFramework):
                 "height": 0
             }
 
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
         self.generate(self.wallet, COINBASE_MATURITY + 100)  # blocks generated for inputs
 
         self.log.info("Create some transactions")
@@ -99,7 +112,9 @@ class RPCPackagesTest(BitcoinTestFramework):
         self.assert_testres_equal(self.independent_txns_hex, self.independent_txns_testres)
 
         self.log.info("Test an otherwise valid package with an extra garbage tx appended")
-        address = node.get_deterministic_priv_key().address
+        # QTC: only P2MR/OP_RETURN outputs are standard, so pay the MiniWallet's P2MR address
+        # (a P2PKH output would fail with "scriptpubkey" before the missing-inputs check)
+        address = self.wallet.get_address()
         garbage_tx = node.createrawtransaction([{"txid": "00" * 32, "vout": 5}], {address: 1})
         tx = tx_from_hex(garbage_tx)
         # Only the txid and wtxids are returned because validation is incomplete for the independent txns.
@@ -207,7 +222,8 @@ class RPCPackagesTest(BitcoinTestFramework):
                 parent_coins.append(parent_tx["new_utxo"])
                 package_hex.append(parent_tx["hex"])
 
-            child_tx = self.wallet.create_self_transfer_multi(utxos_to_spend=parent_coins, fee_per_output=2000)
+            # QTC: each P2MR input is ~3.8 kvB on the node, so scale the child's fee with its input count
+            child_tx = self.wallet.create_self_transfer_multi(utxos_to_spend=parent_coins, fee_per_output=2000 * num_parents)
             for _ in range(10):
                 random.shuffle(package_hex)
                 testres_multiple = node.testmempoolaccept(rawtxs=package_hex + [child_tx['hex']])
@@ -288,9 +304,10 @@ class RPCPackagesTest(BitcoinTestFramework):
         assert_equal(testres_replaceable["txid"], replaceable_tx["txid"])
         assert_equal(testres_replaceable["wtxid"], replaceable_tx["wtxid"])
         assert testres_replaceable["allowed"]
-        assert_equal(testres_replaceable["vsize"], replaceable_tx["tx"].get_vsize())
+        replaceable_vsize = node.decoderawtransaction(replaceable_tx["hex"])["vsize"]  # QTC: node vsize != Python vsize
+        assert_equal(testres_replaceable["vsize"], replaceable_vsize)
         assert_equal(testres_replaceable["fees"]["base"], fee)
-        assert_fee_amount(fee, replaceable_tx["tx"].get_vsize(), testres_replaceable["fees"]["effective-feerate"])
+        assert_fee_amount(fee, replaceable_vsize, testres_replaceable["fees"]["effective-feerate"])
         assert_equal(testres_replaceable["fees"]["effective-includes"], [replaceable_tx["wtxid"]])
 
         # Replacement transaction is identical except has double the fee
@@ -358,10 +375,13 @@ class RPCPackagesTest(BitcoinTestFramework):
             assert wtxid in submitpackage_result["tx-results"]
             tx_result = submitpackage_result["tx-results"][wtxid]
             assert_equal(tx_result["txid"], tx.rehash())
-            assert_equal(tx_result["vsize"], tx.get_vsize())
+            vsize = node.decoderawtransaction(package_txn["hex"])["vsize"]  # QTC: node vsize != Python vsize
+            assert_equal(tx_result["vsize"], vsize)
             assert_equal(tx_result["fees"]["base"], DEFAULT_FEE)
             if wtxid not in presubmitted_wtxids:
-                assert_fee_amount(DEFAULT_FEE, tx.get_vsize(), tx_result["fees"]["effective-feerate"])
+                # QTC: multi-input P2MR children are large enough that the feerate's 8-decimal rounding
+                # exceeds assert_fee_amount()'s 2-byte tolerance, so compare exactly
+                assert_equal(tx_result["fees"]["effective-feerate"], node_feerate(DEFAULT_FEE, vsize))
                 assert_equal(tx_result["fees"]["effective-includes"], [wtxid])
 
         # submitpackage result should be consistent with testmempoolaccept and getmempoolentry
@@ -373,6 +393,10 @@ class RPCPackagesTest(BitcoinTestFramework):
 
     def test_submitpackage(self):
         node = self.nodes[0]
+        # QTC: a fresh peer is immediately sent invs for the mempool's unbroadcast set (txs submitted
+        # via RPC while no peer was connected), which would pollute P2PTxInvStore.wait_for_broadcast().
+        # Confirm everything first so the inv-store peers below only see the packages they wait for.
+        self.generate(node, 1)
 
         self.log.info("Submitpackage only allows valid hex inputs")
         valid_tx_list = self.wallet.create_self_transfer_chain(chain_length=2)
@@ -424,7 +448,9 @@ class RPCPackagesTest(BitcoinTestFramework):
 
         self.log.info("Submitpackage maxfeerate arg testing")
         chained_txns = self.wallet.create_self_transfer_chain(chain_length=2)
-        minrate_btc_kvb = min([chained_txn["fee"] / chained_txn["tx"].get_vsize() * 1000 for chained_txn in chained_txns])
+        # QTC: feerates must use the node's vsize (not Python's) and the node's rounding
+        p2mr_vsize = node.decoderawtransaction(chained_txns[0]["hex"])["vsize"]  # node vsize of a 1-in-1-out P2MR spend
+        minrate_btc_kvb = min([node_feerate(chained_txn["fee"], node.decoderawtransaction(chained_txn["hex"])["vsize"]) for chained_txn in chained_txns])
         chain_hex = [t["hex"] for t in chained_txns]
         pkg_result = node.submitpackage(chain_hex, maxfeerate=minrate_btc_kvb - Decimal("0.00000001"))
 
@@ -437,8 +463,12 @@ class RPCPackagesTest(BitcoinTestFramework):
         # Make chain of two transactions where parent doesn't make minfee threshold
         # but child is too high fee
         # Lower mempool limit to make it easier to fill_mempool
+        # QTC: fill_mempool() uses a default-mode (P2TR) MiniWallet, which is non-standard on QTC,
+        # so accept non-standard txs for this section (and raise -limitdescendantsize so -maxmempool=5 is accepted)
         self.restart_node(0, extra_args=[
+            "-acceptnonstdtxn=1",
             "-datacarriersize=100000",
+            "-limitdescendantsize=125",
             "-maxmempool=5",
             "-persistmempool=0",
         ])
@@ -447,13 +477,16 @@ class RPCPackagesTest(BitcoinTestFramework):
         fill_mempool(self, node)
 
         minrelay = node.getmempoolinfo()["minrelaytxfee"]
+        # QTC: fee_rate is applied over the Python vsize, which is ~3.7x smaller than the node's, so set
+        # absolute fees: parent exactly at minrelay (below mempoolminfee, but not below the per-tx relay
+        # floor), child at DEFAULT_FEE so its node feerate is above maxfeerate
         parent = self.wallet.create_self_transfer(
-            fee_rate=minrelay,
+            fee=minrelay * p2mr_vsize / 1000,
             confirmed_only=True,
         )
 
         child = self.wallet.create_self_transfer(
-            fee_rate=DEFAULT_FEE,
+            fee=DEFAULT_FEE * p2mr_vsize / 1000,
             utxo_to_spend=parent["new_utxo"],
         )
 
@@ -492,7 +525,8 @@ class RPCPackagesTest(BitcoinTestFramework):
         assert_raises_rpc_error(-25, "Unspendable output exceeds maximum configured by user", node.submitpackage, chained_burn_hex, 0, chained_txns_burn[1]["new_utxo"]["value"] - Decimal("0.00000001"))
         assert_equal(node.getrawmempool(), [])
 
-        minrate_btc_kvb_burn = min([chained_txn_burn["fee"] / chained_txn_burn["tx"].get_vsize() * 1000 for chained_txn_burn in chained_txns_burn])
+        # QTC: feerates must use the node's vsize (not Python's) and the node's rounding
+        minrate_btc_kvb_burn = min([node_feerate(chained_txn_burn["fee"], node.decoderawtransaction(chained_txn_burn["hex"])["vsize"]) for chained_txn_burn in chained_txns_burn])
 
         # Relax the restrictions for both and send it; parent gets through as own subpackage
         pkg_result = node.submitpackage(chained_burn_hex, maxfeerate=minrate_btc_kvb_burn, maxburnamount=chained_txns_burn[1]["new_utxo"]["value"])

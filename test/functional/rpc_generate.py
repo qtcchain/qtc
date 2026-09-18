@@ -7,8 +7,9 @@
 from concurrent.futures import ThreadPoolExecutor
 
 from test_framework.authproxy import JSONRPCException
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 from test_framework.util import (
     assert_equal,
     assert_raises_rpc_error,
@@ -16,6 +17,12 @@ from test_framework.util import (
 
 
 class RPCGenerateTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
 
@@ -32,7 +39,8 @@ class RPCGenerateTest(BitcoinTestFramework):
 
     def test_generateblock(self):
         node = self.nodes[0]
-        miniwallet = MiniWallet(node)
+        miniwallet = MiniWallet(node, mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(miniwallet, COINBASE_MATURITY + 15)  # QTC: the cached chain has no P2MR coins
 
         def derive_one(descriptor: str) -> str:
             return node.deriveaddresses(node.getdescriptorinfo(descriptor)["descriptor"])[0]
@@ -83,47 +91,38 @@ class RPCGenerateTest(BitcoinTestFramework):
         assert_equal(len(block['tx']), 1)
         assert block['tx'][0]['vout'][0]['scriptPubKey']['address'] in combo_addresses
 
-        can_send_wallet_txs = True
-        try:
-            # Generate some extra mempool transactions to verify they don't get mined
-            for _ in range(10):
-                miniwallet.send_self_transfer(from_node=node)
-        except JSONRPCException as e:
-            if "scriptpubkey" in str(e):
-                can_send_wallet_txs = False
-                self.log.info("Skipping tx-inclusion generateblock checks due chain output-policy restrictions")
-            else:
-                raise
+        # Generate some extra mempool transactions to verify they don't get mined
+        for _ in range(10):
+            miniwallet.send_self_transfer(from_node=node)
 
-        if can_send_wallet_txs:
-            self.log.info('Generate block with txid')
-            txid = miniwallet.send_self_transfer(from_node=node)['txid']
-            hash = self.generateblock(node, address, [txid])['hash']
-            block = node.getblock(hash, 1)
-            assert_equal(len(block['tx']), 2)
-            assert_equal(block['tx'][1], txid)
+        self.log.info('Generate block with txid')
+        txid = miniwallet.send_self_transfer(from_node=node)['txid']
+        hash = self.generateblock(node, address, [txid])['hash']
+        block = node.getblock(hash, 1)
+        assert_equal(len(block['tx']), 2)
+        assert_equal(block['tx'][1], txid)
 
-            self.log.info('Generate block with raw tx')
-            rawtx = miniwallet.create_self_transfer()['hex']
-            hash = self.generateblock(node, address, [rawtx])['hash']
+        self.log.info('Generate block with raw tx')
+        rawtx = miniwallet.create_self_transfer()['hex']
+        hash = self.generateblock(node, address, [rawtx])['hash']
 
-            block = node.getblock(hash, 1)
-            assert_equal(len(block['tx']), 2)
-            txid = block['tx'][1]
-            assert_equal(node.getrawtransaction(txid=txid, verbose=False, blockhash=hash), rawtx)
+        block = node.getblock(hash, 1)
+        assert_equal(len(block['tx']), 2)
+        txid = block['tx'][1]
+        assert_equal(node.getrawtransaction(txid=txid, verbose=False, blockhash=hash), rawtx)
 
-            # Ensure that generateblock can be called concurrently by many threads.
-            self.log.info('Generate blocks in parallel')
-            generate_50_blocks = lambda n: [n.generateblock(output=address, transactions=[]) for _ in range(50)]
-            rpcs = [node.cli for _ in range(6)]
-            with ThreadPoolExecutor(max_workers=len(rpcs)) as threads:
-                list(threads.map(generate_50_blocks, rpcs))
+        # Ensure that generateblock can be called concurrently by many threads.
+        self.log.info('Generate blocks in parallel')
+        generate_50_blocks = lambda n: [n.generateblock(output=address, transactions=[]) for _ in range(50)]
+        rpcs = [node.cli for _ in range(6)]
+        with ThreadPoolExecutor(max_workers=len(rpcs)) as threads:
+            list(threads.map(generate_50_blocks, rpcs))
 
-            self.log.info('Fail to generate block with out of order txs')
-            txid1 = miniwallet.send_self_transfer(from_node=node)['txid']
-            utxo1 = miniwallet.get_utxo(txid=txid1)
-            rawtx2 = miniwallet.create_self_transfer(utxo_to_spend=utxo1)['hex']
-            assert_raises_rpc_error(-25, 'TestBlockValidity failed: bad-txns-inputs-missingorspent', self.generateblock, node, address, [rawtx2, txid1])
+        self.log.info('Fail to generate block with out of order txs')
+        txid1 = miniwallet.send_self_transfer(from_node=node)['txid']
+        utxo1 = miniwallet.get_utxo(txid=txid1)
+        rawtx2 = miniwallet.create_self_transfer(utxo_to_spend=utxo1)['hex']
+        assert_raises_rpc_error(-25, 'TestBlockValidity failed: bad-txns-inputs-missingorspent', self.generateblock, node, address, [rawtx2, txid1])
 
         self.log.info('Fail to generate block with txid not in mempool')
         missing_txid = '0000000000000000000000000000000000000000000000000000000000000000'

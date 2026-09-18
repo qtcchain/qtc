@@ -5,25 +5,14 @@
 """Test dust limit mempool policy (`-dustrelayfee` parameter)"""
 from decimal import Decimal
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     COIN,
     CTxOut,
 )
-from test_framework.blocktools import QTC_MAX_TXOUT_SCRIPT_SIZE
 from test_framework.script import (
     CScript,
     OP_RETURN,
-    OP_TRUE,
-)
-from test_framework.script_util import (
-    key_to_p2pk_script,
-    key_to_p2pkh_script,
-    key_to_p2wpkh_script,
-    keys_to_multisig_script,
-    output_key_to_p2tr_script,
-    program_to_witness_script,
-    script_to_p2sh_script,
-    script_to_p2wsh_script,
 )
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.test_node import TestNode
@@ -31,14 +20,20 @@ from test_framework.util import (
     assert_equal,
     get_fee,
 )
-from test_framework.wallet import MiniWallet
-from test_framework.wallet_util import generate_keypair
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 
 DUST_RELAY_TX_FEE = 3000  # default setting [sat/kvB]
+P2MR_DUST_FUTURE_INPUT_SIZE = 3818  # QTC: see src/policy/policy.h
 
 
 class DustRelayFeeTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, legacy=False)
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
     def set_test_params(self):
         self.num_nodes = 1
         self.extra_args = [['-permitbaremultisig']]
@@ -50,7 +45,8 @@ class DustRelayFeeTest(BitcoinTestFramework):
             dust_threshold = 0
         else:
             tx_size = len(CTxOut(nValue=0, scriptPubKey=output_script).serialize())
-            tx_size += 67 if output_script.IsWitnessProgram() else 148
+            # QTC: a P2MR output needs a ~3.8 kB PQ witness to spend (P2MR_DUST_FUTURE_INPUT_SIZE)
+            tx_size += P2MR_DUST_FUTURE_INPUT_SIZE
             dust_threshold = int(get_fee(tx_size, dust_relay_fee) * COIN)
         self.log.info(f"-> Test {type_desc} output (size {len(output_script)}, limit {dust_threshold})")
 
@@ -58,6 +54,7 @@ class DustRelayFeeTest(BitcoinTestFramework):
         tx = self.wallet.create_self_transfer()["tx"]
         tx.vout.append(CTxOut(nValue=dust_threshold, scriptPubKey=output_script))
         tx.vout[0].nValue -= dust_threshold  # keep total output value constant
+        self.wallet.sign_tx(tx)  # QTC: re-sign after editing outputs
         tx_good_hex = tx.serialize().hex()
         res = node.testmempoolaccept([tx_good_hex])[0]
         assert_equal(res['allowed'], True)
@@ -65,6 +62,7 @@ class DustRelayFeeTest(BitcoinTestFramework):
         # amount just below the dust threshold should fail
         if dust_threshold > 0:
             tx.vout[1].nValue -= 1
+            self.wallet.sign_tx(tx)
             res = node.testmempoolaccept([tx.serialize().hex()])[0]
             assert_equal(res['allowed'], False)
             assert_equal(res['reject-reason'], 'dust')
@@ -76,6 +74,7 @@ class DustRelayFeeTest(BitcoinTestFramework):
         self.log.info("Test that small outputs are acceptable when dust relay rate is set to 0 that would otherwise trigger ephemeral dust rules")
 
         self.restart_node(0, extra_args=["-dustrelayfee=0"])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)  # QTC: rebind the node wallet RPC after restart
 
         assert_equal(self.nodes[0].getrawmempool(), [])
 
@@ -97,31 +96,21 @@ class DustRelayFeeTest(BitcoinTestFramework):
 
         # Wipe extra arg to reset dust relay
         self.restart_node(0, extra_args=[])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)  # QTC: rebind the node wallet RPC after restart
 
         assert_equal(self.nodes[0].getrawmempool(), [])
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
 
         self.test_dustrelay()
 
-        # prepare output scripts of each standard type
-        _, uncompressed_pubkey = generate_keypair(compressed=False)
-        _, pubkey = generate_keypair(compressed=True)
-
+        # QTC relay policy only accepts witness v2 P2MR and OP_RETURN outputs
+        # (every other script type is rejected as "scriptpubkey"), so those are
+        # the only output types whose dust limit is reachable.
         output_scripts = (
-            (key_to_p2pk_script(uncompressed_pubkey),          "P2PK (uncompressed)"),
-            (key_to_p2pk_script(pubkey),                       "P2PK (compressed)"),
-            (key_to_p2pkh_script(pubkey),                      "P2PKH"),
-            (script_to_p2sh_script(CScript([OP_TRUE])),        "P2SH"),
-            (key_to_p2wpkh_script(pubkey),                     "P2WPKH"),
-            (script_to_p2wsh_script(CScript([OP_TRUE])),       "P2WSH"),
-            (output_key_to_p2tr_script(pubkey[1:]),            "P2TR"),
-            # witness programs for segwitv2+ can be between 2 and 40 bytes
-            (program_to_witness_script(2,  b'\x66' * 2),       "P2?? (future witness version 2)"),
-            (program_to_witness_script(16, b'\x77' * 40),      "P2?? (future witness version 16)"),
-            # largest possible output script considered standard
-            (keys_to_multisig_script([uncompressed_pubkey]*3), "bare multisig (m-of-3)"),
+            (self.wallet.get_output_script(),                  "P2MR"),
             (CScript([OP_RETURN, b'superimportanthash']),      "null data (OP_RETURN)"),
         )
 
@@ -134,13 +123,9 @@ class DustRelayFeeTest(BitcoinTestFramework):
                 dust_parameter = f"-dustrelayfee={dustfee_btc_kvb:.8f}"
                 self.log.info(f"Test dust limit setting {dust_parameter} ({dustfee_sat_kvb} sat/kvB)...")
                 self.restart_node(0, extra_args=[dust_parameter, "-permitbaremultisig"])
+                self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)  # QTC: rebind the node wallet RPC after restart
 
             for output_script, description in output_scripts:
-                if len(output_script) > QTC_MAX_TXOUT_SCRIPT_SIZE:
-                    self.log.info(
-                        f"-> Skip {description} output (size {len(output_script)} exceeds consensus max {QTC_MAX_TXOUT_SCRIPT_SIZE})"
-                    )
-                    continue
                 self.test_dust_output(self.nodes[0], dustfee_btc_kvb, output_script, description)
             self.generate(self.nodes[0], 1)
 

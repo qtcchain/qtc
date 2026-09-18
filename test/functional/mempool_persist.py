@@ -40,25 +40,31 @@ import os
 import time
 
 from test_framework.p2p import P2PTxInvStore
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
     assert_greater_than_or_equal,
     assert_raises_rpc_error,
 )
-from test_framework.wallet import MiniWallet, COIN
+from test_framework.wallet import MiniWallet, MiniWalletMode, COIN
 
 
 class MempoolPersistTest(BitcoinTestFramework):
     def add_options(self, parser):
         self.add_wallet_options(parser, legacy=False)
 
+    def skip_test_if_missing_module(self):
+        # QTC: MiniWallet ADDRESS_P2MR spends wallet-signed P2MR coins
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 3
         self.extra_args = [[], ["-persistmempool=0"], []]
 
     def run_test(self):
-        self.mini_wallet = MiniWallet(self.nodes[2])
+        self.mini_wallet = MiniWallet(self.nodes[2], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.mini_wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
         if self.is_sqlite_compiled():
             self.nodes[2].createwallet(
                 wallet_name="watch",

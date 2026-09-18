@@ -17,6 +17,7 @@ from test_framework.p2p import (
     P2PInterface,
     P2P_SERVICES,
 )
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_approx,
@@ -25,7 +26,10 @@ from test_framework.util import (
     assert_raises_rpc_error,
     p2p_port,
 )
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
+
+# QTC: service bits that test_framework.messages does not define (see src/protocol.h)
+QTC_SERVICE_FLAGS = {"NODE_SHIELDED": (1 << 8)}
 
 
 def assert_net_servicesnames(servicesflag, servicenames):
@@ -37,7 +41,8 @@ def assert_net_servicesnames(servicesflag, servicenames):
     """
     servicesflag_generated = 0
     for servicename in servicenames:
-        servicesflag_generated |= getattr(test_framework.messages, 'NODE_' + servicename.rstrip('?'))
+        name = 'NODE_' + servicename.rstrip('?')
+        servicesflag_generated |= getattr(test_framework.messages, name, QTC_SERVICE_FLAGS.get(name))
     assert servicesflag_generated == servicesflag
 
 
@@ -60,6 +65,12 @@ def seed_addrman(node):
 
 
 class NetTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 2
         self.extra_args = [["-minrelaytxfee=0.00001000"], ["-minrelaytxfee=0.00000500"]]
@@ -70,7 +81,8 @@ class NetTest(BitcoinTestFramework):
 
     def run_test(self):
         # We need miniwallet to make a transaction
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
 
         # By default, the test framework sets up an addnode connection from
         # node 1 --> node0. By connecting node0 --> node 1, we're left with
@@ -172,6 +184,8 @@ class NetTest(BitcoinTestFramework):
                 "relaytxes": False,
                 "services": "0000000000000000",
                 "servicesnames": [],
+                "shieldeddata_rate_limited": 0,  # QTC
+                "shieldedtx_rate_limited": 0,  # QTC
                 "session_id": "" if not self.options.v2transport else no_version_peer.v2_state.peer['session_id'].hex(),
                 "startingheight": -1,
                 "subver": "",
@@ -315,7 +329,7 @@ class NetTest(BitcoinTestFramework):
         assert_greater_than(10000, len(node_addresses))
         for a in node_addresses:
             assert_greater_than(a["time"], 1527811200)  # 1st June 2018
-            assert_equal(a["services"], P2P_SERVICES)
+            assert_equal(a["services"], test_framework.messages.NODE_NETWORK | test_framework.messages.NODE_WITNESS)  # QTC: addpeeraddress services (no NODE_MATMUL_CONSENSUS)
             assert a["address"] in imported_addrs
             assert_equal(a["port"], 8333)
             assert_equal(a["network"], "ipv4")
@@ -326,7 +340,7 @@ class NetTest(BitcoinTestFramework):
         assert_equal(res[0]["address"], ipv6_addr)
         assert_equal(res[0]["network"], "ipv6")
         assert_equal(res[0]["port"], 8333)
-        assert_equal(res[0]["services"], P2P_SERVICES)
+        assert_equal(res[0]["services"], test_framework.messages.NODE_NETWORK | test_framework.messages.NODE_WITNESS)  # QTC: addpeeraddress services
 
         # Test for the absence of onion, I2P and CJDNS addresses.
         for network in ["onion", "i2p", "cjdns"]:

@@ -24,10 +24,16 @@ from test_framework.blocktools import (
     NORMAL_GBT_REQUEST_PARAMS,
 )
 from test_framework.util import assert_equal
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 import copy
 
 class MutatedBlocksTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.setup_clean_chain = True
         self.num_nodes = 1
@@ -38,7 +44,7 @@ class MutatedBlocksTest(BitcoinTestFramework):
         ]
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
         self.generate(self.wallet, COINBASE_MATURITY)
 
         honest_relayer = self.nodes[0].add_outbound_p2p_connection(P2PInterface(), p2p_idx=0, connection_type="outbound-full-relay")

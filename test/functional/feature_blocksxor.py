@@ -4,6 +4,7 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test support for XORed block data and undo files (`-blocksxor` option)."""
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.test_node import (
     ErrorMatch,
@@ -14,22 +15,30 @@ from test_framework.util import (
     assert_greater_than,
     util_xor,
 )
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 
 class BlocksXORTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
         self.extra_args = [[
             '-blocksxor=1',
             '-fastprune=1',             # use smaller block files
             '-datacarriersize=100000',  # needed to pad transaction with MiniWallet
+            '-dustrelayfee=0',          # QTC: MiniWallet padding outputs are below the P2MR dust threshold
         ]]
 
     def run_test(self):
         self.log.info("Mine some blocks, to create multiple blk*.dat/rev*.dat files")
         node = self.nodes[0]
-        wallet = MiniWallet(node)
+        wallet = MiniWallet(node, mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(wallet, COINBASE_MATURITY + 5)  # QTC: the cached chain has no P2MR coins
         for _ in range(5):
             wallet.send_self_transfer(from_node=node, target_vsize=20000)
             self.generate(wallet, 1)

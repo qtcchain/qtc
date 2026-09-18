@@ -4,18 +4,27 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test resurrection of mined transactions when the blockchain is re-organized."""
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 
 class MempoolCoinbaseTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser)
+
+    def skip_test_if_missing_module(self):
+        # QTC: MiniWallet ADDRESS_P2MR spends wallet-signed P2MR coins
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
 
     def run_test(self):
         node = self.nodes[0]
-        wallet = MiniWallet(node)
+        wallet = MiniWallet(node, mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(wallet, COINBASE_MATURITY + 6)  # QTC: the cached chain has no P2MR coins
 
         # Spend block 1/2/3's coinbase transactions
         # Mine a block

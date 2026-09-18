@@ -10,6 +10,7 @@ that spend (directly or indirectly) coinbase transactions.
 
 import time
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     CInv,
     MSG_WTX,
@@ -21,9 +22,16 @@ from test_framework.p2p import (
 )
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 class MempoolCoinbaseTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser)
+
+    def skip_test_if_missing_module(self):
+        # QTC: MiniWallet ADDRESS_P2MR spends wallet-signed P2MR coins
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 2
         self.extra_args = [
@@ -38,6 +46,9 @@ class MempoolCoinbaseTest(BitcoinTestFramework):
         # Prevent time from moving forward
         self.nodes[1].setmocktime(int(time.time()))
         self.connect_nodes(0, 1)
+        # QTC: block times run at MTP+1 (ahead of the wall clock) here, so mining on the
+        # invalidated tip would recreate the identical invalid block; move node0's clock past it
+        self.nodes[0].setmocktime(self.nodes[0].getblockheader(self.nodes[0].getbestblockhash())["time"] + 1)
         self.generate(self.wallet, 3)
 
         # Disconnect node0 and node1 to create different chains.
@@ -109,15 +120,17 @@ class MempoolCoinbaseTest(BitcoinTestFramework):
             assert_equal(peer1.last_message["tx"], last_tx_received)
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
         wallet = self.wallet
 
         # Start with a 200 block chain
         assert_equal(self.nodes[0].getblockcount(), 200)
+        # QTC: the cached chain has no P2MR coins, so mine our own on top of it
+        first_block = self.nodes[0].getblockcount() + 1
+        self.generate(self.wallet, COINBASE_MATURITY + 25)
 
         self.log.info("Add 4 coinbase utxos to the miniwallet")
-        # Block 76 contains the first spendable coinbase txs.
-        first_block = 76
+        # Block first_block contains the first spendable P2MR coinbase txs.
 
         # Three scenarios for re-orging coinbase spends in the memory pool:
         # 1. Direct coinbase spend  :  spend_1

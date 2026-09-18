@@ -18,6 +18,7 @@ from test_framework.blocktools import (
     create_block,
     create_coinbase,
 )
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     msg_pong,
     msg_tx,
@@ -28,7 +29,7 @@ from test_framework.p2p import (
 )
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 
 class SlowP2PDataStore(P2PDataStore):
@@ -44,6 +45,12 @@ class SlowP2PInterface(P2PInterface):
 
 
 class P2PEvict(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
         # The choice of maxconnections=32 results in a maximum of 21 inbound connections
@@ -55,7 +62,8 @@ class P2PEvict(BitcoinTestFramework):
         protected_peers = set()  # peers that we expect to be protected from eviction
         current_peer = -1
         node = self.nodes[0]
-        self.wallet = MiniWallet(node)
+        self.wallet = MiniWallet(node, mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
 
         self.log.info("Create 4 peers and protect them from eviction by sending us a block")
         for _ in range(4):

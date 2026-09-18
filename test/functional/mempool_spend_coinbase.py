@@ -12,20 +12,30 @@ in the next block are accepted into the memory pool,
 but less mature coinbase spends are NOT.
 """
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 
 class MempoolSpendCoinbaseTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser)
+
+    def skip_test_if_missing_module(self):
+        # QTC: MiniWallet ADDRESS_P2MR spends wallet-signed P2MR coins
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
 
     def run_test(self):
-        wallet = MiniWallet(self.nodes[0])
+        wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        # QTC: the cached chain has no P2MR coins; mine our own coinbases on top of it
+        self.generate(wallet, COINBASE_MATURITY + 2)
 
         # Invalidate two blocks, so that miniwallet has access to a coin that will mature in the next block
-        chain_height = 198
+        chain_height = self.nodes[0].getblockcount() - 2
         self.nodes[0].invalidateblock(self.nodes[0].getblockhash(chain_height + 1))
         assert_equal(chain_height, self.nodes[0].getblockcount())
 

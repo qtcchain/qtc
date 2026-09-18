@@ -22,6 +22,7 @@ from test_framework.util import (
 from test_framework.wallet_util import generate_keypair
 from test_framework.wallet import (
     MiniWallet,
+    MiniWalletMode,
     getnewdestination,
 )
 
@@ -53,7 +54,7 @@ class RpcCreateMultiSigTest(BitcoinTestFramework):
 
     def run_test(self):
         node0, node1, _node2 = self.nodes
-        self.wallet = MiniWallet(test_node=node0)
+        self.wallet = MiniWallet(test_node=node0, mode=MiniWalletMode.ADDRESS_P2MR)
 
         probe_pubkeys = [
             "03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd",

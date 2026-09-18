@@ -7,23 +7,18 @@
 import time
 
 from test_framework.blocktools import (
+    COINBASE_MATURITY,
     NORMAL_GBT_REQUEST_PARAMS,
     add_witness_commitment,
     create_block,
-    script_to_p2wsh_script,
 )
 from test_framework.messages import (
     COIN,
     COutPoint,
     CTransaction,
     CTxIn,
-    CTxInWitness,
     CTxOut,
     tx_from_hex,
-)
-from test_framework.script import (
-    CScript,
-    OP_TRUE,
 )
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
@@ -32,9 +27,10 @@ from test_framework.util import (
     assert_raises_rpc_error,
     softfork_active,
 )
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
-SCRIPT_W0_SH_OP_TRUE = script_to_p2wsh_script(CScript([OP_TRUE]))
+# QTC: only P2MR outputs are standard, so every hand-built tx below pays back
+# to the MiniWallet and is signed by it instead of using an OP_TRUE witness.
 
 SEQUENCE_LOCKTIME_DISABLE_FLAG = (1<<31)
 SEQUENCE_LOCKTIME_TYPE_FLAG = (1<<22) # this means use time (0 means height)
@@ -50,18 +46,28 @@ class BIP68Test(BitcoinTestFramework):
 
     def set_test_params(self):
         self.num_nodes = 2
+        # QTC: Python-built blocks (create_block) carry no MatMul product
+        # payload, so lift that consensus requirement for this regtest run
+        qtc_args = [
+            '-regtestmatmulproductdigestheight=2147483647',
+            '-regtestmatmulrequireproductpayload=0',
+        ]
         self.extra_args = [
             [
                 '-testactivationheight=csv@432',
-            ],
+            ] + qtc_args,
             [
                 '-testactivationheight=csv@432',
-            ],
+            ] + qtc_args,
         ]
 
     def run_test(self):
         self.relayfee = self.nodes[0].getnetworkinfo()["relayfee"]
-        self.wallet = MiniWallet(self.nodes[0])
+        # QTC: the node weighs a P2MR spend at ~3873 vB, so use a flat per-tx
+        # fee (10x the per-kvB relay fee) for the hand-built transactions below
+        self.txfee = self.relayfee * 10
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
 
         self.log.info("Running test disable flag")
         self.test_disable_flag()
@@ -91,14 +97,14 @@ class BIP68Test(BitcoinTestFramework):
         utxo = self.wallet.send_self_transfer(from_node=self.nodes[0])["new_utxo"]
 
         tx1 = CTransaction()
-        value = int((utxo["value"] - self.relayfee) * COIN)
+        value = int((utxo["value"] - self.txfee) * COIN)
 
         # Check that the disable flag disables relative locktime.
         # If sequence locks were used, this would require 1 block for the
         # input to mature.
         sequence_value = SEQUENCE_LOCKTIME_DISABLE_FLAG | 1
         tx1.vin = [CTxIn(COutPoint(int(utxo["txid"], 16), utxo["vout"]), nSequence=sequence_value)]
-        tx1.vout = [CTxOut(value, SCRIPT_W0_SH_OP_TRUE)]
+        tx1.vout = [CTxOut(value, self.wallet.get_output_script())]
 
         self.wallet.sign_tx(tx=tx1)
         tx1_id = self.wallet.sendrawtransaction(from_node=self.nodes[0], tx_hex=tx1.serialize().hex())
@@ -110,16 +116,15 @@ class BIP68Test(BitcoinTestFramework):
         tx2.version = 2
         sequence_value = sequence_value & 0x7fffffff
         tx2.vin = [CTxIn(COutPoint(tx1_id, 0), nSequence=sequence_value)]
-        tx2.wit.vtxinwit = [CTxInWitness()]
-        tx2.wit.vtxinwit[0].scriptWitness.stack = [CScript([OP_TRUE])]
-        tx2.vout = [CTxOut(int(value - self.relayfee * COIN), SCRIPT_W0_SH_OP_TRUE)]
-        tx2.rehash()
+        tx2.vout = [CTxOut(int(value - self.txfee * COIN), self.wallet.get_output_script())]
+        self.wallet.sign_tx(tx=tx2)
 
         assert_raises_rpc_error(-26, NOT_FINAL_ERROR, self.wallet.sendrawtransaction, from_node=self.nodes[0], tx_hex=tx2.serialize().hex())
 
         # Setting the version back down to 1 should disable the sequence lock,
         # so this should be accepted.
         tx2.version = 1
+        self.wallet.sign_tx(tx=tx2)  # QTC: the signature commits to the version
 
         self.wallet.sendrawtransaction(from_node=self.nodes[0], tx_hex=tx2.serialize().hex())
 
@@ -200,9 +205,9 @@ class BIP68Test(BitcoinTestFramework):
                         sequence_value |= SEQUENCE_LOCKTIME_TYPE_FLAG
                 tx.vin.append(CTxIn(COutPoint(int(utxos[j]["txid"], 16), utxos[j]["vout"]), nSequence=sequence_value))
                 value += utxos[j]["value"]*COIN
-            # Overestimate the size of the tx - signatures should be less than 120 bytes, and leave 50 for the output
-            tx_size = len(tx.serialize().hex())//2 + 120*num_inputs + 50
-            tx.vout.append(CTxOut(int(value - self.relayfee * tx_size * COIN / 1000), SCRIPT_W0_SH_OP_TRUE))
+            # Overestimate the size of the tx - QTC weighs each PQ witness at ~3873 vB, and leave 50 for the output
+            tx_size = len(tx.serialize().hex())//2 + 4000*num_inputs + 50
+            tx.vout.append(CTxOut(int(value - self.relayfee * tx_size * COIN / 1000), self.wallet.get_output_script()))
             self.wallet.sign_tx(tx=tx)
 
             if (using_sequence_locks and not should_pass):
@@ -232,7 +237,7 @@ class BIP68Test(BitcoinTestFramework):
         tx2 = CTransaction()
         tx2.version = 2
         tx2.vin = [CTxIn(COutPoint(tx1.sha256, 0), nSequence=0)]
-        tx2.vout = [CTxOut(int(tx1.vout[0].nValue - self.relayfee * COIN), SCRIPT_W0_SH_OP_TRUE)]
+        tx2.vout = [CTxOut(int(tx1.vout[0].nValue - self.txfee * COIN), self.wallet.get_output_script())]
         self.wallet.sign_tx(tx=tx2)
         tx2_raw = tx2.serialize().hex()
         tx2.rehash()
@@ -242,7 +247,7 @@ class BIP68Test(BitcoinTestFramework):
         # Create a spend of the 0th output of orig_tx with a sequence lock
         # of 1, and test what happens when submitting.
         # orig_tx.vout[0] must be an anyone-can-spend output
-        def test_nonzero_locks(orig_tx, node, relayfee, use_height_lock):
+        def test_nonzero_locks(orig_tx, node, txfee, use_height_lock):
             sequence_value = 1
             if not use_height_lock:
                 sequence_value |= SEQUENCE_LOCKTIME_TYPE_FLAG
@@ -250,10 +255,8 @@ class BIP68Test(BitcoinTestFramework):
             tx = CTransaction()
             tx.version = 2
             tx.vin = [CTxIn(COutPoint(orig_tx.sha256, 0), nSequence=sequence_value)]
-            tx.wit.vtxinwit = [CTxInWitness()]
-            tx.wit.vtxinwit[0].scriptWitness.stack = [CScript([OP_TRUE])]
-            tx.vout = [CTxOut(int(orig_tx.vout[0].nValue - relayfee * COIN), SCRIPT_W0_SH_OP_TRUE)]
-            tx.rehash()
+            tx.vout = [CTxOut(int(orig_tx.vout[0].nValue - txfee * COIN), self.wallet.get_output_script())]
+            self.wallet.sign_tx(tx=tx)
 
             if (orig_tx.hash in node.getrawmempool()):
                 # sendrawtransaction should fail if the tx is in the mempool
@@ -264,12 +267,12 @@ class BIP68Test(BitcoinTestFramework):
 
             return tx
 
-        test_nonzero_locks(tx2, self.nodes[0], self.relayfee, use_height_lock=True)
-        test_nonzero_locks(tx2, self.nodes[0], self.relayfee, use_height_lock=False)
+        test_nonzero_locks(tx2, self.nodes[0], self.txfee, use_height_lock=True)
+        test_nonzero_locks(tx2, self.nodes[0], self.txfee, use_height_lock=False)
 
         # Now mine some blocks, but make sure tx2 doesn't get mined.
         # Use prioritisetransaction to lower the effective feerate to 0
-        self.nodes[0].prioritisetransaction(txid=tx2.hash, fee_delta=int(-self.relayfee*COIN))
+        self.nodes[0].prioritisetransaction(txid=tx2.hash, fee_delta=int(-self.txfee*COIN))
         cur_time = int(time.time())
         for _ in range(10):
             self.nodes[0].setmocktime(cur_time + 600)
@@ -278,11 +281,11 @@ class BIP68Test(BitcoinTestFramework):
 
         assert tx2.hash in self.nodes[0].getrawmempool()
 
-        test_nonzero_locks(tx2, self.nodes[0], self.relayfee, use_height_lock=True)
-        test_nonzero_locks(tx2, self.nodes[0], self.relayfee, use_height_lock=False)
+        test_nonzero_locks(tx2, self.nodes[0], self.txfee, use_height_lock=True)
+        test_nonzero_locks(tx2, self.nodes[0], self.txfee, use_height_lock=False)
 
         # Mine tx2, and then try again
-        self.nodes[0].prioritisetransaction(txid=tx2.hash, fee_delta=int(self.relayfee*COIN))
+        self.nodes[0].prioritisetransaction(txid=tx2.hash, fee_delta=int(self.txfee*COIN))
 
         # Advance the time on the node so that we can test timelocks
         self.nodes[0].setmocktime(cur_time+600)
@@ -293,21 +296,21 @@ class BIP68Test(BitcoinTestFramework):
 
         # Now that tx2 is not in the mempool, a sequence locked spend should
         # succeed
-        tx3 = test_nonzero_locks(tx2, self.nodes[0], self.relayfee, use_height_lock=False)
+        tx3 = test_nonzero_locks(tx2, self.nodes[0], self.txfee, use_height_lock=False)
         assert tx3.hash in self.nodes[0].getrawmempool()
 
         self.generate(self.nodes[0], 1)
         assert tx3.hash not in self.nodes[0].getrawmempool()
 
         # One more test, this time using height locks
-        tx4 = test_nonzero_locks(tx3, self.nodes[0], self.relayfee, use_height_lock=True)
+        tx4 = test_nonzero_locks(tx3, self.nodes[0], self.txfee, use_height_lock=True)
         assert tx4.hash in self.nodes[0].getrawmempool()
 
         # Now try combining confirmed and unconfirmed inputs
-        tx5 = test_nonzero_locks(tx4, self.nodes[0], self.relayfee, use_height_lock=True)
+        tx5 = test_nonzero_locks(tx4, self.nodes[0], self.txfee, use_height_lock=True)
         assert tx5.hash not in self.nodes[0].getrawmempool()
 
-        utxo = self.wallet.get_utxo()
+        utxo = self.wallet.get_utxo(confirmed_only=True)  # QTC: tx4's output may be the largest coin
         tx5.vin.append(CTxIn(COutPoint(int(utxo["txid"], 16), utxo["vout"]), nSequence=1))
         tx5.vout[0].nValue += int(utxo["value"]*COIN)
         self.wallet.sign_tx(tx=tx5)
@@ -335,7 +338,8 @@ class BIP68Test(BitcoinTestFramework):
             block = create_block(tmpl=tmpl, ntime=cur_time)
             block.solve()
             tip = block.sha256
-            assert_equal(None if i == 1 else 'inconclusive', self.nodes[0].submitblock(block.serialize().hex()))
+            # QTC: fork choice may already prefer the first competing block
+            assert self.nodes[0].submitblock(block.serialize().hex()) in ([None] if i == 1 else [None, 'inconclusive'])
             tmpl = self.nodes[0].getblocktemplate(NORMAL_GBT_REQUEST_PARAMS)
             tmpl['previousblockhash'] = '%x' % tip
             tmpl['transactions'] = []
@@ -364,7 +368,7 @@ class BIP68Test(BitcoinTestFramework):
         tx2 = CTransaction()
         tx2.version = 1
         tx2.vin = [CTxIn(COutPoint(tx1.sha256, 0), nSequence=0)]
-        tx2.vout = [CTxOut(int(tx1.vout[0].nValue - self.relayfee * COIN), SCRIPT_W0_SH_OP_TRUE)]
+        tx2.vout = [CTxOut(int(tx1.vout[0].nValue - self.txfee * COIN), self.wallet.get_output_script())]
 
         # sign tx2
         self.wallet.sign_tx(tx=tx2)
@@ -380,10 +384,8 @@ class BIP68Test(BitcoinTestFramework):
         tx3 = CTransaction()
         tx3.version = 2
         tx3.vin = [CTxIn(COutPoint(tx2.sha256, 0), nSequence=sequence_value)]
-        tx3.wit.vtxinwit = [CTxInWitness()]
-        tx3.wit.vtxinwit[0].scriptWitness.stack = [CScript([OP_TRUE])]
-        tx3.vout = [CTxOut(int(tx2.vout[0].nValue - self.relayfee * COIN), SCRIPT_W0_SH_OP_TRUE)]
-        tx3.rehash()
+        tx3.vout = [CTxOut(int(tx2.vout[0].nValue - self.txfee * COIN), self.wallet.get_output_script())]
+        self.wallet.sign_tx(tx=tx3)
 
         assert_raises_rpc_error(-26, NOT_FINAL_ERROR, self.wallet.sendrawtransaction, from_node=self.nodes[0], tx_hex=tx3.serialize().hex())
 
@@ -409,7 +411,7 @@ class BIP68Test(BitcoinTestFramework):
 
     # Use self.nodes[1] to test that version 2 transactions are standard.
     def test_version2_relay(self):
-        mini_wallet = MiniWallet(self.nodes[1])
+        mini_wallet = MiniWallet(self.nodes[1], mode=MiniWalletMode.ADDRESS_P2MR)
         mini_wallet.send_self_transfer(from_node=self.nodes[1], version=2)
 
 

@@ -5,6 +5,7 @@
 
 from decimal import Decimal
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     COIN,
     CTxOut,
@@ -18,9 +19,16 @@ from test_framework.util import (
 )
 from test_framework.wallet import (
     MiniWallet,
+    MiniWalletMode,
 )
 
 class EphemeralDustTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, legacy=False)
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
     def set_test_params(self):
         # Mempools should match via 1P1C p2p relay
         self.num_nodes = 2
@@ -66,7 +74,8 @@ class EphemeralDustTest(BitcoinTestFramework):
     def run_test(self):
 
         node = self.nodes[0]
-        self.wallet = MiniWallet(node)
+        self.wallet = MiniWallet(node, mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
 
         self.test_normal_dust()
         self.test_sponsor_cycle()

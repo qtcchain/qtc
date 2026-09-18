@@ -16,6 +16,7 @@ from collections import OrderedDict
 from decimal import Decimal
 from itertools import product
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     MAX_BIP125_RBF_SEQUENCE,
     COIN,
@@ -38,6 +39,7 @@ from test_framework.util import (
 from test_framework.wallet import (
     getnewdestination,
     MiniWallet,
+    MiniWalletMode,
 )
 
 
@@ -64,7 +66,7 @@ class multidict(dict):
 
 class RawTransactionsTest(BitcoinTestFramework):
     def add_options(self, parser):
-        self.add_wallet_options(parser, descriptors=False)
+        self.add_wallet_options(parser)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet; legacy-only parts are gated below
 
     def set_test_params(self):
         self.num_nodes = 3
@@ -82,13 +84,8 @@ class RawTransactionsTest(BitcoinTestFramework):
         self.connect_nodes(0, 2)
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
-        probe_tx_hex = self.wallet.create_self_transfer()["tx"].serialize().hex()
-        probe = self.nodes[0].testmempoolaccept([probe_tx_hex])[0]
-        if not probe.get("allowed", False) and probe.get("reject-reason") == "scriptpubkey":
-            self.run_qtc_p2mr_rawtransaction_smoke()
-            return
-
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
         self.getrawtransaction_tests()
         self.createrawtransaction_tests()
         self.sendrawtransaction_tests()
@@ -99,29 +96,6 @@ class RawTransactionsTest(BitcoinTestFramework):
             self.import_deterministic_coinbase_privkeys()
             self.raw_multisig_transaction_legacy_tests()
         self.getrawtransaction_verbosity_tests()
-
-    def run_qtc_p2mr_rawtransaction_smoke(self):
-        self.log.info("QTC policy mode: MiniWallet default script type is non-standard; running rawtransaction smoke coverage.")
-
-        node0 = self.nodes[0]
-        node1 = self.nodes[1]
-
-        # Mine a block and exercise getrawtransaction with explicit blockhash.
-        [block_hash] = self.generate(node1, 1)
-        coinbase_txid = node1.getblock(block_hash, 2)["tx"][0]["txid"]
-        coinbase_hex = node0.getrawtransaction(coinbase_txid, False, block_hash)
-        assert_equal(node0.getrawtransaction(coinbase_txid, True, block_hash)["txid"], coinbase_txid)
-        assert_equal(node0.decoderawtransaction(coinbase_hex)["txid"], coinbase_txid)
-
-        # Ensure raw-creation/decoding paths still function in QTC policy mode.
-        raw = node0.createrawtransaction([], {"data": "01"})
-        decoded_raw = node0.decoderawtransaction(raw)
-        assert_equal(decoded_raw["vin"], [])
-        assert_equal(decoded_raw["vout"][0]["scriptPubKey"]["type"], "nulldata")
-
-        # Invalid-raw submission path remains deterministic.
-        assert_raises_rpc_error(-22, "TX decode failed", node0.sendrawtransaction, "00")
-
 
     def getrawtransaction_tests(self):
         tx = self.wallet.send_self_transfer(from_node=self.nodes[0])
@@ -320,7 +294,7 @@ class RawTransactionsTest(BitcoinTestFramework):
         self.nodes[0].createrawtransaction(inputs=[], outputs={})  # Should not throw for backwards compatibility
         self.nodes[0].createrawtransaction(inputs=[], outputs=[])
         assert_raises_rpc_error(-8, "Data must be hexadecimal string", self.nodes[0].createrawtransaction, [], {'data': 'foo'})
-        assert_raises_rpc_error(-5, "Invalid Bitcoin address", self.nodes[0].createrawtransaction, [], {'foo': 0})
+        assert_raises_rpc_error(-5, "Invalid QTC address", self.nodes[0].createrawtransaction, [], {'foo': 0})
         assert_raises_rpc_error(-3, "Invalid amount", self.nodes[0].createrawtransaction, [], {address: 'foo'})
         assert_raises_rpc_error(-3, "Amount out of range", self.nodes[0].createrawtransaction, [], {address: -1})
         assert_raises_rpc_error(-8, "Invalid parameter, duplicated address: %s" % address, self.nodes[0].createrawtransaction, [], multidict([(address, 1), (address, 1)]))
@@ -369,7 +343,7 @@ class RawTransactionsTest(BitcoinTestFramework):
     def sendrawtransaction_tests(self):
         self.log.info("Test sendrawtransaction with missing input")
         inputs = [{'txid': TXID, 'vout': 1}]  # won't exist
-        address = getnewdestination()[2]
+        address = self.wallet.get_address()  # QTC: output must be P2MR to reach input validation
         outputs = {address: 4.998}
         rawtx = self.nodes[2].createrawtransaction(inputs, outputs)
         assert_raises_rpc_error(-25, "bad-txns-inputs-missingorspent", self.nodes[2].sendrawtransaction, rawtx)
@@ -387,6 +361,7 @@ class RawTransactionsTest(BitcoinTestFramework):
         tx = self.wallet.create_self_transfer()['tx']
         tx_val = 0.001
         tx.vout = [CTxOut(int(Decimal(tx_val) * COIN), CScript([OP_RETURN] + [OP_FALSE] * 30))]
+        self.wallet.sign_tx(tx)  # QTC: re-sign after editing outputs
         tx_hex = tx.serialize().hex()
         assert_raises_rpc_error(-25, max_burn_exceeded, self.nodes[2].sendrawtransaction, tx_hex)
 
@@ -394,6 +369,7 @@ class RawTransactionsTest(BitcoinTestFramework):
         tx = self.wallet.create_self_transfer()['tx']
         tx_val = 0.001
         tx.vout = [CTxOut(int(Decimal(tx_val) * COIN), CScript([OP_FALSE] * 10001))]
+        self.wallet.sign_tx(tx)  # QTC: re-sign after editing outputs
         tx_hex = tx.serialize().hex()
         assert_raises_rpc_error(-25, max_burn_exceeded, self.nodes[2].sendrawtransaction, tx_hex)
 
@@ -401,6 +377,7 @@ class RawTransactionsTest(BitcoinTestFramework):
         tx = self.wallet.create_self_transfer()['tx']
         tx_val = 0.01
         tx.vout = [CTxOut(int(Decimal(tx_val) * COIN), CScript([OP_INVALIDOPCODE]))]
+        self.wallet.sign_tx(tx)  # QTC: re-sign after editing outputs
         tx_hex = tx.serialize().hex()
         assert_raises_rpc_error(-25, max_burn_exceeded, self.nodes[2].sendrawtransaction, tx_hex)
 
@@ -408,6 +385,7 @@ class RawTransactionsTest(BitcoinTestFramework):
         tx = self.wallet.create_self_transfer()['tx']
         tx_val = 0.001
         tx.vout = [CTxOut(int(Decimal(tx_val) * COIN), CScript([OP_RETURN] + [OP_FALSE] * 30))]
+        self.wallet.sign_tx(tx)  # QTC: re-sign after editing outputs
         tx_hex = tx.serialize().hex()
         assert_raises_rpc_error(-25, max_burn_exceeded, self.nodes[2].sendrawtransaction, tx_hex, 0, 0.0009)
 
@@ -415,6 +393,7 @@ class RawTransactionsTest(BitcoinTestFramework):
         tx = self.wallet.create_self_transfer()['tx']
         tx_val = 0.001
         tx.vout = [CTxOut(int(Decimal(tx_val) * COIN), CScript([OP_RETURN] + [OP_FALSE] * 30))]
+        self.wallet.sign_tx(tx)  # QTC: re-sign after editing outputs
         tx_hex = tx.serialize().hex()
         self.nodes[2].sendrawtransaction(hexstring=tx_hex, maxfeerate='0', maxburnamount='0.0011')
 
@@ -422,6 +401,7 @@ class RawTransactionsTest(BitcoinTestFramework):
         tx = self.wallet.create_self_transfer()['tx']
         tx_val = 0.001
         tx.vout = [CTxOut(int(Decimal(tx_val) * COIN), CScript([OP_RETURN] + [OP_FALSE] * 30))]
+        self.wallet.sign_tx(tx)  # QTC: re-sign after editing outputs
         tx_hex = tx.serialize().hex()
         self.nodes[2].sendrawtransaction(hexstring=tx_hex, maxfeerate='0', maxburnamount='0.001')
 
@@ -455,7 +435,10 @@ class RawTransactionsTest(BitcoinTestFramework):
 
         # Test a transaction with a large fee.
         # Fee rate is 0.20000000 BTC/kvB
-        tx = self.wallet.create_self_transfer(fee_rate=Decimal("0.20000000"))
+        # QTC: the node weighs the PQ witness more heavily than tx.get_vsize(), so size the fee by the node's vsize
+        utxo = self.wallet.get_utxo()
+        node_vsize = self.nodes[2].decoderawtransaction(self.wallet.create_self_transfer(utxo_to_spend=utxo)["hex"])["vsize"]
+        tx = self.wallet.create_self_transfer(utxo_to_spend=utxo, fee=Decimal("0.20000000") * node_vsize / 1000)
         # Thus, testmempoolaccept should reject
         testres = self.nodes[2].testmempoolaccept([tx['hex']])[0]
         assert_equal(testres['allowed'], False)

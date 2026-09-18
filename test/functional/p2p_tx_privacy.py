@@ -20,6 +20,7 @@ if it was received after spy's version handshake completed.
 5. tx_originator sends tx2
 6. We check that only tx2 is announced on the spy interface
 """
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     msg_wtxidrelay,
     msg_verack,
@@ -31,7 +32,7 @@ from test_framework.p2p import (
     P2PInterface,
 )
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 class P2PTxSpy(P2PInterface):
     def __init__(self):
@@ -48,11 +49,18 @@ class P2PTxSpy(P2PInterface):
         self.wait_until(lambda: len(self.all_invs) == 1 and self.all_invs[0] == expected_inv)
 
 class TxPrivacyTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
 
         tx_originator = self.nodes[0].add_p2p_connection(P2PInterface())
         spy = self.nodes[0].add_p2p_connection(P2PTxSpy(), wait_for_verack=False)

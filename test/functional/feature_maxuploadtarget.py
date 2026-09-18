@@ -24,12 +24,23 @@ from test_framework.p2p import P2PInterface
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
-    mine_large_block,
 )
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 
-UPLOAD_TARGET_MB = 800
+# QTC: MAX_BLOCK_SERIALIZED_SIZE is 24 MB, so the historical block serving
+# buffer is 144 * 24 MB; the target must exceed that or the node never serves
+# historical blocks at all.
+MAX_BLOCK_SERIALIZED_SIZE = 24_000_000
+UPLOAD_TARGET_MB = 4000
+
+
+def mine_large_block(test_framework, mini_wallet, node):
+    # QTC: 14 padded ~66 kvB P2MR self-transfers approach the 1 MB block size
+    # (the generic util helper edits outputs after signing, which breaks P2MR)
+    for _ in range(14):
+        mini_wallet.send_self_transfer(from_node=node, target_vsize=66000)
+    test_framework.generate(node, 1)
 
 
 class TestP2PConn(P2PInterface):
@@ -46,12 +57,19 @@ class TestP2PConn(P2PInterface):
 
 class MaxUploadTest(BitcoinTestFramework):
 
+    def add_options(self, parser):
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.setup_clean_chain = True
         self.num_nodes = 1
         self.extra_args = [[
             f"-maxuploadtarget={UPLOAD_TARGET_MB}M",
             "-datacarriersize=100000",
+            "-dustrelayfee=0",  # QTC: MiniWallet padding outputs are below the P2MR dust threshold
         ]]
         self.supports_cli = False
 
@@ -72,7 +90,7 @@ class MaxUploadTest(BitcoinTestFramework):
         self.nodes[0].setmocktime(old_time)
 
         # Generate some old blocks
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
         self.generate(self.wallet, 130)
 
         # p2p_conns[0] will only request old blocks
@@ -88,9 +106,7 @@ class MaxUploadTest(BitcoinTestFramework):
         mine_large_block(self, self.wallet, self.nodes[0])
 
         # Store the hash; we'll request this later
-        big_old_block = self.nodes[0].getbestblockhash()
-        old_block_size = self.nodes[0].getblock(big_old_block, True)['size']
-        big_old_block = int(big_old_block, 16)
+        big_old_block = int(self.nodes[0].getbestblockhash(), 16)
 
         # Advance to two days ago
         self.nodes[0].setmocktime(int(time.time()) - 2*60*60*24)
@@ -108,14 +124,21 @@ class MaxUploadTest(BitcoinTestFramework):
         getdata_request = msg_getdata()
         getdata_request.inv.append(CInv(MSG_BLOCK, big_old_block))
 
+        # QTC: the block is smaller on the wire than getblock 'size' reports,
+        # so measure the bytes actually sent for one download
+        bytes_sent_before = self.nodes[0].getnettotals()["totalbytessent"]
+        p2p_conns[0].send_and_ping(getdata_request)
+        assert_equal(p2p_conns[0].block_receive_map[big_old_block], 1)
+        old_block_size = self.nodes[0].getnettotals()["totalbytessent"] - bytes_sent_before
+
         max_bytes_per_day = UPLOAD_TARGET_MB * 1024 *1024
-        daily_buffer = 144 * 4000000
+        daily_buffer = 144 * MAX_BLOCK_SERIALIZED_SIZE
         max_bytes_available = max_bytes_per_day - daily_buffer
         success_count = max_bytes_available // old_block_size
 
-        # 576MB will be reserved for relaying new blocks, so expect this to
-        # succeed for ~235 tries.
-        for i in range(success_count):
+        # 3456MB will be reserved for relaying new blocks, so expect this to
+        # succeed for ~700 tries.
+        for i in range(1, success_count):
             p2p_conns[0].send_and_ping(getdata_request)
             assert_equal(p2p_conns[0].block_receive_map[big_old_block], i+1)
 
@@ -134,9 +157,10 @@ class MaxUploadTest(BitcoinTestFramework):
 
         # Requesting the current block on p2p_conns[1] should succeed indefinitely,
         # even when over the max upload target.
-        # We'll try 800 times
+        # QTC: download enough copies to exhaust what is left of the (larger) target
         getdata_request.inv = [CInv(MSG_BLOCK, big_new_block)]
-        for i in range(800):
+        new_block_count = self.nodes[0].getnettotals()["uploadtarget"]["bytes_left_in_cycle"] // old_block_size + 2
+        for i in range(new_block_count):
             p2p_conns[1].send_and_ping(getdata_request)
             assert_equal(p2p_conns[1].block_receive_map[big_new_block], i+1)
 

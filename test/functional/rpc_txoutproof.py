@@ -4,12 +4,9 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test gettxoutproof and verifytxoutproof RPCs."""
 
-from decimal import Decimal
-
-from test_framework.authproxy import JSONRPCException
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     CMerkleBlock,
-    CTxOut,
     from_hex,
 )
 from test_framework.test_framework import BitcoinTestFramework
@@ -17,12 +14,12 @@ from test_framework.util import (
     assert_equal,
     assert_raises_rpc_error,
 )
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 
 class MerkleBlockTest(BitcoinTestFramework):
     def add_options(self, parser):
-        self.add_wallet_options(parser)
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
 
     def set_test_params(self):
         self.num_nodes = 2
@@ -31,44 +28,18 @@ class MerkleBlockTest(BitcoinTestFramework):
             ["-txindex"],
         ]
 
-    def run_test(self):
-        miniwallet = MiniWallet(self.nodes[0])
-        use_node_wallet = False
-        wallet_rpc = None
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
 
-        def ensure_wallet_rpc():
-            nonlocal wallet_rpc
-            if wallet_rpc is not None:
-                return wallet_rpc
-            wallet_name = "rpc_txoutproof_fallback"
-            if wallet_name not in self.nodes[0].listwallets():
-                self.nodes[0].createwallet(wallet_name=wallet_name, descriptors=True)
-            wallet_rpc = self.nodes[0].get_wallet_rpc(wallet_name)
-            return wallet_rpc
+    def run_test(self):
+        miniwallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(miniwallet, COINBASE_MATURITY + 2)  # QTC: the cached chain has no P2MR coins
 
         chain_height = self.nodes[1].getblockcount()
-        assert_equal(chain_height, 200)
+        assert_equal(chain_height, 200 + COINBASE_MATURITY + 2)
 
-        try:
-            txid1 = miniwallet.send_self_transfer(from_node=self.nodes[0])['txid']
-            txid2 = miniwallet.send_self_transfer(from_node=self.nodes[0])['txid']
-        except JSONRPCException as e:
-            # QTC policy may reject MiniWallet's default non-P2MR outputs.
-            if "scriptpubkey" not in str(e):
-                raise
-            use_node_wallet = True
-            wallet = ensure_wallet_rpc()
-
-            def send_miniwallet_to_wallet() -> str:
-                tx = miniwallet.create_self_transfer()
-                tx_obj = tx["tx"]
-                dest_addr = wallet.getnewaddress()
-                dest_script = bytes.fromhex(wallet.getaddressinfo(dest_addr)["scriptPubKey"])
-                tx_obj.vout = [CTxOut(tx_obj.vout[0].nValue, bytearray(dest_script))]
-                return self.nodes[0].sendrawtransaction(tx_obj.serialize().hex())
-
-            txid1 = send_miniwallet_to_wallet()
-            txid2 = send_miniwallet_to_wallet()
+        txid1 = miniwallet.send_self_transfer(from_node=self.nodes[0])['txid']
+        txid2 = miniwallet.send_self_transfer(from_node=self.nodes[0])['txid']
         # This will raise an exception because the transaction is not yet in a block
         assert_raises_rpc_error(-5, "Transaction not yet in block", self.nodes[0].gettxoutproof, [txid1])
 
@@ -107,22 +78,9 @@ class MerkleBlockTest(BitcoinTestFramework):
         del expected_proven['tx'][1]['txid']
         assert_equal(self.nodes[0].verifytxoutproof(proofres['proof'], verify_witness=True), expected_proven)
 
-        if use_node_wallet:
-            wallet = ensure_wallet_rpc()
-            spend_candidates = [u for u in wallet.listunspent() if u["txid"] == txid2]
-            assert spend_candidates
-            txin_spent = spend_candidates[0]
-            spend_amount = txin_spent["amount"] - Decimal("0.0001")
-            raw_tx = wallet.createrawtransaction(
-                [{"txid": txin_spent["txid"], "vout": txin_spent["vout"]}],
-                [{wallet.getnewaddress(): spend_amount}],
-            )
-            signed = wallet.signrawtransactionwithwallet(raw_tx)
-            txid3 = self.nodes[0].sendrawtransaction(signed["hex"])
-        else:
-            txin_spent = miniwallet.get_utxo(txid=txid2)  # Get the change from txid2
-            tx3 = miniwallet.send_self_transfer(from_node=self.nodes[0], utxo_to_spend=txin_spent)
-            txid3 = tx3['txid']
+        txin_spent = miniwallet.get_utxo(txid=txid2)  # Get the change from txid2
+        tx3 = miniwallet.send_self_transfer(from_node=self.nodes[0], utxo_to_spend=txin_spent)
+        txid3 = tx3['txid']
         self.generate(self.nodes[0], 1)
 
         txid_spent = txin_spent["txid"]
@@ -140,10 +98,10 @@ class MerkleBlockTest(BitcoinTestFramework):
         assert_equal(self.nodes[0].verifytxoutproof(self.nodes[0].gettxoutproof([txid_spent], blockhash)), [txid_spent])
         # We can't get the proof if we specify a non-existent block
         assert_raises_rpc_error(-5, "Block not found", self.nodes[0].gettxoutproof, [txid_spent], "0000000000000000000000000000000000000000000000000000000000000000")
-        # We can't get the proof if we only have the header of the specified block
+        # QTC: submitheader is rejected on MatMul chains, so the header-only
+        # ("Block not available") case cannot be set up via RPC.
         block = self.generateblock(self.nodes[0], output="raw(55)", transactions=[], submit=False)
-        self.nodes[0].submitheader(block["hex"])
-        assert_raises_rpc_error(-1, "Block not available (not fully downloaded)", self.nodes[0].gettxoutproof, [txid_spent], block['hash'])
+        assert_raises_rpc_error(-8, "submitheader is not supported", self.nodes[0].submitheader, block["hex"])
         # We can get the proof if the transaction is unspent
         assert_equal(self.nodes[0].verifytxoutproof(self.nodes[0].gettxoutproof([txid_unspent])), [txid_unspent])
         # We can get the proof if we provide a list of transactions and one of them is unspent. The ordering of the list should not matter.

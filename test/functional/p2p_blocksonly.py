@@ -6,20 +6,28 @@
 
 import time
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import msg_tx, msg_inv, CInv, MSG_WTX
 from test_framework.p2p import P2PInterface, P2PTxInvStore
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 
 class P2PBlocksOnly(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
         self.extra_args = [["-blocksonly"]]
 
     def run_test(self):
-        self.miniwallet = MiniWallet(self.nodes[0])
+        self.miniwallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.miniwallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
 
         self.blocksonly_mode_tests()
         self.blocks_relay_conn_tests()
@@ -82,6 +90,8 @@ class P2PBlocksOnly(BitcoinTestFramework):
         self.log.info('Tests with node in normal mode with block-relay-only connections')
         self.restart_node(0, ["-noblocksonly"])  # disables blocks only mode
         assert_equal(self.nodes[0].getnetworkinfo()['localrelay'], True)
+        # QTC: the P2MR MiniWallet signs through the node's RPC, which changed on restart
+        self.miniwallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
 
         # Ensure we disconnect if a block-relay-only connection sends us a transaction
         self.nodes[0].add_outbound_p2p_connection(P2PInterface(), p2p_idx=0, connection_type="block-relay-only")

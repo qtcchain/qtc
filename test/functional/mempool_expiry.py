@@ -12,6 +12,7 @@ definable expiry timeout via the '-mempoolexpiry=<n>' command line argument
 
 from datetime import timedelta
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     COIN,
     DEFAULT_MEMPOOL_EXPIRY_HOURS,
@@ -21,12 +22,18 @@ from test_framework.util import (
     assert_equal,
     assert_raises_rpc_error,
 )
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 CUSTOM_MEMPOOL_EXPIRY = 10  # hours
 
 
 class MempoolExpiryTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, legacy=False)
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
     def set_test_params(self):
         self.num_nodes = 1
 
@@ -101,7 +108,8 @@ class MempoolExpiryTest(BitcoinTestFramework):
         assert_equal(half_expiry_time, node.getmempoolentry(independent_txid)['time'])
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
 
         self.log.info('Test default mempool expiry timeout of %d hours.' %
                       DEFAULT_MEMPOOL_EXPIRY_HOURS)
@@ -110,6 +118,7 @@ class MempoolExpiryTest(BitcoinTestFramework):
         self.log.info('Test custom mempool expiry timeout of %d hours.' %
                       CUSTOM_MEMPOOL_EXPIRY)
         self.restart_node(0, ['-mempoolexpiry=%d' % CUSTOM_MEMPOOL_EXPIRY])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)  # QTC: rebind the node wallet RPC after restart
         self.test_transaction_expiry(CUSTOM_MEMPOOL_EXPIRY)
 
 

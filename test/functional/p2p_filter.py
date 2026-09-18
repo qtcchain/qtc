@@ -6,9 +6,14 @@
 Test BIP 37
 """
 
+import random
+import struct
+
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     CInv,
     COIN,
+    CTxOut,
     MAX_BLOOM_FILTER_SIZE,
     MAX_BLOOM_HASH_FUNCS,
     MSG_WTX,
@@ -28,21 +33,65 @@ from test_framework.p2p import (
     P2P_VERSION,
     p2p_lock,
 )
-from test_framework.script import MAX_SCRIPT_ELEMENT_SIZE
+from test_framework.script import (
+    CScript,
+    MAX_SCRIPT_ELEMENT_SIZE,
+    OP_2,
+)
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.wallet import (
     MiniWallet,
-    getnewdestination,
+    MiniWalletMode,
 )
 
 
+def murmur3_32(seed, data):
+    """MurmurHash3 x86_32, as used by CBloomFilter::Hash."""
+    def rotl32(x, r):
+        return ((x << r) | (x >> (32 - r))) & 0xffffffff
+    c1, c2 = 0xcc9e2d51, 0x1b873593
+    h1 = seed & 0xffffffff
+    nblocks = len(data) // 4
+    for i in range(nblocks):
+        k1 = struct.unpack_from('<I', data, i * 4)[0]
+        k1 = rotl32((k1 * c1) & 0xffffffff, 15) * c2 & 0xffffffff
+        h1 = (rotl32(h1 ^ k1, 13) * 5 + 0xe6546b64) & 0xffffffff
+    tail = data[nblocks * 4:]
+    k1 = 0
+    if len(tail) >= 3:
+        k1 ^= tail[2] << 16
+    if len(tail) >= 2:
+        k1 ^= tail[1] << 8
+    if len(tail) >= 1:
+        k1 ^= tail[0]
+        h1 ^= rotl32((k1 * c1) & 0xffffffff, 15) * c2 & 0xffffffff
+    h1 ^= len(data)
+    h1 = ((h1 ^ (h1 >> 16)) * 0x85ebca6b) & 0xffffffff
+    h1 = ((h1 ^ (h1 >> 13)) * 0xc2b2ae35) & 0xffffffff
+    return h1 ^ (h1 >> 16)
+
+
+def bloom_filter_data(element, *, size, n_hash_funcs, tweak=0):
+    """Return the filter bytes of a CBloomFilter of the given size with just `element` inserted."""
+    data = bytearray(size)
+    for i in range(n_hash_funcs):
+        idx = murmur3_32(i * 0xFBA4C795 + tweak, element) % (size * 8)
+        data[idx >> 3] |= 1 << (idx & 7)
+    return bytes(data)
+
+
+def random_p2mr_scriptpubkey():
+    """A witness v2 output that nobody can spend; the only output type QTC policy relays."""
+    return CScript([OP_2, random.randbytes(32)])
+
+
 class P2PBloomFilter(P2PInterface):
-    # This is a P2SH watch-only wallet
-    watch_script_pubkey = bytes.fromhex('a914ffffffffffffffffffffffffffffffffffffffff87')
-    # The initial filter (n=10, fp=0.000001) with just the above scriptPubKey added
+    # This is a P2MR watch-only wallet (QTC: P2SH outputs are not relayed)
+    watch_program = b'\xff' * 32
+    watch_script_pubkey = bytes(CScript([OP_2, watch_program]))
+    # The initial filter (n=10, fp=0.000001) with just the above witness program added
     watch_filter_init = msg_filterload(
-        data=
-        b'@\x00\x08\x00\x80\x00\x00 \x00\xc0\x00 \x04\x00\x08$\x00\x04\x80\x00\x00 \x00\x00\x00\x00\x80\x00\x00@\x00\x02@ \x00',
+        data=bloom_filter_data(watch_program, size=35, n_hash_funcs=19),
         nHashFuncs=19,
         nTweak=0,
         nFlags=1,
@@ -92,6 +141,12 @@ class P2PBloomFilter(P2PInterface):
 
 
 class FilterTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
         # whitelist peers to speed up tx relay / mempool sync
@@ -99,6 +154,15 @@ class FilterTest(BitcoinTestFramework):
         self.extra_args = [[
             '-peerbloomfilters',
         ]]
+
+    def send_to(self, scriptPubKey, amount):
+        """MiniWallet.send_to, but re-signed: QTC P2MR witnesses commit to the outputs."""
+        tx = self.wallet.create_self_transfer(fee_rate=0)["tx"]
+        tx.vout[0].nValue -= amount + 1000
+        tx.vout.append(CTxOut(amount, scriptPubKey))
+        self.wallet.sign_tx(tx)
+        txid = self.wallet.sendrawtransaction(from_node=self.nodes[0], tx_hex=tx.serialize().hex())
+        return {"txid": txid, "wtxid": tx.getwtxid()}
 
     def generatetoscriptpubkey(self, scriptpubkey):
         """Helper to generate a single block to the given scriptPubKey."""
@@ -138,8 +202,8 @@ class FilterTest(BitcoinTestFramework):
         filter_peer = P2PBloomFilter()
 
         self.log.info("Create two tx before connecting, one relevant to the node another that is not")
-        rel_txid = self.wallet.send_to(from_node=self.nodes[0], scriptPubKey=filter_peer.watch_script_pubkey, amount=1 * COIN)["txid"]
-        irr_result = self.wallet.send_to(from_node=self.nodes[0], scriptPubKey=getnewdestination()[1], amount=2 * COIN)
+        rel_txid = self.send_to(scriptPubKey=filter_peer.watch_script_pubkey, amount=1 * COIN)["txid"]
+        irr_result = self.send_to(scriptPubKey=random_p2mr_scriptpubkey(), amount=2 * COIN)
         irr_txid = irr_result["txid"]
         irr_wtxid = irr_result["wtxid"]
 
@@ -157,7 +221,7 @@ class FilterTest(BitcoinTestFramework):
     def test_frelay_false(self, filter_peer):
         self.log.info("Check that a node with fRelay set to false does not receive invs until the filter is set")
         filter_peer.tx_received = False
-        self.wallet.send_to(from_node=self.nodes[0], scriptPubKey=filter_peer.watch_script_pubkey, amount=9 * COIN)
+        self.send_to(scriptPubKey=filter_peer.watch_script_pubkey, amount=9 * COIN)
         # Sync to make sure the reason filter_peer doesn't receive the tx is not p2p delays
         filter_peer.sync_with_ping()
         assert not filter_peer.tx_received
@@ -179,35 +243,35 @@ class FilterTest(BitcoinTestFramework):
 
         self.log.info('Check that we only receive a merkleblock if the filter does not match a tx in a block')
         filter_peer.tx_received = False
-        block_hash = self.generatetoscriptpubkey(getnewdestination()[1])
+        block_hash = self.generatetoscriptpubkey(random_p2mr_scriptpubkey())
         filter_peer.wait_for_merkleblock(block_hash)
         assert not filter_peer.tx_received
 
         self.log.info('Check that we not receive a tx if the filter does not match a mempool tx')
         filter_peer.merkleblock_received = False
         filter_peer.tx_received = False
-        self.wallet.send_to(from_node=self.nodes[0], scriptPubKey=getnewdestination()[1], amount=7 * COIN)
+        self.send_to(scriptPubKey=random_p2mr_scriptpubkey(), amount=7 * COIN)
         filter_peer.sync_with_ping()
         assert not filter_peer.merkleblock_received
         assert not filter_peer.tx_received
 
         self.log.info('Check that we receive a tx if the filter matches a mempool tx')
         filter_peer.merkleblock_received = False
-        txid = self.wallet.send_to(from_node=self.nodes[0], scriptPubKey=filter_peer.watch_script_pubkey, amount=9 * COIN)["txid"]
+        txid = self.send_to(scriptPubKey=filter_peer.watch_script_pubkey, amount=9 * COIN)["txid"]
         filter_peer.wait_for_tx(txid)
         assert not filter_peer.merkleblock_received
 
         self.log.info('Check that after deleting filter all txs get relayed again')
         filter_peer.send_and_ping(msg_filterclear())
         for _ in range(5):
-            txid = self.wallet.send_to(from_node=self.nodes[0], scriptPubKey=getnewdestination()[1], amount=7 * COIN)["txid"]
+            txid = self.send_to(scriptPubKey=random_p2mr_scriptpubkey(), amount=7 * COIN)["txid"]
             filter_peer.wait_for_tx(txid)
 
         self.log.info('Check that request for filtered blocks is ignored if no filter is set')
         filter_peer.merkleblock_received = False
         filter_peer.tx_received = False
         with self.nodes[0].assert_debug_log(expected_msgs=['received getdata']):
-            block_hash = self.generatetoscriptpubkey(getnewdestination()[1])
+            block_hash = self.generatetoscriptpubkey(random_p2mr_scriptpubkey())
             filter_peer.wait_for_inv([CInv(MSG_BLOCK, int(block_hash, 16))])
             filter_peer.sync_with_ping()
             assert not filter_peer.merkleblock_received
@@ -223,7 +287,8 @@ class FilterTest(BitcoinTestFramework):
         self.nodes[0].disconnect_p2ps()
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
 
         filter_peer = self.nodes[0].add_p2p_connection(P2PBloomFilter())
         self.log.info('Test filter size limits')

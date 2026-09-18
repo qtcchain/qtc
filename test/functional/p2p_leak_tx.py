@@ -4,13 +4,14 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test transaction upload"""
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import msg_getdata, CInv, MSG_TX, MSG_WTX
 from test_framework.p2p import p2p_lock, P2PDataStore, P2PTxInvStore
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
 )
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 
 class P2PNode(P2PDataStore):
@@ -19,12 +20,19 @@ class P2PNode(P2PDataStore):
 
 
 class P2PLeakTxTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
 
     def run_test(self):
         self.gen_node = self.nodes[0]  # The block and tx generating node
-        self.miniwallet = MiniWallet(self.gen_node)
+        self.miniwallet = MiniWallet(self.gen_node, mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.miniwallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
 
         self.test_tx_in_block()
         self.test_notfound_on_replaced_tx()
@@ -56,6 +64,7 @@ class P2PLeakTxTest(BitcoinTestFramework):
 
         tx_b = tx_a["tx"]
         tx_b.vout[0].nValue -= 9000
+        self.miniwallet.sign_tx(tx_b)  # QTC: re-sign after editing the output
         self.gen_node.sendrawtransaction(tx_b.serialize().hex())
         inbound_peer.wait_until(lambda: "tx" in inbound_peer.last_message and inbound_peer.last_message.get("tx").tx.getwtxid() == tx_b.getwtxid())
 

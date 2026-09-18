@@ -20,7 +20,7 @@ from test_framework.util import (
     assert_raises_rpc_error,
 )
 from test_framework.wallet_util import test_address
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 NOT_A_NUMBER_OR_STRING = "Amount is not a number or string"
 OUT_OF_RANGE = "Amount out of range"
@@ -844,7 +844,7 @@ class WalletTest(BitcoinTestFramework):
     def test_chain_listunspent(self):
         if not self.options.descriptors:
             return
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
         self.nodes[0].get_wallet_rpc(self.default_wallet_name).sendtoaddress(self.wallet.get_address(), "5")
         self.generate(self.wallet, 1, sync_fun=self.no_op)
         self.nodes[0].createwallet("watch_wallet", disable_private_keys=True)

@@ -32,11 +32,18 @@ from test_framework.util import (
 )
 from test_framework.wallet import (
     MiniWallet,
+    MiniWalletMode,
     getnewdestination,
 )
 
 
 class CoinStatsIndexTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.setup_clean_chain = True
         self.num_nodes = 2
@@ -47,7 +54,7 @@ class CoinStatsIndexTest(BitcoinTestFramework):
         ]
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
         self._test_coin_stats_index()
         self._test_use_index_option()
         self._test_reorg_index()

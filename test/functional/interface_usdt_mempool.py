@@ -24,7 +24,7 @@ from test_framework.util import (
     assert_equal,
     bpf_cflags,
 )
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 MEMPOOL_TRACEPOINTS_PROGRAM = """
 # include <uapi/linux/ptrace.h>
@@ -149,11 +149,15 @@ class MempoolReplaced(ctypes.Structure):
 
 
 class MempoolTracepointTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, legacy=False)
+
     def set_test_params(self):
         self.num_nodes = 1
         self.setup_clean_chain = True
 
     def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
         self.skip_if_platform_not_linux()
         self.skip_if_no_bitcoind_tracepoints()
         self.skip_if_no_python_bcc()
@@ -190,7 +194,7 @@ class MempoolTracepointTest(BitcoinTestFramework):
         assert_equal(1, len(events))
         event = events[0]
         assert_equal(bytes(event.hash)[::-1].hex(), tx["txid"])
-        assert_equal(event.vsize, tx["tx"].get_vsize())
+        assert_equal(event.vsize, node.decoderawtransaction(tx["hex"])["vsize"])  # QTC: node vsize weighs PQ witness bytes
         assert_equal(event.fee, fee)
 
         bpf.cleanup()
@@ -235,7 +239,7 @@ class MempoolTracepointTest(BitcoinTestFramework):
         event = events[0]
         assert_equal(bytes(event.hash)[::-1].hex(), txid)
         assert_equal(event.reason.decode("UTF-8"), "expiry")
-        assert_equal(event.vsize, tx["tx"].get_vsize())
+        assert_equal(event.vsize, node.decoderawtransaction(tx["hex"])["vsize"])  # QTC: node vsize weighs PQ witness bytes
         assert_equal(event.fee, fee)
         assert_equal(event.entry_time, entry_time)
 
@@ -281,11 +285,11 @@ class MempoolTracepointTest(BitcoinTestFramework):
         assert_equal(1, len(events))
         event = events[0]
         assert_equal(bytes(event.replaced_hash)[::-1].hex(), original_tx["txid"])
-        assert_equal(event.replaced_vsize, original_tx["tx"].get_vsize())
+        assert_equal(event.replaced_vsize, node.decoderawtransaction(original_tx["hex"])["vsize"])
         assert_equal(event.replaced_fee, original_fee)
         assert_equal(event.replaced_entry_time, entry_time)
         assert_equal(bytes(event.replacement_hash)[::-1].hex(), replacement_tx["txid"])
-        assert_equal(event.replacement_vsize, replacement_tx["tx"].get_vsize())
+        assert_equal(event.replacement_vsize, node.decoderawtransaction(replacement_tx["hex"])["vsize"])
         assert_equal(event.replacement_fee, replacement_fee)
         assert_equal(event.replaced_by_transaction, True)
 
@@ -334,7 +338,7 @@ class MempoolTracepointTest(BitcoinTestFramework):
 
         # Create some coinbase transactions and mature them so they can be spent
         node = self.nodes[0]
-        self.wallet = MiniWallet(node)
+        self.wallet = MiniWallet(node, mode=MiniWalletMode.ADDRESS_P2MR)
         self.generate(self.wallet, 4)
         self.generate(node, COINBASE_MATURITY)
 

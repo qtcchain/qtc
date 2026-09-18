@@ -4,11 +4,13 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test the scantxoutset rpc call."""
 from test_framework.address import address_to_scriptpubkey
-from test_framework.messages import COIN
+from test_framework.blocktools import COINBASE_MATURITY
+from test_framework.messages import COIN, CTxOut
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
 from test_framework.wallet import (
     MiniWallet,
+    MiniWalletMode,
     getnewdestination,
 )
 
@@ -20,20 +22,34 @@ def descriptors(out):
 
 
 class ScantxoutsetTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
+        # QTC: the scanned destinations are not P2MR, so the node must accept non-standard outputs
+        self.extra_args = [["-acceptnonstdtxn=1"]]
 
-    def sendtodestination(self, destination, amount):
+    def sendtodestination(self, destination, amount, fee=1000):
         # interpret strings as addresses, assume scriptPubKey otherwise
         if isinstance(destination, str):
             destination = address_to_scriptpubkey(destination)
-        self.wallet.send_to(from_node=self.nodes[0], scriptPubKey=destination, amount=int(COIN * amount))
+        # QTC: like MiniWallet.send_to(), but re-sign after appending the output
+        tx = self.wallet.create_self_transfer(fee_rate=0)["tx"]
+        tx.vout[0].nValue -= (int(COIN * amount) + fee)
+        tx.vout.append(CTxOut(int(COIN * amount), destination))
+        self.wallet.sign_tx(tx)
+        self.wallet.sendrawtransaction(from_node=self.nodes[0], tx_hex=tx.serialize().hex())
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
 
         self.log.info("Test if we find coinbase outputs.")
-        assert_equal(sum(u["coinbase"] for u in self.nodes[0].scantxoutset("start", [self.wallet.get_descriptor()])["unspents"]), 49)
+        assert_equal(sum(u["coinbase"] for u in self.nodes[0].scantxoutset("start", [self.wallet.get_descriptor()])["unspents"]), COINBASE_MATURITY + 25)
 
         self.log.info("Create UTXOs...")
         pubk1, spk_P2SH_SEGWIT, addr_P2SH_SEGWIT = getnewdestination("p2sh-segwit")

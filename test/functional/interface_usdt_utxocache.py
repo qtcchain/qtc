@@ -13,13 +13,14 @@ try:
     from bcc import BPF, USDT # type: ignore[import]
 except ImportError:
     pass
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import COIN
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
     bpf_cflags,
 )
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 utxocache_changes_program = """
 #include <uapi/linux/ptrace.h>
@@ -140,19 +141,24 @@ class UTXOCacheFlush(ctypes.Structure):
 
 
 class UTXOCacheTracepointTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, legacy=False)
+
     def set_test_params(self):
         self.setup_clean_chain = False
         self.num_nodes = 1
         self.extra_args = [["-txindex"]]
 
     def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
         self.skip_if_platform_not_linux()
         self.skip_if_no_bitcoind_tracepoints()
         self.skip_if_no_python_bcc()
         self.skip_if_no_bpf_permissions()
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
 
         self.test_uncache()
         self.test_add_spent()

@@ -20,6 +20,7 @@ from test_framework.blocktools import (
     create_coinbase,
 )
 from test_framework.test_framework import BitcoinTestFramework
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     CBlock,
     hash256,
@@ -34,6 +35,7 @@ from test_framework.util import (
 )
 from test_framework.wallet import (
     MiniWallet,
+    MiniWalletMode,
 )
 from test_framework.netutil import test_ipv6_local, test_unix_socket
 
@@ -130,7 +132,8 @@ class ZMQTest (BitcoinTestFramework):
         self.skip_if_no_bitcoind_zmq()
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
         self.ctx = zmq.Context()
         try:
             self.test_basic()
@@ -159,6 +162,7 @@ class ZMQTest (BitcoinTestFramework):
             subscribers.append(ZMQSubscriber(socket, topic.encode()))
 
         self.restart_node(0, [f"-zmqpub{topic}={address.replace('ipc://', 'unix:')}" for topic, address in services])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)  # QTC: rebind the node wallet RPC after restart
 
         for i, sub in enumerate(subscribers):
             sub.socket.connect(services[i][1])
@@ -203,6 +207,7 @@ class ZMQTest (BitcoinTestFramework):
 
         # Invalid zmq arguments don't take down the node, see #17185.
         self.restart_node(0, ["-zmqpubrawtx=foo", "-zmqpubhashtx=bar"])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)  # QTC: rebind the node wallet RPC after restart
 
         address = f"tcp://127.0.0.1:{self.zmq_port_base}"
 

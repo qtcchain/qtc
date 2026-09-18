@@ -7,18 +7,35 @@ from decimal import Decimal
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
-from test_framework.messages import COIN
+from test_framework.messages import COIN, CTxOut
 from test_framework.wallet import MiniWallet, MiniWalletMode, getnewdestination
 
 
 class GetBlocksActivityTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
         self.setup_clean_chain = True
+        # QTC: the queried destinations are not P2MR, so the node must accept non-standard outputs
+        self.extra_args = [["-acceptnonstdtxn=1"]]
+
+    def send_to(self, wallet, scriptPubKey, amount, fee=1000):
+        # QTC: like MiniWallet.send_to(), but re-sign after appending the output
+        tx = wallet.create_self_transfer(fee_rate=0)["tx"]
+        tx.vout[0].nValue -= (amount + fee)
+        tx.vout.append(CTxOut(amount, scriptPubKey))
+        wallet.sign_tx(tx)
+        txid = wallet.sendrawtransaction(from_node=self.nodes[0], tx_hex=tx.serialize().hex())
+        return {"txid": txid, "sent_vout": 1}
 
     def run_test(self):
         node = self.nodes[0]
-        wallet = MiniWallet(node)
+        wallet = MiniWallet(node, mode=MiniWalletMode.ADDRESS_P2MR)
         node.setmocktime(node.getblockheader(node.getbestblockhash())['time'])
         self.generate(wallet, 200)
 
@@ -42,7 +59,7 @@ class GetBlocksActivityTest(BitcoinTestFramework):
     def test_activity_in_block(self, node, wallet):
         self.log.info("Test that receive activity is correctly reported in a mined block")
         _, spk_1, addr_1 = getnewdestination(address_type='bech32m')
-        txid = wallet.send_to(from_node=node, scriptPubKey=spk_1, amount=1 * COIN)['txid']
+        txid = self.send_to(wallet, spk_1, 1 * COIN)['txid']
         blockhash = self.generate(node, 1)[0]
 
         # Test getdescriptoractivity with the specific blockhash
@@ -72,11 +89,10 @@ class GetBlocksActivityTest(BitcoinTestFramework):
     def test_no_mempool_inclusion(self, node, wallet):
         self.log.info("Test that mempool transactions are not included when include_mempool argument is False")
         _, spk_1, addr_1 = getnewdestination()
-        wallet.send_to(from_node=node, scriptPubKey=spk_1, amount=1 * COIN)
+        self.send_to(wallet, spk_1, 1 * COIN)
 
         _, spk_2, addr_2 = getnewdestination()
-        wallet.send_to(
-            from_node=node, scriptPubKey=spk_2, amount=1 * COIN)
+        self.send_to(wallet, spk_2, 1 * COIN)
 
         # Do not generate a block to keep the transaction in the mempool
 
@@ -88,8 +104,8 @@ class GetBlocksActivityTest(BitcoinTestFramework):
         self.log.info("Test querying multiple addresses returns all activity correctly")
         _, spk_1, addr_1 = getnewdestination()
         _, spk_2, addr_2 = getnewdestination()
-        wallet.send_to(from_node=node, scriptPubKey=spk_1, amount=1 * COIN)
-        wallet.send_to(from_node=node, scriptPubKey=spk_2, amount=2 * COIN)
+        self.send_to(wallet, spk_1, 1 * COIN)
+        self.send_to(wallet, spk_2, 2 * COIN)
 
         blockhash = self.generate(node, 1)[0]
 
@@ -122,7 +138,7 @@ class GetBlocksActivityTest(BitcoinTestFramework):
         self.generate(node, 20) # Generate to get more fees
 
         _, spk_1, addr_1 = getnewdestination()
-        wallet.send_to(from_node=node, scriptPubKey=spk_1, amount=1 * COIN)
+        self.send_to(wallet, spk_1, 1 * COIN)
 
         invalid_blockhash = "0000000000000000000000000000000000000000000000000000000000000000"
 
@@ -144,13 +160,11 @@ class GetBlocksActivityTest(BitcoinTestFramework):
         self.generate(node, 20) # Generate to get more fees
 
         _, spk_1, addr_1 = getnewdestination()
-        txid_1 = wallet.send_to(
-            from_node=node, scriptPubKey=spk_1, amount=1 * COIN)['txid']
+        txid_1 = self.send_to(wallet, spk_1, 1 * COIN)['txid']
         blockhash = self.generate(node, 1)[0]
 
         _, spk_2, to_addr = getnewdestination()
-        txid_2 = wallet.send_to(
-            from_node=node, scriptPubKey=spk_2, amount=1 * COIN)['txid']
+        txid_2 = self.send_to(wallet, spk_2, 1 * COIN)['txid']
 
         result = node.getdescriptoractivity(
             [blockhash], [f"addr({addr_1})", f"addr({to_addr})"], True)

@@ -8,7 +8,8 @@ from test_framework.blockfilter import (
     bip158_basic_element_hash,
     bip158_relevant_scriptpubkeys,
 )
-from test_framework.messages import COIN
+from test_framework.blocktools import COINBASE_MATURITY
+from test_framework.messages import COIN, CTxOut
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
@@ -16,29 +17,44 @@ from test_framework.util import (
 )
 from test_framework.wallet import (
     MiniWallet,
+    MiniWalletMode,
     getnewdestination,
 )
 
 
 class ScanblocksTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 2
-        self.extra_args = [["-blockfilterindex=1"], []]
+        # QTC: the scanned destinations are not P2MR, so node0 must accept non-standard outputs
+        self.extra_args = [["-blockfilterindex=1", "-acceptnonstdtxn=1"], []]
+
+    def send_to(self, wallet, scriptPubKey, amount, fee=1000):
+        # QTC: like MiniWallet.send_to(), but re-sign after appending the output
+        tx = wallet.create_self_transfer(fee_rate=0)["tx"]
+        tx.vout[0].nValue -= (amount + fee)
+        tx.vout.append(CTxOut(amount, scriptPubKey))
+        wallet.sign_tx(tx)
+        wallet.sendrawtransaction(from_node=self.nodes[0], tx_hex=tx.serialize().hex())
 
     def run_test(self):
         node = self.nodes[0]
-        wallet = MiniWallet(node)
+        wallet = MiniWallet(node, mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(wallet, COINBASE_MATURITY + 2)  # QTC: the cached chain has no P2MR coins
 
         # send 1.0, mempool only
         _, spk_1, addr_1 = getnewdestination()
-        wallet.send_to(from_node=node, scriptPubKey=spk_1, amount=1 * COIN)
+        self.send_to(wallet, spk_1, 1 * COIN)
 
         parent_key = "tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B"
         # send 1.0, mempool only
         # childkey 5 of `parent_key`
-        wallet.send_to(from_node=node,
-                       scriptPubKey=address_to_scriptpubkey("mkS4HXoTYWRTescLGaUTGbtTTYX5EjJyEE"),
-                       amount=1 * COIN)
+        self.send_to(wallet, address_to_scriptpubkey("mkS4HXoTYWRTescLGaUTGbtTTYX5EjJyEE"), 1 * COIN)
 
         # mine a block and assure that the mined blockhash is in the filterresult
         blockhash = self.generate(node, 1)[0]
@@ -91,8 +107,8 @@ class ScanblocksTest(BitcoinTestFramework):
         assert_equal(len(genesis_spks), 1)
         genesis_coinbase_spk = list(genesis_spks)[0]
         # Precomputed collision for QTC regtest genesis blockhash:
-        # 5b7ffeb9cabf3fb88e036e7fb0b6115fbcdd60d2a9389f70bff5744b1b83223d
-        false_positive_spk = bytes.fromhex("00140000000000000000000000000000000000041fd0")
+        # 25d0b1c272072b56bb0e79aea8566b16378648775e7a517d9d022720f6a1fca6
+        false_positive_spk = bytes.fromhex("00140000000000000000000000000000000000000813")
 
         genesis_coinbase_hash = bip158_basic_element_hash(genesis_coinbase_spk, 1, genesis_blockhash)
         false_positive_hash = bip158_basic_element_hash(false_positive_spk, 1, genesis_blockhash)

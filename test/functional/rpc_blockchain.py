@@ -37,6 +37,7 @@ from test_framework.blocktools import (
 )
 from test_framework.messages import (
     CBlockHeader,
+    msg_headers,
     COIN,
     from_hex,
     msg_block,
@@ -62,6 +63,12 @@ TIME_RANGE_MTP = TIME_GENESIS_BLOCK + (HEIGHT - 6) * TIME_RANGE_STEP
 TIME_RANGE_TIP = TIME_GENESIS_BLOCK + (HEIGHT - 1) * TIME_RANGE_STEP
 TIME_RANGE_END = TIME_GENESIS_BLOCK + HEIGHT * TIME_RANGE_STEP
 class BlockchainTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.setup_clean_chain = True
         self.num_nodes = 1
@@ -69,7 +76,7 @@ class BlockchainTest(BitcoinTestFramework):
 
     def run_test(self):
         # Use a standard script template for mempool policy compatibility.
-        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.RAW_P2PKH)
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
         self._test_prune_disk_space()
         self.mine_chain()
         self._test_max_future_block_time()
@@ -139,7 +146,9 @@ class BlockchainTest(BitcoinTestFramework):
             'matmulvalidationmode',
             'mediantime',
             'pruned',
+            'shielded_retention',  # QTC
             'size_on_disk',
+            'snapshot_sync',  # QTC
             'target',
             'time',
             'verificationprogress',
@@ -651,25 +660,15 @@ class BlockchainTest(BitcoinTestFramework):
         fee_per_byte = Decimal('0.00000010')
         fee_per_kb = 1000 * fee_per_byte
 
-        # QTC policy only relays WITNESS_V2_P2MR/OP_RETURN outputs, while
-        # this test wallet uses RAW_P2PKH for broad script compatibility.
-        # Mine the signed transaction directly in a block to exercise getblock
-        # verbosity/fee semantics without relying on mempool relay policy.
-        tx = self.wallet.create_self_transfer(fee_rate=fee_per_kb)["tx"]
-        best_hash = node.getbestblockhash()
-        best_block = node.getblock(best_hash)
-        block_template = node.getblocktemplate({"rules": ["segwit"]})
-        block_time = max(best_block["time"] + 1, block_template["curtime"])
-        block = create_block(
-            int(best_hash, 16),
-            create_coinbase(best_block["height"] + 1),
-            block_time,
-            version=block_template["version"],
-            txlist=[tx],
-        )
-        block.solve()
-        assert_equal(node.submitblock(block.serialize().hex()), None)
-        blockhash = block.hash
+        # QTC: re-create the MiniWallet so its node-wallet RPC is valid after the
+        # restarts above, then derive the fee from the node-reported vsize, since
+        # the node weighs the PQ witness more heavily than tx.get_vsize().
+        self.wallet = MiniWallet(node, mode=MiniWalletMode.ADDRESS_P2MR)
+        utxo = self.wallet.get_utxo()
+        probe = self.wallet.create_self_transfer(utxo_to_spend=utxo)
+        node_vsize = node.decoderawtransaction(probe["hex"])["vsize"]
+        self.wallet.send_self_transfer(fee=node_vsize * fee_per_byte, utxo_to_spend=utxo, from_node=node)
+        blockhash = self.generate(node, 1)[0]
 
         def assert_hexblock_hashes(verbosity):
             block = node.getblock(blockhash, verbosity)
@@ -756,7 +755,11 @@ class BlockchainTest(BitcoinTestFramework):
         block_time = node.getblock(node.getbestblockhash())['time'] + 1
         block = create_block(int(blockhash, 16), create_coinbase(current_height + 1, nValue=100), block_time)
         block.solve()
-        node.submitheader(block.serialize().hex())
+        # QTC: submitheader is rejected on MatMul chains; relay the header over P2P instead
+        peer = node.add_p2p_connection(P2PInterface())
+        peer.send_and_ping(msg_headers([CBlockHeader(block)]))
+        self.wait_until(lambda: node.getblockchaininfo()["headers"] == current_height + 1)
+        peer.peer_disconnect()
         assert_raises_rpc_error(-1, "Block not available (not fully downloaded)", lambda: node.getblock(block.hash))
 
         self.log.info("Test getblock when block data is available but undo data isn't")

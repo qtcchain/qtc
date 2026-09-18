@@ -12,6 +12,7 @@ import random
 import time
 import urllib.parse
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     COIN,
 )
@@ -23,11 +24,15 @@ from test_framework.util import (
     assert_raises_rpc_error,
     satoshi_round,
 )
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 MAX_FILE_AGE = 60
 SECONDS_PER_HOUR = 60 * 60
 target_success_threshold = 0.8
+# QTC: vsize the node assigns to a 1-in-1-out P2MR self-transfer (the PQ
+# witness is weighed more heavily than in tx.get_vsize()); feerates in this
+# test are expressed against the node's view so estimates match exactly.
+P2MR_NODE_VSIZE = 3873
 
 def small_txpuzzle_randfee(
     wallet, from_node, conflist, unconflist, amount, min_fee, fee_increment, batch_reqs
@@ -64,7 +69,7 @@ def small_txpuzzle_randfee(
     tx.vout[0].nValue = int((total_in - amount - fee) * COIN)
     tx.vout.append(deepcopy(tx.vout[0]))
     tx.vout[1].nValue = int(amount * COIN)
-    tx.rehash()
+    wallet.sign_tx(tx)  # QTC: re-sign after editing the outputs
     txid = tx.hash
     tx_hex = tx.serialize().hex()
 
@@ -72,7 +77,8 @@ def small_txpuzzle_randfee(
     unconflist.append({"txid": txid, "vout": 0, "value": total_in - amount - fee})
     unconflist.append({"txid": txid, "vout": 1, "value": amount})
 
-    return (tx.get_vsize(), fee)
+    # QTC: report the vsize the node's fee estimator will see
+    return (from_node.decoderawtransaction(tx_hex)["vsize"], fee)
 
 
 def rest_getfee(url, mode, target, status=200):
@@ -148,7 +154,7 @@ def make_tx(wallet, utxo, feerate):
     """Create a 1in-1out transaction with a specific input and feerate (sat/vb)."""
     return wallet.create_self_transfer(
         utxo_to_spend=utxo,
-        fee_rate=Decimal(feerate * 1000) / COIN,
+        fee=Decimal(feerate * P2MR_NODE_VSIZE) / COIN,
     )
 
 def check_fee_estimates_btw_modes(node, expected_conservative, expected_economical):
@@ -177,14 +183,22 @@ def get_feerate_into_mempool(node, kB):
 
 
 class EstimateFeeTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 3
         # whitelist peers to speed up tx relay / mempool sync
         self.noban_tx_relay = True
+        # QTC: P2MR transactions weigh ~12x their upstream counterparts, so the
+        # block weights are scaled to keep the same transactions-per-block ratio
         self.extra_args = [
             ['-rest'],
-            ["-blockmaxweight=72000", "-rest"],
-            ["-blockmaxweight=36000"],
+            ["-blockmaxweight=864000", "-rest"],
+            ["-blockmaxweight=432000"],
         ]
 
     def setup_network(self):
@@ -238,10 +252,10 @@ class EstimateFeeTest(BitcoinTestFramework):
             self.memutxo = newmem
 
     def initial_split(self, node):
-        """Split two coinbase UTxOs into many small coins"""
+        """Split four coinbase UTxOs into many small coins"""
         self.confutxo = self.wallet.send_self_transfer_multi(
             from_node=node,
-            utxos_to_spend=[self.wallet.get_utxo() for _ in range(2)],
+            utxos_to_spend=[self.wallet.get_utxo() for _ in range(4)],  # QTC: 25-coin coinbases
             num_outputs=2048)['new_utxos']
         while len(node.getrawmempool()) > 0:
             self.generate(node, 1, sync_fun=self.no_op)
@@ -504,7 +518,7 @@ class EstimateFeeTest(BitcoinTestFramework):
     def broadcast_and_mine(self, broadcaster, miner, feerate, count):
         """Broadcast and mine some number of transactions with a specified fee rate."""
         for _ in range(count):
-            self.wallet.send_self_transfer(from_node=broadcaster, fee_rate=feerate)
+            self.wallet.send_self_transfer(from_node=broadcaster, fee=feerate * P2MR_NODE_VSIZE / 1000)
         self.sync_mempools()
         self.generate(miner, 1)
 
@@ -532,7 +546,8 @@ class EstimateFeeTest(BitcoinTestFramework):
 
         # Split two coinbases into many small utxos
         self.start_node(0)
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 4, sync_fun=self.no_op)  # QTC: the cached chain has no P2MR coins
         self.initial_split(self.nodes[0])
         self.log.info("Finished splitting")
 

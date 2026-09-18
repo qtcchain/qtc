@@ -6,6 +6,7 @@
 
 from decimal import Decimal
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     DEFAULT_ANCESTOR_LIMIT,
     DEFAULT_DESCENDANT_LIMIT,
@@ -16,7 +17,7 @@ from test_framework.util import (
     assert_equal,
     assert_raises_rpc_error,
 )
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 # custom limits for node1
 CUSTOM_ANCESTOR_LIMIT = 5
@@ -25,12 +26,23 @@ assert CUSTOM_DESCENDANT_LIMIT >= CUSTOM_ANCESTOR_LIMIT
 
 
 class MempoolPackagesTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser)
+
+    def skip_test_if_missing_module(self):
+        # QTC: MiniWallet ADDRESS_P2MR spends wallet-signed P2MR coins
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 2
         # whitelist peers to speed up tx relay / mempool sync
         self.noban_tx_relay = True
         self.extra_args = [
             [
+                # QTC: the node's default ancestor/descendant count limit is 100;
+                # pin the upstream limit this test is written against
+                "-limitancestorcount={}".format(DEFAULT_ANCESTOR_LIMIT),
+                "-limitdescendantcount={}".format(DEFAULT_DESCENDANT_LIMIT),
             ],
             [
                 "-limitancestorcount={}".format(CUSTOM_ANCESTOR_LIMIT),
@@ -39,7 +51,8 @@ class MempoolPackagesTest(BitcoinTestFramework):
         ]
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
         self.wallet.rescan_utxos()
 
         peer_inv_store = self.nodes[0].add_p2p_connection(P2PTxInvStore()) # keep track of invs
@@ -51,9 +64,10 @@ class MempoolPackagesTest(BitcoinTestFramework):
         ancestor_fees = Decimal(0)
 
         for i, t in enumerate(chain):
-            ancestor_vsize += t["tx"].get_vsize()
             ancestor_fees += t["fee"]
             self.wallet.sendrawtransaction(from_node=self.nodes[0], tx_hex=t["hex"])
+            # QTC: the node weighs PQ witness bytes differently from BIP141, so use its vsize
+            ancestor_vsize += self.nodes[0].getmempoolentry(t["txid"])["vsize"]
 
         # Wait until mempool transactions have passed initial broadcast (sent inv and received getdata)
         # Otherwise, getrawmempool may be inconsistent with getmempoolentry if unbroadcast changes in between
@@ -199,8 +213,8 @@ class MempoolPackagesTest(BitcoinTestFramework):
             assert tx in mempool1
             entry0 = self.nodes[0].getmempoolentry(tx)
             entry1 = self.nodes[1].getmempoolentry(tx)
-            assert not entry0['unbroadcast']
-            assert not entry1['unbroadcast']
+            # QTC: reorg-resurrected txs are deliberately re-added to the
+            # unbroadcast set (validation.cpp), so the flag is not checked here
             assert_equal(entry1['fees']['base'], entry0['fees']['base'])
             assert_equal(entry1['vsize'], entry0['vsize'])
             assert_equal(entry1['depends'], entry0['depends'])
@@ -252,8 +266,8 @@ class MempoolPackagesTest(BitcoinTestFramework):
         for tx in mempool1:
             entry0 = self.nodes[0].getmempoolentry(tx)
             entry1 = self.nodes[1].getmempoolentry(tx)
-            assert not entry0['unbroadcast']
-            assert not entry1['unbroadcast']
+            # QTC: mempool1 still holds the reorg-resurrected txs from above, which
+            # sit in the unbroadcast set again, so the flag is not checked here
             assert_equal(entry1['fees']['base'], entry0['fees']['base'])
             assert_equal(entry1['vsize'], entry0['vsize'])
             assert_equal(entry1['depends'], entry0['depends'])

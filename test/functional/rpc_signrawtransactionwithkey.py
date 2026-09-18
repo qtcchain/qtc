@@ -4,8 +4,10 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test transaction signing using the signrawtransactionwithkey RPC."""
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     COIN,
+    CTxOut,
 )
 from test_framework.address import (
     address_to_scriptpubkey,
@@ -20,12 +22,12 @@ from test_framework.util import (
 from test_framework.script_util import (
     key_to_p2pk_script,
     key_to_p2pkh_script,
-    script_to_p2sh_p2wsh_script,
     script_to_p2wsh_script,
 )
 from test_framework.wallet import (
     getnewdestination,
     MiniWallet,
+    MiniWalletMode,
 )
 from test_framework.wallet_util import (
     generate_keypair,
@@ -45,13 +47,26 @@ INPUTS = [
 OUTPUTS = {'mpLQjfK79b7CCV4VMJWEWAj5Mpx8Up5zxB': 0.1}
 
 class SignRawTransactionWithKeyTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
+        # QTC: the funded scripts are not P2MR, so the node must accept non-standard outputs
+        self.extra_args = [["-acceptnonstdtxn=1"]]
 
-    def send_to_address(self, addr, amount):
+    def send_to_address(self, addr, amount, fee=1000):
         script_pub_key = address_to_scriptpubkey(addr)
-        tx = self.wallet.send_to(from_node=self.nodes[0], scriptPubKey=script_pub_key, amount=int(amount * COIN))
-        return tx["txid"], tx["sent_vout"]
+        # QTC: like MiniWallet.send_to(), but re-sign after appending the output
+        tx = self.wallet.create_self_transfer(fee_rate=0)["tx"]
+        tx.vout[0].nValue -= (int(amount * COIN) + fee)
+        tx.vout.append(CTxOut(int(amount * COIN), script_pub_key))
+        self.wallet.sign_tx(tx)
+        txid = self.wallet.sendrawtransaction(from_node=self.nodes[0], tx_hex=tx.serialize().hex())
+        return txid, 1
 
     def assert_signing_completed_successfully(self, signed_tx):
         assert 'errors' not in signed_tx
@@ -74,22 +89,10 @@ class SignRawTransactionWithKeyTest(BitcoinTestFramework):
 
     def witness_script_test(self):
         self.log.info("Test signing transaction to P2SH-P2WSH addresses without wallet")
-        # Create a new P2SH-P2WSH 1-of-1 multisig address:
+        # QTC: createmultisig only builds PQ p2mr multisig, so the legacy
+        # P2SH-P2WSH 1-of-1 multisig case is skipped.
         embedded_privkey, embedded_pubkey = generate_keypair(wif=True)
-        p2sh_p2wsh_address = self.nodes[0].createmultisig(1, [embedded_pubkey.hex()], "p2sh-segwit")
-        # send transaction to P2SH-P2WSH 1-of-1 multisig address
-        self.send_to_address(p2sh_p2wsh_address["address"], 49.999)
-        self.generate(self.nodes[0], 1)
-        # Get the UTXO info from scantxoutset
-        unspent_output = self.nodes[0].scantxoutset('start', [p2sh_p2wsh_address['descriptor']])['unspents'][0]
-        spk = script_to_p2sh_p2wsh_script(p2sh_p2wsh_address['redeemScript']).hex()
-        unspent_output['witnessScript'] = p2sh_p2wsh_address['redeemScript']
-        unspent_output['redeemScript'] = script_to_p2wsh_script(unspent_output['witnessScript']).hex()
-        assert_equal(spk, unspent_output['scriptPubKey'])
-        # Now create and sign a transaction spending that output on node[0], which doesn't know the scripts or keys
-        spending_tx = self.nodes[0].createrawtransaction([unspent_output], {getnewdestination()[2]: Decimal("49.998")})
-        spending_tx_signed = self.nodes[0].signrawtransactionwithkey(spending_tx, [embedded_privkey], [unspent_output])
-        self.assert_signing_completed_successfully(spending_tx_signed)
+        assert_raises_rpc_error(-8, "Only address type 'p2mr' is supported", self.nodes[0].createmultisig, 1, [embedded_pubkey.hex()], "p2sh-segwit")
 
         # Now test with P2PKH and P2PK scripts as the witnessScript
         for tx_type in ['P2PKH', 'P2PK']:  # these tests are order-independent
@@ -97,10 +100,10 @@ class SignRawTransactionWithKeyTest(BitcoinTestFramework):
 
     def keyless_signing_test(self):
         self.log.info("Test that keyless 'signing' of pay-to-anchor input succeeds")
-        [txid, vout] = self.send_to_address(p2a(), 49.999)
+        [txid, vout] = self.send_to_address(p2a(), 24.999)  # QTC: coinbase is 25
         spending_tx = self.nodes[0].createrawtransaction(
             [{"txid": txid, "vout": vout}],
-            [{getnewdestination()[2]: Decimal("49.998")}])
+            [{getnewdestination()[2]: Decimal("24.998")}])
         spending_tx_signed = self.nodes[0].signrawtransactionwithkey(spending_tx, [], [])
         self.assert_signing_completed_successfully(spending_tx_signed)
         assert self.nodes[0].testmempoolaccept([spending_tx_signed["hex"]])[0]["allowed"]
@@ -141,7 +144,8 @@ class SignRawTransactionWithKeyTest(BitcoinTestFramework):
         assert_raises_rpc_error(-22, "TX decode failed. Make sure the tx has at least one input.", self.nodes[0].signrawtransactionwithkey, tx + "00", privkeys)
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
         self.successful_signing_test()
         self.witness_script_test()
         self.keyless_signing_test()

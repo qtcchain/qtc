@@ -91,7 +91,11 @@ class MiniWalletMode(Enum):
     Python ML-DSA signer). Because the witness carries a real post-quantum
     signature, any change to a transaction after create_self_transfer*() must
     be followed by sign_tx(). The pre-mined test chain has no P2MR coins, so
-    tests using this mode must call generate() first.
+    tests using this mode must call generate() first. The node must run with
+    wallet support (add_wallet_options() + skip_if_no_wallet() in the test),
+    and fee_rate maths uses the Python vsize (1039 vB) while the node weighs
+    the same spend at 3873 vB, so fee-rate-sensitive tests should price
+    against the node's vsize.
     """
     ADDRESS_OP_TRUE = 1
     RAW_OP_TRUE = 2
@@ -105,6 +109,8 @@ class MiniWalletMode(Enum):
 # (1316), control block (33)]. Fixed-size PQ signatures make this deterministic.
 P2MR_SELF_TRANSFER_VSIZE = 1039
 P2MR_WALLET_NAME = "miniwallet_p2mr"
+# Smallest non-dust P2MR output at the default -dustrelayfee (3 sat/vB over 43 + 3818 bytes).
+P2MR_MIN_PAD_OUTPUT_VALUE_SAT = 12000
 # Fixed pqhd seed for the default ADDRESS_P2MR key (k=1, like the other modes).
 P2MR_DEFAULT_SEED = (1).to_bytes(32, 'big').hex()
 
@@ -139,8 +145,11 @@ class MiniWallet:
             # tag) imported into a dedicated wallet on the node, so the address is
             # the same on every node and in every test, like the other modes.
             seed = P2MR_DEFAULT_SEED if tag_name is None else hash256(tag_name.encode()).hex()
-            self._wallet_rpc, self._address = self._import_p2mr_wallet(test_node, seed)
+            self._address = self._import_p2mr_wallet(test_node, seed)
             self._scriptPubKey = address_to_scriptpubkey(self._address)
+            # outpoint -> value (sat) of every utxo handed to create_self_transfer_multi,
+            # so sign_tx can supply prevouts for parents the node has not seen yet
+            self._p2mr_prevouts = {}
 
         # When the pre-mined test framework chain is used, it contains coinbase
         # outputs to the MiniWallet's default address in blocks 76-100
@@ -155,7 +164,7 @@ class MiniWallet:
     @staticmethod
     def _import_p2mr_wallet(test_node, seed):
         """Load (or create) the dedicated ADDRESS_P2MR wallet on test_node, import
-        the fixed-seed P2MR descriptor and return (wallet_rpc, address)."""
+        the fixed-seed P2MR descriptor and return its address."""
         desc = f"mr(pqhd({seed}/1h/0h/0/*),pk_slh(pqhd({seed}/1h/0h/0/*)))"
         desc = desc + "#" + test_node.getdescriptorinfo(desc)["checksum"]
         if P2MR_WALLET_NAME not in test_node.listwallets():
@@ -168,8 +177,13 @@ class MiniWallet:
         if desc not in known:
             res = wallet_rpc.importdescriptors([{"desc": desc, "timestamp": 0, "active": False, "range": [0, 0]}])
             assert res[0]["success"], res
-        address = wallet_rpc.deriveaddresses(desc, [0, 0])[0]
-        return wallet_rpc, address
+        return wallet_rpc.deriveaddresses(desc, [0, 0])[0]
+
+    @property
+    def _wallet_rpc(self):
+        # Resolved on every use: a cached proxy would keep a stale auth cookie
+        # across restart_node()/start_nodes().
+        return self._test_node.get_wallet_rpc(P2MR_WALLET_NAME)
 
     def _bulk_tx(self, tx, target_vsize):
         """Pad a transaction with extra outputs until it reaches a target vsize.
@@ -197,7 +211,9 @@ class MiniWallet:
         # script plus at most one capped OP_RETURN output for fine-grained size.
         standard_script_size = len(self._scriptPubKey)
         standard_output_vbytes = 8 + compact_size_len(standard_script_size) + standard_script_size
-        min_pad_output_value_sat = 1000
+        # QTC: P2MR outputs are dust below (43 + P2MR future input size ~3818) * 3 sat/vB
+        # (see GetDustThreshold), so pad with outputs above that threshold in P2MR mode.
+        min_pad_output_value_sat = P2MR_MIN_PAD_OUTPUT_VALUE_SAT if self._mode == MiniWalletMode.ADDRESS_P2MR else 1000
         initial_outputs = len(tx.vout)
         max_standard_outputs = tx.vout[0].nValue // min_pad_output_value_sat
         solution = None
@@ -309,7 +325,13 @@ class MiniWallet:
             # Real PQ signatures: sign via the node wallet that owns the P2MR
             # key. Prevouts are resolved from the chain or the node's mempool.
             tx.wit.vtxinwit = [CTxInWitness() for _ in tx.vin]
-            res = self._wallet_rpc.signrawtransactionwithwallet(tx.serialize().hex())
+            # Supply prevouts we know about, so spends of parents that are not
+            # (yet) in the chain or mempool can still be signed.
+            prevtxs = [{"txid": f"{i.prevout.hash:064x}", "vout": i.prevout.n,
+                        "scriptPubKey": self._scriptPubKey.hex(),
+                        "amount": Decimal(self._p2mr_prevouts[(i.prevout.hash, i.prevout.n)]) / COIN}
+                       for i in tx.vin if (i.prevout.hash, i.prevout.n) in self._p2mr_prevouts]
+            res = self._wallet_rpc.signrawtransactionwithwallet(tx.serialize().hex(), prevtxs)
             assert res["complete"], res
             tx.wit = tx_from_hex(res["hex"]).wit
             tx.rehash()
@@ -406,6 +428,8 @@ class MiniWallet:
         assert_greater_than_or_equal(tx.vout[0].nValue, amount + fee)
         tx.vout[0].nValue -= (amount + fee)           # change output -> MiniWallet
         tx.vout.append(CTxOut(amount, scriptPubKey))  # arbitrary output -> to be returned
+        if self._mode == MiniWalletMode.ADDRESS_P2MR:
+            self.sign_tx(tx)  # real signature commits to the outputs
         txid = self.sendrawtransaction(from_node=from_node, tx_hex=tx.serialize().hex())
         return {
             "sent_vout": 1,
@@ -454,6 +478,9 @@ class MiniWallet:
         # create tx
         tx = CTransaction()
         tx.vin = [CTxIn(COutPoint(int(utxo_to_spend['txid'], 16), utxo_to_spend['vout']), nSequence=seq) for utxo_to_spend, seq in zip(utxos_to_spend, sequence)]
+        if self._mode == MiniWalletMode.ADDRESS_P2MR:
+            for utxo_to_spend in utxos_to_spend:
+                self._p2mr_prevouts[(int(utxo_to_spend['txid'], 16), utxo_to_spend['vout'])] = int(COIN * utxo_to_spend['value'])
         tx.vout = [CTxOut(amount_per_output, bytearray(self._scriptPubKey)) for _ in range(num_outputs)]
         tx.version = version
         tx.nLockTime = locktime

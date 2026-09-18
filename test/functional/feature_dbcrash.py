@@ -40,11 +40,18 @@ from test_framework.util import (
 )
 from test_framework.wallet import (
     MiniWallet,
+    MiniWalletMode,
     getnewdestination,
 )
 
 
 class ChainstateWriteCrashTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 4
         self.rpc_timeout = 480
@@ -203,8 +210,9 @@ class ChainstateWriteCrashTest(BitcoinTestFramework):
             num_transactions += 1
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[3])
+        self.wallet = MiniWallet(self.nodes[3], mode=MiniWalletMode.ADDRESS_P2MR)
         initial_height = self.nodes[3].getblockcount()
+        self.generate(self.wallet, COINBASE_MATURITY + 5, sync_fun=self.no_op)  # QTC: the cached chain has no P2MR coins
         self.generate(self.nodes[3], COINBASE_MATURITY, sync_fun=self.no_op)
 
         # Track test coverage statistics

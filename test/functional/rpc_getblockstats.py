@@ -8,7 +8,14 @@
 #
 
 from test_framework.blocktools import COINBASE_MATURITY
-from test_framework.messages import COIN
+from test_framework.messages import (
+    CBlockHeader,
+    COIN,
+    CTxOut,
+    from_hex,
+    msg_headers,
+)
+from test_framework.p2p import P2PInterface
 from test_framework.script import (
     CScript,
     OP_RETURN,
@@ -20,6 +27,7 @@ from test_framework.util import (
 )
 from test_framework.wallet import (
     MiniWallet,
+    MiniWalletMode,
     getnewdestination,
 )
 import json
@@ -34,6 +42,7 @@ class GetblockstatsTest(BitcoinTestFramework):
     max_stat_pos = 2
 
     def add_options(self, parser):
+        self.add_wallet_options(parser, descriptors=True, legacy=False)  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
         parser.add_argument('--gen-test-data', dest='gen_test_data',
                             default=False, action='store_true',
                             help='Generate test data')
@@ -41,6 +50,9 @@ class GetblockstatsTest(BitcoinTestFramework):
                             default='data/rpc_getblockstats.json',
                             action='store', metavar='FILE',
                             help='Test data file')
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
 
     def set_test_params(self):
         self.num_nodes = 1
@@ -52,22 +64,23 @@ class GetblockstatsTest(BitcoinTestFramework):
 
     def send_to_script(self, wallet, script_pub_key, *, amount_sats, fee_sats, subtract_fee):
         amount_out = amount_sats - fee_sats if subtract_fee else amount_sats
-        assert amount_out > 0
-        wallet.send_to(
-            from_node=self.nodes[0],
-            scriptPubKey=script_pub_key,
-            amount=amount_out,
-            fee=fee_sats,
-        )
+        assert amount_out >= 0
+        # QTC: like MiniWallet.send_to(), but re-sign after appending the output
+        tx = wallet.create_self_transfer(fee_rate=0)["tx"]
+        tx.vout[0].nValue -= (amount_out + fee_sats)
+        tx.vout.append(CTxOut(amount_out, script_pub_key))
+        wallet.sign_tx(tx)
+        wallet.sendrawtransaction(from_node=self.nodes[0], tx_hex=tx.serialize().hex())
 
     def generate_test_data(self, filename):
         mocktime = 1525107225
         self.nodes[0].setmocktime(mocktime)
-        wallet = MiniWallet(self.nodes[0])
+        wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
         self.generatetodescriptor(self.nodes[0], COINBASE_MATURITY + 1, wallet.get_descriptor())
         wallet.rescan_utxos()
 
-        _, recipient_script, _ = getnewdestination()
+        # QTC: recipient must be a standard (P2MR) script; use a tagged MiniWallet's
+        recipient_script = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR, tag_name="recipient").get_output_script()
 
         self.send_to_script(wallet, recipient_script, amount_sats=10 * COIN, fee_sats=1_000, subtract_fee=True)
         self.generatetodescriptor(self.nodes[0], 1, wallet.get_descriptor())
@@ -77,7 +90,7 @@ class GetblockstatsTest(BitcoinTestFramework):
         self.send_to_script(wallet, recipient_script, amount_sats=10 * COIN, fee_sats=1_000, subtract_fee=False)
         self.send_to_script(wallet, recipient_script, amount_sats=1 * COIN, fee_sats=300_000, subtract_fee=True)
         # Send to OP_RETURN output to test its exclusion from statistics
-        wallet.send_to(from_node=self.nodes[0], scriptPubKey=CScript([OP_RETURN, b"\x21"]), amount=0, fee=1_000)
+        self.send_to_script(wallet, CScript([OP_RETURN, b"\x21"]), amount_sats=0, fee_sats=1_000, subtract_fee=False)
         self.sync_all()
         self.generate(self.nodes[0], 1)
 
@@ -210,7 +223,11 @@ class GetblockstatsTest(BitcoinTestFramework):
 
         self.log.info("Test when only header is known")
         block = self.generateblock(self.nodes[0], output="raw(55)", transactions=[], submit=False)
-        self.nodes[0].submitheader(block["hex"])
+        # QTC: submitheader is rejected on MatMul chains; relay the header over P2P instead
+        peer = self.nodes[0].add_p2p_connection(P2PInterface())
+        peer.send_and_ping(msg_headers([from_hex(CBlockHeader(), block["hex"])]))
+        self.wait_until(lambda: self.nodes[0].getblockchaininfo()["headers"] == tip + 1)
+        peer.peer_disconnect()
         assert_raises_rpc_error(-1, "Block not available (not fully downloaded)", lambda: self.nodes[0].getblockstats(block['hash']))
 
         self.log.info('Test when block is missing')

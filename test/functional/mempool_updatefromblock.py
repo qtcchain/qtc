@@ -10,15 +10,24 @@ when transactions have been re-added from a disconnected block to the mempool.
 from math import ceil
 import time
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 
 class MempoolUpdateFromBlockTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser)
+
+    def skip_test_if_missing_module(self):
+        # QTC: MiniWallet ADDRESS_P2MR spends wallet-signed P2MR coins
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
-        self.extra_args = [['-limitdescendantsize=1000', '-limitancestorsize=1000', '-limitancestorcount=100']]
+        # QTC: P2MR inputs carry ~3.8 kvB of PQ witness each (node vsize), so the size limits are raised
+        self.extra_args = [['-limitdescendantsize=10000', '-limitancestorsize=10000', '-limitancestorcount=100']]
 
     def transaction_graph_test(self, size, n_tx_to_mine=None, fee=100_000):
         """Create an acyclic tournament (a type of directed graph) of transactions and use it for testing.
@@ -35,7 +44,8 @@ class MempoolUpdateFromBlockTest(BitcoinTestFramework):
 
         More details: https://en.wikipedia.org/wiki/Tournament_(graph_theory)
         """
-        wallet = MiniWallet(self.nodes[0])
+        wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(wallet, COINBASE_MATURITY + 1)  # QTC: the cached chain has no P2MR coins
         first_block_hash = ''
         tx_id = []
         tx_size = []
@@ -68,7 +78,8 @@ class MempoolUpdateFromBlockTest(BitcoinTestFramework):
                 fee_per_output=ceil(fee / n_outputs)
             )
             tx_id.append(new_tx['txid'])
-            tx_size.append(new_tx['tx'].get_vsize())
+            # QTC: the node weighs PQ witness bytes differently from BIP141, so use its vsize
+            tx_size.append(self.nodes[0].getmempoolentry(new_tx['txid'])['vsize'])
 
             if tx_count in n_tx_to_mine:
                 # The created transactions are mined into blocks by batches.
@@ -99,7 +110,8 @@ class MempoolUpdateFromBlockTest(BitcoinTestFramework):
 
     def run_test(self):
         # Use batch size limited by DEFAULT_ANCESTOR_LIMIT = 25 to not fire "too many unconfirmed parents" error.
-        self.transaction_graph_test(size=100, n_tx_to_mine=[25, 50, 75])
+        # QTC: a smaller tournament keeps the (wallet-signed, ~0.25 s/input) test under a few minutes.
+        self.transaction_graph_test(size=40, n_tx_to_mine=[10, 20, 30])
 
 
 if __name__ == '__main__':

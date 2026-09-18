@@ -7,6 +7,7 @@
    size.
 """
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     DEFAULT_ANCESTOR_LIMIT,
 )
@@ -15,12 +16,22 @@ from test_framework.util import (
     assert_equal,
     assert_raises_rpc_error,
 )
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 
 class MempoolPackagesTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser)
+
+    def skip_test_if_missing_module(self):
+        # QTC: MiniWallet ADDRESS_P2MR spends wallet-signed P2MR coins
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 1
+        # QTC: the node's default ancestor/descendant count limit is 100; pin the
+        # upstream limit this test is written against
+        self.extra_args = [[f"-limitancestorcount={DEFAULT_ANCESTOR_LIMIT}", f"-limitdescendantcount={DEFAULT_ANCESTOR_LIMIT}"]]
 
     def chain_tx(self, utxos_to_spend, *, num_outputs=1):
         return self.wallet.send_self_transfer_multi(
@@ -29,7 +40,8 @@ class MempoolPackagesTest(BitcoinTestFramework):
             num_outputs=num_outputs)['new_utxos']
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
 
         # DEFAULT_ANCESTOR_LIMIT transactions off a confirmed tx should be fine
         chain = []
@@ -70,6 +82,7 @@ class MempoolPackagesTest(BitcoinTestFramework):
         # Ensure an individual transaction with single direct conflict can RBF the chain which used our carve-out rule
         replacement_tx = replaceable_tx["tx"]
         replacement_tx.vout[0].nValue -= 1000000
+        self.wallet.sign_tx(replacement_tx)  # QTC: re-sign after editing the outputs
         self.nodes[0].sendrawtransaction(replacement_tx.serialize().hex())
 
         # Finally, check that we added two transactions

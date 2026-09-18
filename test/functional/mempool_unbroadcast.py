@@ -6,12 +6,13 @@
 to peers until a GETDATA is received."""
 
 from test_framework.p2p import P2PTxInvStore
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
     ensure_for,
 )
-from test_framework.wallet import MiniWallet
+from test_framework.wallet import MiniWallet, MiniWalletMode
 
 MAX_INITIAL_BROADCAST_DELAY = 15 * 60 # 15 minutes in seconds
 
@@ -19,11 +20,16 @@ class MempoolUnbroadcastTest(BitcoinTestFramework):
     def add_options(self, parser):
         self.add_wallet_options(parser)
 
+    def skip_test_if_missing_module(self):
+        # QTC: MiniWallet ADDRESS_P2MR spends wallet-signed P2MR coins
+        self.skip_if_no_wallet()
+
     def set_test_params(self):
         self.num_nodes = 2
 
     def run_test(self):
-        self.wallet = MiniWallet(self.nodes[0])
+        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, COINBASE_MATURITY + 25)  # QTC: the cached chain has no P2MR coins
         self.test_broadcast()
         self.test_txn_removal()
 
@@ -36,10 +42,11 @@ class MempoolUnbroadcastTest(BitcoinTestFramework):
         self.log.info("Generate transactions that only node 0 knows about")
 
         if self.is_wallet_compiled():
-            self.import_deterministic_coinbase_privkeys()
-            # generate a wallet txn
-            addr = node.getnewaddress()
-            wallet_tx_hsh = node.sendtoaddress(addr, 0.0001)
+            # QTC: the coinbase keys are already imported (skip_if_no_wallet); select the
+            # default wallet explicitly since the MiniWallet's P2MR wallet is also loaded
+            w = node.get_wallet_rpc(self.default_wallet_name)
+            addr = w.getnewaddress()
+            wallet_tx_hsh = w.sendtoaddress(addr, 1)  # QTC: P2MR dust threshold is well above 0.0001
 
         # generate a txn using sendrawtransaction
         txFS = self.wallet.create_self_transfer()
