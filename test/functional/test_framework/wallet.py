@@ -104,7 +104,9 @@ class MiniWalletMode(Enum):
 # by the default QTC wallet descriptor: witness = [ML-DSA-44 sig (2420), leaf script
 # (1316), control block (33)]. Fixed-size PQ signatures make this deterministic.
 P2MR_SELF_TRANSFER_VSIZE = 1039
-P2MR_WALLET_LABEL = "miniwallet_p2mr"
+P2MR_WALLET_NAME = "miniwallet_p2mr"
+# Fixed pqhd seed for the default ADDRESS_P2MR key (k=1, like the other modes).
+P2MR_DEFAULT_SEED = (1).to_bytes(32, 'big').hex()
 
 
 class MiniWallet:
@@ -133,15 +135,11 @@ class MiniWallet:
             self._address, self._taproot_info = create_deterministic_address_bcrt1_p2tr_op_true(internal_key)
             self._scriptPubKey = address_to_scriptpubkey(self._address)
         elif mode == MiniWalletMode.ADDRESS_P2MR:
-            self._wallet_rpc = self._get_p2mr_wallet_rpc(test_node)
-            label = P2MR_WALLET_LABEL if tag_name is None else f"{P2MR_WALLET_LABEL}_{tag_name}"
-            # Reuse the same address across MiniWallet instances on the same node
-            # (mirrors the deterministic addresses of the other modes).
-            try:
-                existing = list(self._wallet_rpc.getaddressesbylabel(label).keys())
-            except JSONRPCException:
-                existing = []
-            self._address = existing[0] if existing else self._wallet_rpc.getnewaddress(label=label, address_type="p2mr")
+            # Deterministic P2MR key: a fixed pqhd seed (or one derived from the
+            # tag) imported into a dedicated wallet on the node, so the address is
+            # the same on every node and in every test, like the other modes.
+            seed = P2MR_DEFAULT_SEED if tag_name is None else hash256(tag_name.encode()).hex()
+            self._wallet_rpc, self._address = self._import_p2mr_wallet(test_node, seed)
             self._scriptPubKey = address_to_scriptpubkey(self._address)
 
         # When the pre-mined test framework chain is used, it contains coinbase
@@ -155,16 +153,23 @@ class MiniWallet:
         return {"txid": txid, "vout": vout, "value": value, "height": height, "coinbase": coinbase, "confirmations": confirmations}
 
     @staticmethod
-    def _get_p2mr_wallet_rpc(test_node):
-        """Return a wallet RPC on test_node for ADDRESS_P2MR mode, creating a
-        dedicated wallet if none is loaded."""
-        wallets = test_node.listwallets()
-        if P2MR_WALLET_LABEL in wallets:
-            return test_node.get_wallet_rpc(P2MR_WALLET_LABEL)
-        if wallets:
-            return test_node.get_wallet_rpc(wallets[0])
-        test_node.createwallet(wallet_name=P2MR_WALLET_LABEL, descriptors=True)
-        return test_node.get_wallet_rpc(P2MR_WALLET_LABEL)
+    def _import_p2mr_wallet(test_node, seed):
+        """Load (or create) the dedicated ADDRESS_P2MR wallet on test_node, import
+        the fixed-seed P2MR descriptor and return (wallet_rpc, address)."""
+        desc = f"mr(pqhd({seed}/1h/0h/0/*),pk_slh(pqhd({seed}/1h/0h/0/*)))"
+        desc = desc + "#" + test_node.getdescriptorinfo(desc)["checksum"]
+        if P2MR_WALLET_NAME not in test_node.listwallets():
+            try:
+                test_node.loadwallet(P2MR_WALLET_NAME)
+            except JSONRPCException:
+                test_node.createwallet(wallet_name=P2MR_WALLET_NAME, descriptors=True, blank=True, load_on_startup=True)
+        wallet_rpc = test_node.get_wallet_rpc(P2MR_WALLET_NAME)
+        known = {d["desc"] for d in wallet_rpc.listdescriptors(True)["descriptors"]}
+        if desc not in known:
+            res = wallet_rpc.importdescriptors([{"desc": desc, "timestamp": 0, "active": False, "range": [0, 0]}])
+            assert res[0]["success"], res
+        address = wallet_rpc.deriveaddresses(desc, [0, 0])[0]
+        return wallet_rpc, address
 
     def _bulk_tx(self, tx, target_vsize):
         """Pad a transaction with extra outputs until it reaches a target vsize.
