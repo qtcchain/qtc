@@ -699,6 +699,7 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
             return nullptr;
         }
 
+        if (options.broadcast) wallet->SetBroadcastTransactions(*options.broadcast);
         NotifyWalletLoaded(context, wallet);
         AddWallet(context, wallet);
         wallet->postInitProcess();
@@ -880,6 +881,7 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
         }
     }
 
+    if (options.broadcast) wallet->SetBroadcastTransactions(*options.broadcast);
     NotifyWalletLoaded(context, wallet);
     AddWallet(context, wallet);
     wallet->postInitProcess();

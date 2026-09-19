@@ -265,6 +265,7 @@ static RPCHelpMan loadwallet()
                 {
                     {"filename", RPCArg::Type::STR, RPCArg::Optional::NO, "The path to the directory of the wallet to be loaded, either absolute or relative to the \"wallets\" directory. The \"wallets\" directory is set by the -walletdir option and defaults to the \"wallets\" folder within the data directory."},
                     {"load_on_startup", RPCArg::Type::BOOL, RPCArg::Optional::OMITTED, "Save wallet name to persistent settings and load on startup. True to add wallet to startup list, false to remove, null to leave unchanged."},
+                    {"broadcast", RPCArg::Type::BOOL, RPCArg::Optional::OMITTED, "Whether this wallet broadcasts and resubmits its transactions (overrides -walletbroadcast for this wallet; null to use the node setting)."},
                 },
                 RPCResult{
                     RPCResult::Type::OBJ, "", "",
@@ -307,6 +308,7 @@ static RPCHelpMan loadwallet()
     bilingual_str error;
     std::vector<bilingual_str> warnings;
     std::optional<bool> load_on_start = request.params[1].isNull() ? std::nullopt : std::optional<bool>(request.params[1].get_bool());
+    if (!request.params[2].isNull()) options.broadcast = request.params[2].get_bool();
 
     {
         LOCK(context.wallets_mutex);
@@ -420,6 +422,7 @@ static RPCHelpMan createwallet()
             {"descriptors", RPCArg::Type::BOOL, RPCArg::Default{true}, "Create a native descriptor wallet. On QTC this must be true."},
             {"load_on_startup", RPCArg::Type::BOOL, RPCArg::Optional::OMITTED, "Save wallet name to persistent settings and load on startup. True to add wallet to startup list, false to remove, null to leave unchanged."},
             {"external_signer", RPCArg::Type::BOOL, RPCArg::Default{false}, "Use an external signer such as a hardware wallet. Requires -signer to be configured. Wallet creation will fail if keys cannot be fetched. Requires disable_private_keys and descriptors set to true."},
+            {"broadcast", RPCArg::Type::BOOL, RPCArg::Optional::OMITTED, "Whether this wallet broadcasts and resubmits its transactions (overrides -walletbroadcast for this wallet; null to use the node setting)."},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
@@ -502,6 +505,7 @@ static RPCHelpMan createwallet()
     options.create_passphrase = passphrase;
     bilingual_str error;
     std::optional<bool> load_on_start = request.params[6].isNull() ? std::nullopt : std::optional<bool>(request.params[6].get_bool());
+    if (!request.params[8].isNull()) options.broadcast = request.params[8].get_bool();
     const std::shared_ptr<CWallet> wallet = CreateWallet(context, request.params[0].get_str(), load_on_start, options, status, error, warnings);
     if (!wallet) {
         RPCErrorCode code = status == DatabaseStatus::FAILED_ENCRYPT ? RPC_WALLET_ENCRYPTION_FAILED : RPC_WALLET_ERROR;

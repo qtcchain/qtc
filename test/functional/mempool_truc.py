@@ -43,9 +43,7 @@ def python_vsize(node_vsize):
     """Python target_vsize for a 1-input P2MR tx of the given node vsize."""
     return node_vsize - (P2MR_NODE_VSIZE - P2MR_SELF_TRANSFER_VSIZE)
 
-# QTC: the node wallet behind the ADDRESS_P2MR MiniWallet would otherwise resubmit every
-# unconfirmed tx it knows (e.g. an evicted sibling) at each restart, polluting the mempool.
-NODE_ARGS = ["-walletbroadcast=0"]
+NODE_ARGS = []
 
 def cleanup(extra_args=None):
     def decorator(func):
@@ -757,10 +755,10 @@ class MempoolTRUC(BitcoinTestFramework):
                 assert_equal(result_non_truc["package_msg"], "success")
                 self.check_mempool([tx_v2_0fee_parent["txid"], tx_v2_child["txid"], tx_v3_0fee_parent["txid"], tx_v3_child["txid"]])
 
-        # QTC: each loaded wallet (the default one and the MiniWallet's) warns about the last,
-        # very high -minrelaytxfee; the framework treats unexpected stderr at shutdown as a failure.
+        # QTC: the default wallet warns at startup about the last, very high -minrelaytxfee;
+        # the framework treats unexpected stderr at shutdown as a failure.
         warning = "Warning: -minrelaytxfee is set very high! The wallet will avoid paying less than the minimum relay fee."
-        self.stop_node(0, expected_stderr="\n".join([warning] * 2))
+        self.stop_node(0, expected_stderr=warning)
         self.start_node(0, extra_args=NODE_ARGS)
 
 

@@ -210,7 +210,14 @@ class FilterTest(BitcoinTestFramework):
         self.log.info("Send a mempool msg after connecting and check that the relevant tx is announced")
         self.nodes[0].add_p2p_connection(filter_peer)
         filter_peer.send_and_ping(filter_peer.watch_filter_init)
+        # QTC: the node announces its mempool to every fresh peer at connect time, before the
+        # filter is loaded, so both txs may already have been seen. Only the response to the
+        # mempool msg is filtered: it must announce exactly the relevant tx.
+        rel_hashes = {int(rel_txid, 16), int(self.nodes[0].getmempoolentry(rel_txid)["wtxid"], 16)}
+        with p2p_lock:
+            filter_peer.last_message.pop("inv", None)
         filter_peer.send_message(msg_mempool())
+        filter_peer.wait_until(lambda: "inv" in filter_peer.last_message and {i.hash for i in filter_peer.last_message["inv"].inv} <= rel_hashes)
         filter_peer.wait_for_tx(rel_txid)
 
         self.log.info("Request the irrelevant transaction even though it was not announced")

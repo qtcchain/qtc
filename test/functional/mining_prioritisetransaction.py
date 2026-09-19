@@ -33,7 +33,6 @@ class PrioritiseTransactionTest(BitcoinTestFramework):
             "-printpriority=1",
             "-datacarriersize=100000",
             f"-blockmaxweight={self.block_max_weight}",  # QTC: 24M-weight blocks would need far more P2MR coins than the test has
-            "-walletbroadcast=0",  # QTC: keep the P2MR signing wallet from re-adding its txs to the mempool on restart
         ]] * self.num_nodes
         self.supports_cli = False
 
@@ -142,7 +141,7 @@ class PrioritiseTransactionTest(BitcoinTestFramework):
         self.clear_prioritisation(node=self.nodes[0])
 
         self.log.info("Test priority while txs are not in mempool")
-        self.restart_node(0, extra_args=["-nopersistmempool", "-walletbroadcast=0"])
+        self.restart_node(0, extra_args=["-nopersistmempool"])
         self.nodes[0].setmocktime(mock_time)
         assert_equal(self.nodes[0].getmempoolinfo()["size"], 0)
         self.nodes[0].prioritisetransaction(txid=txid_b, fee_delta=int(fee_delta_b * COIN))

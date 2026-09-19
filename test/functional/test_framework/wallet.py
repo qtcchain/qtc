@@ -167,23 +167,32 @@ class MiniWallet:
         the fixed-seed P2MR descriptor and return its address."""
         desc = f"mr(pqhd({seed}/1h/0h/0/*),pk_slh(pqhd({seed}/1h/0h/0/*)))"
         desc = desc + "#" + test_node.getdescriptorinfo(desc)["checksum"]
-        if P2MR_WALLET_NAME not in test_node.listwallets():
-            try:
-                test_node.loadwallet(P2MR_WALLET_NAME)
-            except JSONRPCException:
-                test_node.createwallet(wallet_name=P2MR_WALLET_NAME, descriptors=True, blank=True, load_on_startup=True)
-        wallet_rpc = test_node.get_wallet_rpc(P2MR_WALLET_NAME)
+        wallet_rpc = MiniWallet._load_p2mr_wallet(test_node)
         known = {d["desc"] for d in wallet_rpc.listdescriptors(True)["descriptors"]}
         if desc not in known:
             res = wallet_rpc.importdescriptors([{"desc": desc, "timestamp": 0, "active": False, "range": [0, 0]}])
             assert res[0]["success"], res
         return wallet_rpc.deriveaddresses(desc, [0, 0])[0]
 
+    @staticmethod
+    def _load_p2mr_wallet(test_node):
+        """Load (or create) the signing wallet with broadcast=False: it must never
+        resubmit the MiniWallet's transactions on its own (e.g. after a restart),
+        since tests control the mempool contents themselves. It is not loaded on
+        startup for the same reason; it is (re)loaded here on first use."""
+        if P2MR_WALLET_NAME not in test_node.listwallets():
+            try:
+                test_node.loadwallet(P2MR_WALLET_NAME, False, False)
+            except JSONRPCException:
+                test_node.createwallet(wallet_name=P2MR_WALLET_NAME, descriptors=True, blank=True, load_on_startup=False, broadcast=False)
+        return test_node.get_wallet_rpc(P2MR_WALLET_NAME)
+
     @property
     def _wallet_rpc(self):
         # Resolved on every use: a cached proxy would keep a stale auth cookie
-        # across restart_node()/start_nodes().
-        return self._test_node.get_wallet_rpc(P2MR_WALLET_NAME)
+        # across restart_node()/start_nodes(), and the wallet must be re-loaded
+        # after a restart.
+        return self._load_p2mr_wallet(self._test_node)
 
     def _bulk_tx(self, tx, target_vsize):
         """Pad a transaction with extra outputs until it reaches a target vsize.

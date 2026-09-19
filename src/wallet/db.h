@@ -194,6 +194,8 @@ struct DatabaseOptions {
     std::optional<DatabaseFormat> require_format;
     uint64_t create_flags = 0;
     SecureString create_passphrase;
+    //! Override -walletbroadcast for this wallet (applied before it resubmits its unconfirmed txs).
+    std::optional<bool> broadcast;
 
     // Specialized options. Not every option is supported by every backend.
     bool verify = true;             //!< Check data integrity on load.

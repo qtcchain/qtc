@@ -118,7 +118,6 @@ class MempoolExpiryTest(BitcoinTestFramework):
         self.log.info('Test custom mempool expiry timeout of %d hours.' %
                       CUSTOM_MEMPOOL_EXPIRY)
         self.restart_node(0, ['-mempoolexpiry=%d' % CUSTOM_MEMPOOL_EXPIRY])
-        self.wallet = MiniWallet(self.nodes[0], mode=MiniWalletMode.ADDRESS_P2MR)  # QTC: rebind the node wallet RPC after restart
         self.test_transaction_expiry(CUSTOM_MEMPOOL_EXPIRY)
 
 

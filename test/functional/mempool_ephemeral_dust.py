@@ -199,10 +199,6 @@ class EphemeralDustTest(BitcoinTestFramework):
         self.restart_node(1)
         self.connect_nodes(0, 1)
         assert_mempool_contents(self, self.nodes[0], expected=[])
-        # QTC: the node wallet behind the P2MR MiniWallet saw the package in its mempool and
-        # would resubmit it on every later restart (it gets in once -minrelaytxfee=0); forget it.
-        for tx in (dusty_tx, sweep_tx):
-            self.nodes[0].get_wallet_rpc(P2MR_WALLET_NAME).abandontransaction(tx["txid"])
 
     def test_fee_having_parent(self):
         self.log.info("Test that a transaction with ephemeral dust may not have non-0 base fee")
