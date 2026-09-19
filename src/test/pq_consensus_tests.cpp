@@ -2230,6 +2230,20 @@ BOOST_AUTO_TEST_CASE(consensus_rejects_non_p2mr_outputs_in_blocks)
     BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-txns-nonp2mr-output");
 }
 
+BOOST_AUTO_TEST_CASE(consensus_accepts_anchor_outputs_in_blocks)
+{
+    const auto main_params = CreateChainParams(*m_node.args, ChainType::MAIN);
+    CTxOut anchor_out;
+    anchor_out.nValue = 50 * COIN;
+    anchor_out.scriptPubKey = CScript{} << OP_1 << std::vector<unsigned char>{0x4e, 0x73};
+    BOOST_REQUIRE(anchor_out.scriptPubKey.IsPayToAnchor());
+
+    CBlock block = BuildSingleCoinbaseBlock({anchor_out});
+    BlockValidationState state;
+    BOOST_CHECK(CheckBlock(block, state, main_params->GetConsensus(), /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/false));
+    BOOST_CHECK_NE(state.GetRejectReason(), "bad-txns-nonp2mr-output");
+}
+
 BOOST_AUTO_TEST_CASE(consensus_accepts_p2mr_outputs_in_blocks)
 {
     const auto main_params = CreateChainParams(*m_node.args, ChainType::MAIN);

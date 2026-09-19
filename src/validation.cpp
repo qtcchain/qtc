@@ -9730,10 +9730,14 @@ static bool CheckReducedDataOutputLimits(const CTransaction& tx, BlockValidation
 {
     if (!consensus_params.fReducedDataLimits) return true;
 
+    // QTC: besides P2MR, the 4-byte pay-to-anchor output (OP_1 <0x4e73>, BIP 431 / ephemeral
+    // dust fee bumping) is admitted. It is keyless, carries no data, and is spendable by anyone
+    // with an empty witness, so it adds no key-type or data-carrier surface (approved 2026-09-19).
     const auto is_p2mr_output = [](const CScript& script_pub_key) {
         int witness_version{-1};
         std::vector<unsigned char> witness_program;
         if (!script_pub_key.IsWitnessProgram(witness_version, witness_program)) return false;
+        if (CScript::IsPayToAnchor(witness_version, witness_program)) return true;
         return witness_version == 2 && witness_program.size() == 32;
     };
 
@@ -9756,7 +9760,7 @@ static bool CheckReducedDataOutputLimits(const CTransaction& tx, BlockValidation
 
         if (consensus_params.fEnforceP2MROnlyOutputs && !is_p2mr_output(txout.scriptPubKey)) {
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-nonp2mr-output",
-                                 "non-OP_RETURN outputs must be witness v2 P2MR");
+                                 "non-OP_RETURN outputs must be witness v2 P2MR or pay-to-anchor");
         }
     }
 

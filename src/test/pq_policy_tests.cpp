@@ -1292,10 +1292,9 @@ BOOST_AUTO_TEST_CASE(p2mr_policy_stack_size_six_and_one_rejected)
     }
 }
 
-// P2A (pay-to-anchor) outputs are relay-standard, but relay must never exceed
-// consensus: chains that enforce P2MR-only outputs (CheckReducedDataOutputLimits)
-// must not admit anchors to the mempool.
-BOOST_AUTO_TEST_CASE(anchor_outputs_relay_gated_by_consensus)
+// P2A (pay-to-anchor) outputs are relay-standard on every chain; consensus admits
+// them alongside P2MR (see consensus_accepts_anchor_outputs_in_blocks).
+BOOST_AUTO_TEST_CASE(anchor_outputs_are_relay_standard)
 {
     TxoutType which;
     const CScript anchor_spk{CScript() << OP_1 << std::vector<unsigned char>{0x4e, 0x73}};
@@ -1306,9 +1305,8 @@ BOOST_AUTO_TEST_CASE(anchor_outputs_relay_gated_by_consensus)
         const ArgsManager empty_args{};
         const auto params{CreateChainParams(empty_args, chain)};
         kernel::MemPoolOptions opts{};
-        opts.permitephemeral_anchor = true;
         BOOST_REQUIRE(ApplyArgsManOptions(*m_node.args, *params, opts));
-        BOOST_CHECK_EQUAL(opts.permitephemeral_anchor, !params->GetConsensus().fEnforceP2MROnlyOutputs);
+        BOOST_CHECK(opts.permitephemeral_anchor);
     }
 }
 

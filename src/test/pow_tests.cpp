@@ -946,7 +946,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_matmul_activation)
     BOOST_CHECK(consensus.enforce_BIP94);
     BOOST_CHECK_EQUAL(consensus.nKAWPOWHeight, std::numeric_limits<int>::max());
     BOOST_CHECK(consensus.fReducedDataLimits);
-    BOOST_CHECK_EQUAL(consensus.nMaxOpReturnBytes, 83U);
+    BOOST_CHECK_EQUAL(consensus.nMaxOpReturnBytes, 1'004U);  // 1,000-byte payload + OP_RETURN + OP_PUSHDATA2 + length (approved 2026-09-18)
     BOOST_CHECK_EQUAL(consensus.nMaxTxoutScriptPubKeyBytes, 34U);
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacing, 600);
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacingFastMs, 250);
@@ -1147,7 +1147,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_REGTEST_matmul_activation)
     BOOST_CHECK(consensus.fSkipMatMulValidation);
     BOOST_CHECK_EQUAL(consensus.nKAWPOWHeight, std::numeric_limits<int>::max());
     BOOST_CHECK(consensus.fReducedDataLimits);
-    BOOST_CHECK_EQUAL(consensus.nMaxOpReturnBytes, 83U);
+    BOOST_CHECK_EQUAL(consensus.nMaxOpReturnBytes, 1'004U);  // 1,000-byte payload + OP_RETURN + OP_PUSHDATA2 + length (approved 2026-09-18)
     BOOST_CHECK_EQUAL(consensus.nMaxTxoutScriptPubKeyBytes, 34U);
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacing, 90);
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacingFastMs, 250);
