@@ -508,7 +508,8 @@ bool IsStandard(const CScript& scriptPubKey, const std::optional<unsigned>& max_
         return false;
     }
 
-    // QTC P2MR hard-fork policy: only witness v2 P2MR outputs and OP_RETURN are relay standard.
+    // QTC P2MR hard-fork policy: only witness v2 P2MR outputs, OP_RETURN and
+    // pay-to-anchor (P2A, for TRUC/ephemeral-dust fee bumping) are relay standard.
     if (whichType == TxoutType::NULL_DATA) {
         if (!max_datacarrier_bytes || scriptPubKey.size() > *max_datacarrier_bytes) {
             return false;
@@ -516,7 +517,7 @@ bool IsStandard(const CScript& scriptPubKey, const std::optional<unsigned>& max_
         return true;
     }
 
-    return whichType == TxoutType::WITNESS_V2_P2MR;
+    return whichType == TxoutType::WITNESS_V2_P2MR || whichType == TxoutType::ANCHOR;
 }
 
 static inline bool MaybeReject_(std::string& out_reason, const std::string& reason, const std::string& reason_prefix, const ignore_rejects_type& ignore_rejects) {

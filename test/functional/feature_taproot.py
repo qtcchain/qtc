@@ -667,7 +667,7 @@ MIN_FEE = 50000
 
 TX_MAX_STANDARD_VERSION = 3
 TX_STANDARD_VERSIONS = [1, 2, TX_MAX_STANDARD_VERSION]
-TRUC_MAX_VSIZE = 10000 # test doesn't cover in-mempool spends, so only this limit is hit
+TRUC_MAX_VSIZE = 40000 # QTC value; test doesn't cover in-mempool spends, so only this limit is hit
 
 # === Actual test cases ===
 

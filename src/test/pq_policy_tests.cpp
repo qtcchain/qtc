@@ -7,6 +7,10 @@
 #include <hash.h>
 #include <policy/policy.h>
 #include <policy/settings.h>
+#include <chainparams.h>
+#include <kernel/mempool_options.h>
+#include <node/mempool_args.h>
+#include <util/chaintype.h>
 #include <pqkey.h>
 #include <script/interpreter.h>
 #include <script/pqm.h>
@@ -1285,6 +1289,26 @@ BOOST_AUTO_TEST_CASE(p2mr_policy_stack_size_six_and_one_rejected)
         std::string reason;
         BOOST_CHECK(!IsWitnessStandard(CTransaction{tx}, coins_cache, "", reason));
         BOOST_CHECK_EQUAL(reason, "p2mr-witness-missing");
+    }
+}
+
+// P2A (pay-to-anchor) outputs are relay-standard, but relay must never exceed
+// consensus: chains that enforce P2MR-only outputs (CheckReducedDataOutputLimits)
+// must not admit anchors to the mempool.
+BOOST_AUTO_TEST_CASE(anchor_outputs_relay_gated_by_consensus)
+{
+    TxoutType which;
+    const CScript anchor_spk{CScript() << OP_1 << std::vector<unsigned char>{0x4e, 0x73}};
+    BOOST_CHECK(IsStandard(anchor_spk, std::optional<unsigned>{MAX_OP_RETURN_RELAY}, which));
+    BOOST_CHECK(which == TxoutType::ANCHOR);
+
+    for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4, ChainType::REGTEST}) {
+        const ArgsManager empty_args{};
+        const auto params{CreateChainParams(empty_args, chain)};
+        kernel::MemPoolOptions opts{};
+        opts.permitephemeral_anchor = true;
+        BOOST_REQUIRE(ApplyArgsManOptions(*m_node.args, *params, opts));
+        BOOST_CHECK_EQUAL(opts.permitephemeral_anchor, !params->GetConsensus().fEnforceP2MROnlyOutputs);
     }
 }
 

@@ -26,10 +26,15 @@ static constexpr unsigned int TRUC_DESCENDANT_LIMIT{2};
 /** Maximum number of transactions including a TRUC tx and all its mempool ancestors. */
 static constexpr unsigned int TRUC_ANCESTOR_LIMIT{2};
 
+// QTC: every input carries a post-quantum witness that the node weighs at ~3.8 kvB
+// (WITNESS_SCALE_FACTOR is 1), so Bitcoin's 10,000 / 1,000 limits were unreachable:
+// no P2MR spend could ever be a TRUC child. The limits are scaled so that a TRUC
+// parent fits ~10 P2MR inputs and a TRUC child fits one P2MR input plus outputs
+// (approved 2026-09-19).
 /** Maximum sigop-adjusted virtual size of all v3 transactions. */
-static constexpr int64_t TRUC_MAX_VSIZE{10000};
+static constexpr int64_t TRUC_MAX_VSIZE{40000};
 /** Maximum sigop-adjusted virtual size of a tx which spends from an unconfirmed TRUC transaction. */
-static constexpr int64_t TRUC_CHILD_MAX_VSIZE{1000};
+static constexpr int64_t TRUC_CHILD_MAX_VSIZE{5000};
 // These limits are within the default ancestor/descendant limits.
 static_assert(TRUC_MAX_VSIZE + TRUC_CHILD_MAX_VSIZE <= DEFAULT_ANCESTOR_SIZE_LIMIT_KVB * 1000);
 static_assert(TRUC_MAX_VSIZE + TRUC_CHILD_MAX_VSIZE <= DEFAULT_DESCENDANT_SIZE_LIMIT_KVB * 1000);

@@ -6093,7 +6093,8 @@ BOOST_FIXTURE_TEST_CASE(version3_tests, RegTestingSetup)
     }
 
     // Tx spending TRUC cannot be too large in virtual size.
-    auto many_inputs{random_outpoints(100)};
+    // QTC: TRUC_CHILD_MAX_VSIZE is 5000, so 100 empty-witness inputs (~41 vB each) no longer exceed it.
+    auto many_inputs{random_outpoints(140)};
     many_inputs.emplace_back(mempool_tx_v3->GetHash(), 0);
     {
         auto tx_v3_child_big = make_tx(many_inputs, /*version=*/3);
@@ -6113,7 +6114,8 @@ BOOST_FIXTURE_TEST_CASE(version3_tests, RegTestingSetup)
     // Tx spending TRUC cannot have too many sigops.
     // Keep the raw tx below the child vsize limit while making the sigop-adjusted
     // virtual size exceed it.
-    auto multisig_outpoints{random_outpoints(5)};
+    // QTC: 7 inputs x 2 CHECKMULTISIG x 20 keys x 20 bytes/sigop = 5600 > TRUC_CHILD_MAX_VSIZE (5000).
+    auto multisig_outpoints{random_outpoints(6)};
     multisig_outpoints.emplace_back(mempool_tx_v3->GetHash(), 0);
     CScript script_multisig;
     script_multisig << OP_CHECKMULTISIG << OP_CHECKMULTISIG;

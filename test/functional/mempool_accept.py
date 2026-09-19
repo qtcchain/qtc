@@ -457,15 +457,46 @@ class MempoolAcceptanceTest(BitcoinTestFramework):
             maxfeerate=0,
         )
 
-        self.log.info('OP_1 <0x4e73> (pay-to-anchor) outputs are not standard on QTC')
-        # QTC: only P2MR and OP_RETURN outputs are relay-standard, so anchors cannot
-        # be created through the mempool and upstream's anchor-spend coverage does
-        # not apply.
-        tx = tx_from_hex(raw_tx_reference)
-        tx.vout[0].scriptPubKey = PAY_TO_ANCHOR
+        self.log.info('OP_1 <0x4e73> is able to be created and spent')
+        # QTC: P2A outputs are relay-standard (regtest does not enforce P2MR-only
+        # outputs at consensus); the spend pays to the MiniWallet's P2MR script.
+        anchor_value = 20000  # spend output must clear the P2MR dust threshold (~11583 sat)
+        anchor_spend_script = self.wallet.get_output_script()
+        create_anchor_tx = self.wallet.send_to(from_node=node, scriptPubKey=PAY_TO_ANCHOR, amount=anchor_value)
+        self.generate(node, 1)
+
+        # First spend has non-empty witness, will be rejected to prevent third party wtxid malleability
+        anchor_nonempty_wit_spend = CTransaction()
+        anchor_nonempty_wit_spend.vin.append(CTxIn(COutPoint(int(create_anchor_tx["txid"], 16), create_anchor_tx["sent_vout"]), b""))
+        anchor_nonempty_wit_spend.vout.append(CTxOut(anchor_value - int(fee*COIN), anchor_spend_script))
+        anchor_nonempty_wit_spend.wit.vtxinwit.append(CTxInWitness())
+        anchor_nonempty_wit_spend.wit.vtxinwit[0].scriptWitness.stack.append(b"f")
+        anchor_nonempty_wit_spend.rehash()
+
         self.check_mempool_result(
-            result_expected=[{'txid': tx.rehash(), 'allowed': False, 'reject-reason': 'scriptpubkey'}],
-            rawtxs=[tx.serialize().hex()],
+            result_expected=[{'txid': anchor_nonempty_wit_spend.rehash(), 'allowed': False, 'reject-reason': 'bad-witness-anchor-not-empty'}],
+            rawtxs=[anchor_nonempty_wit_spend.serialize().hex()],
+            maxfeerate=0,
+        )
+
+        # but is consensus-legal
+        self.generateblock(node, self.wallet.get_address(), [anchor_nonempty_wit_spend.serialize().hex()])
+
+        # Without witness elements it is standard
+        create_anchor_tx = self.wallet.send_to(from_node=node, scriptPubKey=PAY_TO_ANCHOR, amount=anchor_value)
+        self.generate(node, 1)
+
+        anchor_spend = CTransaction()
+        anchor_spend.vin.append(CTxIn(COutPoint(int(create_anchor_tx["txid"], 16), create_anchor_tx["sent_vout"]), b""))
+        anchor_spend.vout.append(CTxOut(anchor_value - int(fee*COIN), anchor_spend_script))
+        anchor_spend.wit.vtxinwit.append(CTxInWitness())
+        # It's "segwit" but txid == wtxid since there is no witness data
+        assert_equal(anchor_spend.rehash(), anchor_spend.getwtxid())
+
+        self.check_mempool_result(
+            result_expected=[{'txid': anchor_spend.rehash(), 'allowed': True, 'vsize': self.node_vsize(anchor_spend), 'fees': { 'base': fee}}],
+            rawtxs=[anchor_spend.serialize().hex()],
+            maxfeerate=0,
         )
 
         self.log.info('Spending a confirmed bare multisig is okay')

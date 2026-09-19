@@ -5,8 +5,14 @@
 from decimal import Decimal
 
 from test_framework.messages import (
+    COutPoint,
+    CTransaction,
+    CTxIn,
+    CTxOut,
     MAX_BIP125_RBF_SEQUENCE,
+    tx_from_hex,
 )
+from test_framework.script_util import PAY_TO_ANCHOR
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
@@ -19,31 +25,53 @@ from test_framework.wallet import (
     COIN,
     DEFAULT_FEE,
     MiniWallet,
+    MiniWalletMode,
+    P2MR_SELF_TRANSFER_VSIZE,
+    P2MR_WALLET_NAME,
 )
 
 MAX_REPLACEMENT_CANDIDATES = 100
-TRUC_MAX_VSIZE = 10000
-TRUC_CHILD_MAX_VSIZE = 1000
+TRUC_MAX_VSIZE = 40000  # QTC: scaled for ~3.8 kvB P2MR inputs (src/policy/truc_policy.h)
+TRUC_CHILD_MAX_VSIZE = 5000
+
+# QTC: the node weighs a 1-input P2MR spend at 3873 vB (WITNESS_SCALE_FACTOR 1) where the
+# Python side, which discounts the ~3.8 kB ML-DSA witness 4x, reports 1039 vB. TRUC limits
+# are enforced on the node's figure; MiniWallet's target_vsize takes the Python one.
+P2MR_NODE_VSIZE = 3873
+
+def python_vsize(node_vsize):
+    """Python target_vsize for a 1-input P2MR tx of the given node vsize."""
+    return node_vsize - (P2MR_NODE_VSIZE - P2MR_SELF_TRANSFER_VSIZE)
+
+# QTC: the node wallet behind the ADDRESS_P2MR MiniWallet would otherwise resubmit every
+# unconfirmed tx it knows (e.g. an evicted sibling) at each restart, polluting the mempool.
+NODE_ARGS = ["-walletbroadcast=0"]
 
 def cleanup(extra_args=None):
     def decorator(func):
         def wrapper(self):
             try:
                 if extra_args is not None:
-                    self.restart_node(0, extra_args=extra_args)
+                    self.restart_node(0, extra_args=extra_args + NODE_ARGS)
                 func(self)
             finally:
                 # Clear mempool again after test
                 self.generate(self.nodes[0], 1)
                 if extra_args is not None:
-                    self.restart_node(0)
+                    self.restart_node(0, extra_args=NODE_ARGS)
         return wrapper
     return decorator
 
 class MempoolTRUC(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser, legacy=False)
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()  # QTC: ADDRESS_P2MR MiniWallet signs via the node wallet
+
     def set_test_params(self):
         self.num_nodes = 1
-        self.extra_args = [[]]
+        self.extra_args = [NODE_ARGS]
         self.setup_clean_chain = True
 
     def check_mempool(self, txids):
@@ -52,32 +80,75 @@ class MempoolTRUC(BitcoinTestFramework):
         assert_equal(len(txids), len(mempool_contents))
         assert all([txid in txids for txid in mempool_contents])
 
+    def node_vsize(self, tx):
+        """QTC: the vsize the node enforces TRUC limits on."""
+        return self.nodes[0].decoderawtransaction(tx["hex"])["vsize"]
+
+    def create_anchor_coins(self, count, amount):
+        """QTC: mine `count` pay-to-anchor coins of `amount` sat. Spending an anchor costs no
+        ML-DSA witness, so a TRUC child can conflict with several of them and still fit
+        TRUC_CHILD_MAX_VSIZE, where a second ~3.8 kvB P2MR input never could."""
+        tx = self.wallet.create_self_transfer()["tx"]
+        tx.vout[0].nValue -= count * amount
+        for _ in range(count):
+            tx.vout.append(CTxOut(amount, PAY_TO_ANCHOR))
+        self.wallet.sign_tx(tx)
+        self.wallet.sendrawtransaction(from_node=self.nodes[0], tx_hex=tx.serialize().hex())
+        self.generate(self.nodes[0], 1)
+        return [{"txid": tx.rehash(), "vout": 1 + i, "value": Decimal(amount) / COIN, "height": 0, "coinbase": False,
+                 "confirmations": 1, "scriptPubKey": PAY_TO_ANCHOR.hex()} for i in range(count)]
+
+    def create_mixed_spend(self, *, utxos_to_spend, fee, version=2):
+        """QTC: MiniWallet.create_self_transfer_multi for any mix of P2MR and pay-to-anchor
+        coins (the MiniWallet would sign every input as P2MR)."""
+        amount = sum(int(COIN * u["value"]) for u in utxos_to_spend) - fee
+        assert amount > 0
+        tx = CTransaction()
+        tx.vin = [CTxIn(COutPoint(int(u["txid"], 16), u["vout"])) for u in utxos_to_spend]
+        tx.vout = [CTxOut(amount, self.wallet.get_output_script())]
+        tx.version = version
+        prevtxs = [{"txid": u["txid"], "vout": u["vout"], "amount": u["value"],
+                    "scriptPubKey": u.get("scriptPubKey", self.wallet.get_output_script().hex())}
+                   for u in utxos_to_spend]
+        res = self.nodes[0].get_wallet_rpc(P2MR_WALLET_NAME).signrawtransactionwithwallet(tx.serialize().hex(), prevtxs)
+        assert res["complete"], res
+        tx.wit = tx_from_hex(res["hex"]).wit
+        txid = tx.rehash()
+        return {
+            "new_utxo": {"txid": txid, "vout": 0, "value": Decimal(amount) / COIN, "height": 0, "coinbase": False, "confirmations": 0},
+            "fee": Decimal(fee) / COIN,
+            "txid": txid,
+            "wtxid": tx.getwtxid(),
+            "hex": tx.serialize().hex(),
+            "tx": tx,
+        }
+
     @cleanup(extra_args=["-datacarriersize=20000"])
     def test_truc_max_vsize(self):
         node = self.nodes[0]
         self.log.info("Test TRUC-specific maximum transaction vsize")
-        tx_v3_heavy = self.wallet.create_self_transfer(target_vsize=TRUC_MAX_VSIZE + 1, version=3)
-        assert_greater_than_or_equal(tx_v3_heavy["tx"].get_vsize(), TRUC_MAX_VSIZE)
+        tx_v3_heavy = self.wallet.create_self_transfer(target_vsize=python_vsize(TRUC_MAX_VSIZE + 1), version=3)
+        assert_equal(self.node_vsize(tx_v3_heavy), TRUC_MAX_VSIZE + 1)  # QTC: pins python_vsize()
         expected_error_heavy = f"truc-vsize-toobig, version=3 tx {tx_v3_heavy['txid']} (wtxid={tx_v3_heavy['wtxid']}) is too big"
         assert_raises_rpc_error(-26, expected_error_heavy, node.sendrawtransaction, tx_v3_heavy["hex"])
         self.check_mempool([])
 
         # Ensure we are hitting the TRUC-specific limit and not something else
-        tx_v2_heavy = self.wallet.send_self_transfer(from_node=node, target_vsize=TRUC_MAX_VSIZE + 1, version=2)
+        tx_v2_heavy = self.wallet.send_self_transfer(from_node=node, target_vsize=python_vsize(TRUC_MAX_VSIZE + 1), version=2)
         self.check_mempool([tx_v2_heavy["txid"]])
 
     @cleanup(extra_args=["-datacarriersize=1000"])
     def test_truc_acceptance(self):
         node = self.nodes[0]
-        self.log.info("Test a child of a TRUC transaction cannot be more than 1000vB")
+        self.log.info(f"Test a child of a TRUC transaction cannot be more than {TRUC_CHILD_MAX_VSIZE}vB")
         tx_v3_parent_normal = self.wallet.send_self_transfer(from_node=node, version=3)
         self.check_mempool([tx_v3_parent_normal["txid"]])
         tx_v3_child_heavy = self.wallet.create_self_transfer(
             utxo_to_spend=tx_v3_parent_normal["new_utxo"],
-            target_vsize=TRUC_CHILD_MAX_VSIZE + 1,
+            target_vsize=python_vsize(TRUC_CHILD_MAX_VSIZE + 1),
             version=3
         )
-        assert_greater_than_or_equal(tx_v3_child_heavy["tx"].get_vsize(), TRUC_CHILD_MAX_VSIZE)
+        assert_greater_than_or_equal(self.node_vsize(tx_v3_child_heavy), TRUC_CHILD_MAX_VSIZE)
         expected_error_child_heavy = f"truc-child-toobig, version=3 child tx {tx_v3_child_heavy['txid']} (wtxid={tx_v3_child_heavy['wtxid']}) is too big"
         assert_raises_rpc_error(-26, expected_error_child_heavy, node.sendrawtransaction, tx_v3_child_heavy["hex"])
         self.check_mempool([tx_v3_parent_normal["txid"]])
@@ -89,20 +160,20 @@ class MempoolTRUC(BitcoinTestFramework):
             from_node=node,
             fee_rate=DEFAULT_FEE,
             utxo_to_spend=tx_v3_parent_normal["new_utxo"],
-            target_vsize=TRUC_CHILD_MAX_VSIZE - 3,
+            target_vsize=python_vsize(TRUC_CHILD_MAX_VSIZE - 3),
             version=3
         )
-        assert_greater_than_or_equal(TRUC_CHILD_MAX_VSIZE, tx_v3_child_almost_heavy["tx"].get_vsize())
+        assert_greater_than_or_equal(TRUC_CHILD_MAX_VSIZE, self.node_vsize(tx_v3_child_almost_heavy))
         self.check_mempool([tx_v3_parent_normal["txid"], tx_v3_child_almost_heavy["txid"]])
         assert_equal(node.getmempoolentry(tx_v3_parent_normal["txid"])["descendantcount"], 2)
         tx_v3_child_almost_heavy_rbf = self.wallet.send_self_transfer(
             from_node=node,
             fee_rate=DEFAULT_FEE * 2,
             utxo_to_spend=tx_v3_parent_normal["new_utxo"],
-            target_vsize=875,
+            target_vsize=python_vsize(4000),
             version=3
         )
-        assert_greater_than_or_equal(tx_v3_child_almost_heavy["tx"].get_vsize() + tx_v3_child_almost_heavy_rbf["tx"].get_vsize(),
+        assert_greater_than_or_equal(self.node_vsize(tx_v3_child_almost_heavy) + self.node_vsize(tx_v3_child_almost_heavy_rbf),
                                      TRUC_CHILD_MAX_VSIZE)
         self.check_mempool([tx_v3_parent_normal["txid"], tx_v3_child_almost_heavy_rbf["txid"]])
         assert_equal(node.getmempoolentry(tx_v3_parent_normal["txid"])["descendantcount"], 2)
@@ -209,12 +280,12 @@ class MempoolTRUC(BitcoinTestFramework):
         tx_chain_3 = self.wallet.create_self_transfer(utxo_to_spend=tx_chain_2["new_utxo"], version=3)
 
         tx_to_mine = [tx_v3_block["hex"], tx_v2_block["hex"], tx_v3_block2["hex"], tx_chain_1["hex"], tx_chain_2["hex"], tx_chain_3["hex"]]
-        block = self.generateblock(node, output="raw(42)", transactions=tx_to_mine)
+        block = self.generateblock(node, output=self.wallet.get_address(), transactions=tx_to_mine)
 
         self.check_mempool([])
         tx_v2_from_v3 = self.wallet.send_self_transfer(from_node=node, utxo_to_spend=tx_v3_block["new_utxo"], version=2)
         tx_v3_from_v2 = self.wallet.send_self_transfer(from_node=node, utxo_to_spend=tx_v2_block["new_utxo"], version=3)
-        tx_v3_child_large = self.wallet.send_self_transfer(from_node=node, utxo_to_spend=tx_v3_block2["new_utxo"], target_vsize=1250, version=3)
+        tx_v3_child_large = self.wallet.send_self_transfer(from_node=node, utxo_to_spend=tx_v3_block2["new_utxo"], target_vsize=python_vsize(TRUC_CHILD_MAX_VSIZE + 250), version=3)
         assert_greater_than(node.getmempoolentry(tx_v3_child_large["txid"])["vsize"], TRUC_CHILD_MAX_VSIZE)
         tx_chain_4 = self.wallet.send_self_transfer(from_node=node, utxo_to_spend=tx_chain_3["new_utxo"], version=2)
         self.check_mempool([tx_v2_from_v3["txid"], tx_v3_from_v2["txid"], tx_v3_child_large["txid"], tx_chain_4["txid"]])
@@ -223,7 +294,7 @@ class MempoolTRUC(BitcoinTestFramework):
         node.invalidateblock(block["hash"])
         self.check_mempool([tx_v3_block["txid"], tx_v2_block["txid"], tx_v3_block2["txid"], tx_v2_from_v3["txid"], tx_v3_from_v2["txid"], tx_v3_child_large["txid"], tx_chain_1["txid"], tx_chain_2["txid"], tx_chain_3["txid"], tx_chain_4["txid"]])
 
-    @cleanup(extra_args=["-limitdescendantsize=10", "-datacarriersize=40000"])
+    @cleanup(extra_args=[f"-limitdescendantsize={TRUC_MAX_VSIZE // 1000}", "-datacarriersize=40000"])
     def test_nondefault_package_limits(self):
         """
         Max standard tx size + TRUC rules imply the ancestor/descendant rules (at their default
@@ -232,8 +303,9 @@ class MempoolTRUC(BitcoinTestFramework):
         """
         node = self.nodes[0]
         self.log.info("Test that a decreased limitdescendantsize also applies to TRUC child")
-        parent_target_vsize = 9990
-        child_target_vsize = 500
+        # QTC: the package limit is set to TRUC_MAX_VSIZE (40 kvB); a near-maximal parent plus
+        # the smallest possible (1-input, ~3.9 kvB) child exceeds it.
+        parent_target_vsize = python_vsize(TRUC_MAX_VSIZE - 10)
         tx_v3_parent_large1 = self.wallet.send_self_transfer(
             from_node=node,
             target_vsize=parent_target_vsize,
@@ -241,14 +313,13 @@ class MempoolTRUC(BitcoinTestFramework):
         )
         tx_v3_child_large1 = self.wallet.create_self_transfer(
             utxo_to_spend=tx_v3_parent_large1["new_utxo"],
-            target_vsize=child_target_vsize,
             version=3
         )
 
-        # Parent and child are within v3 limits, but parent's 10kvB descendant limit is exceeded
-        assert_greater_than_or_equal(TRUC_MAX_VSIZE, tx_v3_parent_large1["tx"].get_vsize())
-        assert_greater_than_or_equal(TRUC_CHILD_MAX_VSIZE, tx_v3_child_large1["tx"].get_vsize())
-        assert_greater_than(tx_v3_parent_large1["tx"].get_vsize() + tx_v3_child_large1["tx"].get_vsize(), 10000)
+        # Parent and child are within v3 limits, but parent's 40kvB descendant limit is exceeded
+        assert_greater_than_or_equal(TRUC_MAX_VSIZE, self.node_vsize(tx_v3_parent_large1))
+        assert_greater_than_or_equal(TRUC_CHILD_MAX_VSIZE, self.node_vsize(tx_v3_child_large1))
+        assert_greater_than(self.node_vsize(tx_v3_parent_large1) + self.node_vsize(tx_v3_child_large1), TRUC_MAX_VSIZE)
 
         assert_raises_rpc_error(-26, f"too-long-mempool-chain, exceeds descendant size limit for tx {tx_v3_parent_large1['txid']}", node.sendrawtransaction, tx_v3_child_large1["hex"])
         self.check_mempool([tx_v3_parent_large1["txid"]])
@@ -256,7 +327,7 @@ class MempoolTRUC(BitcoinTestFramework):
         self.generate(node, 1)
 
         self.log.info("Test that a decreased limitancestorsize also applies to v3 parent")
-        self.restart_node(0, extra_args=["-limitancestorsize=10", "-datacarriersize=40000"])
+        self.restart_node(0, extra_args=[f"-limitancestorsize={TRUC_MAX_VSIZE // 1000}", "-datacarriersize=40000"] + NODE_ARGS)
         tx_v3_parent_large2 = self.wallet.send_self_transfer(
             from_node=node,
             target_vsize=parent_target_vsize,
@@ -264,14 +335,13 @@ class MempoolTRUC(BitcoinTestFramework):
         )
         tx_v3_child_large2 = self.wallet.create_self_transfer(
             utxo_to_spend=tx_v3_parent_large2["new_utxo"],
-            target_vsize=child_target_vsize,
             version=3
         )
 
         # Parent and child are within TRUC limits
-        assert_greater_than_or_equal(TRUC_MAX_VSIZE, tx_v3_parent_large2["tx"].get_vsize())
-        assert_greater_than_or_equal(TRUC_CHILD_MAX_VSIZE, tx_v3_child_large2["tx"].get_vsize())
-        assert_greater_than(tx_v3_parent_large2["tx"].get_vsize() + tx_v3_child_large2["tx"].get_vsize(), 10000)
+        assert_greater_than_or_equal(TRUC_MAX_VSIZE, self.node_vsize(tx_v3_parent_large2))
+        assert_greater_than_or_equal(TRUC_CHILD_MAX_VSIZE, self.node_vsize(tx_v3_child_large2))
+        assert_greater_than(self.node_vsize(tx_v3_parent_large2) + self.node_vsize(tx_v3_child_large2), TRUC_MAX_VSIZE)
 
         assert_raises_rpc_error(-26, "too-long-mempool-chain, exceeds ancestor size limit", node.sendrawtransaction, tx_v3_child_large2["hex"])
         self.check_mempool([tx_v3_parent_large2["txid"]])
@@ -282,12 +352,12 @@ class MempoolTRUC(BitcoinTestFramework):
         node = self.nodes[0]
         tx_v3_parent_normal = self.wallet.create_self_transfer(
             fee_rate=0,
-            target_vsize=1001,
+            target_vsize=python_vsize(TRUC_CHILD_MAX_VSIZE + 1),
             version=3
         )
         tx_v3_parent_2_normal = self.wallet.create_self_transfer(
             fee_rate=0,
-            target_vsize=1001,
+            target_vsize=python_vsize(TRUC_CHILD_MAX_VSIZE + 1),
             version=3
         )
         tx_v3_child_multiparent = self.wallet.create_self_transfer_multi(
@@ -297,7 +367,7 @@ class MempoolTRUC(BitcoinTestFramework):
         )
         tx_v3_child_heavy = self.wallet.create_self_transfer_multi(
             utxos_to_spend=[tx_v3_parent_normal["new_utxo"]],
-            target_vsize=TRUC_CHILD_MAX_VSIZE + 1,
+            target_vsize=python_vsize(TRUC_CHILD_MAX_VSIZE + 1),
             fee_per_output=10000,
             version=3
         )
@@ -310,7 +380,7 @@ class MempoolTRUC(BitcoinTestFramework):
         self.check_mempool([])
         result = node.submitpackage([tx_v3_parent_normal["hex"], tx_v3_child_heavy["hex"]])
         # tx_v3_child_heavy is heavy based on vsize, not sigops.
-        assert_equal(result['package_msg'], f"truc-child-toobig, version=3 child tx {tx_v3_child_heavy['txid']} (wtxid={tx_v3_child_heavy['wtxid']}) is too big: {tx_v3_child_heavy['tx'].get_vsize()} > 1000 virtual bytes")
+        assert_equal(result['package_msg'], f"truc-child-toobig, version=3 child tx {tx_v3_child_heavy['txid']} (wtxid={tx_v3_child_heavy['wtxid']}) is too big: {self.node_vsize(tx_v3_child_heavy)} > {TRUC_CHILD_MAX_VSIZE} virtual bytes")
         self.check_mempool([])
 
         tx_v3_parent = self.wallet.create_self_transfer(version=3)
@@ -431,7 +501,7 @@ class MempoolTRUC(BitcoinTestFramework):
         node = self.nodes[0]
         tx_v3_parent = self.wallet.create_self_transfer(
             fee_rate=0,
-            target_vsize=1001,
+            target_vsize=python_vsize(TRUC_CHILD_MAX_VSIZE + 1),
             version=3
         )
         tx_v2_child = self.wallet.create_self_transfer_multi(
@@ -529,6 +599,9 @@ class MempoolTRUC(BitcoinTestFramework):
     def test_truc_sibling_eviction(self):
         self.log.info("Test sibling eviction for TRUC")
         node = self.nodes[0]
+        # QTC: the conflicts below are rooted in anchor coins so that every replacement carries
+        # a single P2MR input; a TRUC child with two (~7.7 kvB) could never pass the child limit.
+        anchor_coins = self.create_anchor_coins(5, COIN)
         tx_v3_parent = self.wallet.send_self_transfer_multi(from_node=node, num_outputs=2, version=3)
         # This is the sibling to replace
         tx_v3_child_1 = self.wallet.send_self_transfer(
@@ -546,7 +619,7 @@ class MempoolTRUC(BitcoinTestFramework):
 
         self.log.info("Test tx must meet absolute fee rules to evict sibling")
         tx_v3_child_2_rule4 = self.wallet.create_self_transfer(
-            utxo_to_spend=tx_v3_parent["new_utxos"][1], fee_rate=2 * DEFAULT_FEE + Decimal("0.00000001"), version=3
+            utxo_to_spend=tx_v3_parent["new_utxos"][1], fee_rate=2 * DEFAULT_FEE + Decimal("0.00000002"), version=3  # QTC: +2 sat on 1039 vB, still short of incremental relay
         )
         rule4_str = f"insufficient fee (including sibling eviction), rejecting replacement {tx_v3_child_2_rule4['txid']}, not enough additional fees to relay"
         assert_raises_rpc_error(-26, rule4_str, node.sendrawtransaction, tx_v3_child_2_rule4["hex"])
@@ -556,24 +629,26 @@ class MempoolTRUC(BitcoinTestFramework):
         # First add 4 groups of 25 transactions.
         utxos_for_conflict = []
         txids_v2_100 = []
-        for _ in range(4):
-            confirmed_utxo = self.wallet.get_utxo(confirmed_only=True)
+        for confirmed_utxo in anchor_coins[:4]:
             utxos_for_conflict.append(confirmed_utxo)
             # 25 is within descendant limits
             chain_length = int(MAX_REPLACEMENT_CANDIDATES / 4)
-            chain = self.wallet.create_self_transfer_chain(chain_length=chain_length, utxo_to_spend=confirmed_utxo)
+            chain_root = self.create_mixed_spend(utxos_to_spend=[confirmed_utxo], fee=10000)
+            chain = [chain_root] + self.wallet.create_self_transfer_chain(chain_length=chain_length - 1, utxo_to_spend=chain_root["new_utxo"])
             for item in chain:
                 txids_v2_100.append(item["txid"])
                 node.sendrawtransaction(item["hex"])
         self.check_mempool(txids_v2_100 + [tx_v3_parent["txid"], tx_v3_child_1["txid"]])
 
         # Replacing 100 transactions is fine
-        tx_v3_replacement_only = self.wallet.create_self_transfer_multi(utxos_to_spend=utxos_for_conflict, fee_per_output=4000000)
+        # QTC: each replaced P2MR chain tx paid ~0.003 QTC, so outbid the lot by a wide margin.
+        replacement_fee = 40000000
+        tx_v3_replacement_only = self.create_mixed_spend(utxos_to_spend=utxos_for_conflict, fee=replacement_fee)
         # Override maxfeerate - it costs a lot to replace these 100 transactions.
         assert node.testmempoolaccept([tx_v3_replacement_only["hex"]], maxfeerate=0)[0]["allowed"]
         # Adding another one exceeds the limit.
         utxos_for_conflict.append(tx_v3_parent["new_utxos"][1])
-        tx_v3_child_2_rule5 = self.wallet.create_self_transfer_multi(utxos_to_spend=utxos_for_conflict, fee_per_output=4000000, version=3)
+        tx_v3_child_2_rule5 = self.create_mixed_spend(utxos_to_spend=utxos_for_conflict, fee=replacement_fee, version=3)
         rule5_str = f"too many potential replacements (including sibling eviction), rejecting replacement {tx_v3_child_2_rule5['txid']}; too many potential replacements (101 > 100)"
         assert_raises_rpc_error(-26, rule5_str, node.sendrawtransaction, tx_v3_child_2_rule5["hex"])
         self.check_mempool(txids_v2_100 + [tx_v3_parent["txid"], tx_v3_child_1["txid"]])
@@ -586,14 +661,15 @@ class MempoolTRUC(BitcoinTestFramework):
         self.check_mempool(txids_v2_100 + [tx_v3_parent["txid"], tx_v3_child_2["txid"]])
 
         self.log.info("Test that it's possible to do a sibling eviction and RBF at the same time")
-        utxo_unrelated_conflict = self.wallet.get_utxo(confirmed_only=True)
-        tx_unrelated_replacee = self.wallet.send_self_transfer(from_node=node, utxo_to_spend=utxo_unrelated_conflict)
+        utxo_unrelated_conflict = anchor_coins[4]
+        tx_unrelated_replacee = self.create_mixed_spend(utxos_to_spend=[utxo_unrelated_conflict], fee=1000)
+        node.sendrawtransaction(tx_unrelated_replacee["hex"])
         assert tx_unrelated_replacee["txid"] in node.getrawmempool()
 
         fee_to_beat = max(int(tx_v3_child_2["fee"] * COIN), int(tx_unrelated_replacee["fee"]*COIN))
 
-        tx_v3_child_3 = self.wallet.create_self_transfer_multi(
-            utxos_to_spend=[tx_v3_parent["new_utxos"][0], utxo_unrelated_conflict], fee_per_output=fee_to_beat*2, version=3
+        tx_v3_child_3 = self.create_mixed_spend(
+            utxos_to_spend=[tx_v3_parent["new_utxos"][0], utxo_unrelated_conflict], fee=fee_to_beat*2, version=3
         )
         node.sendrawtransaction(tx_v3_child_3["hex"])
         self.check_mempool(txids_v2_100 + [tx_v3_parent["txid"], tx_v3_child_3["txid"]])
@@ -644,27 +720,27 @@ class MempoolTRUC(BitcoinTestFramework):
         for minrelay_setting in (0, 5, 10, 100, 500, 1000, 5000, 333333, 2500000):
             self.log.info(f"-> Test -minrelaytxfee={minrelay_setting}sat/kvB...")
             setting_decimal = minrelay_setting / Decimal(COIN)
-            self.restart_node(0, extra_args=[f"-minrelaytxfee={setting_decimal:.8f}", "-persistmempool=0"])
+            self.restart_node(0, extra_args=[f"-minrelaytxfee={setting_decimal:.8f}", "-persistmempool=0"] + NODE_ARGS)
             minrelayfeerate = node.getmempoolinfo()["minrelaytxfee"]
             high_feerate = minrelayfeerate * 50
 
             tx_v3_0fee_parent = self.wallet.create_self_transfer(fee=0, fee_rate=0, confirmed_only=True, version=3)
             tx_v3_child = self.wallet.create_self_transfer(utxo_to_spend=tx_v3_0fee_parent["new_utxo"], fee_rate=high_feerate, version=3)
             total_v3_fee = tx_v3_child["fee"] + tx_v3_0fee_parent["fee"]
-            total_v3_size = tx_v3_child["tx"].get_vsize() + tx_v3_0fee_parent["tx"].get_vsize()
+            total_v3_size = self.node_vsize(tx_v3_child) + self.node_vsize(tx_v3_0fee_parent)
             assert_greater_than_or_equal(total_v3_fee, get_fee(total_v3_size, minrelayfeerate))
             if minrelayfeerate > 0:
-                assert_greater_than(get_fee(tx_v3_0fee_parent["tx"].get_vsize(), minrelayfeerate), 0)
+                assert_greater_than(get_fee(self.node_vsize(tx_v3_0fee_parent), minrelayfeerate), 0)
                 # Always need to pay at least 1 satoshi for entry, even if minimum feerate is very low
                 assert_greater_than(total_v3_fee, 0)
 
             tx_v2_0fee_parent = self.wallet.create_self_transfer(fee=0, fee_rate=0, confirmed_only=True, version=2)
             tx_v2_child = self.wallet.create_self_transfer(utxo_to_spend=tx_v2_0fee_parent["new_utxo"], fee_rate=high_feerate, version=2)
             total_v2_fee = tx_v2_child["fee"] + tx_v2_0fee_parent["fee"]
-            total_v2_size = tx_v2_child["tx"].get_vsize() + tx_v2_0fee_parent["tx"].get_vsize()
+            total_v2_size = self.node_vsize(tx_v2_child) + self.node_vsize(tx_v2_0fee_parent)
             assert_greater_than_or_equal(total_v2_fee, get_fee(total_v2_size, minrelayfeerate))
             if minrelayfeerate > 0:
-                assert_greater_than(get_fee(tx_v2_0fee_parent["tx"].get_vsize(), minrelayfeerate), 0)
+                assert_greater_than(get_fee(self.node_vsize(tx_v2_0fee_parent), minrelayfeerate), 0)
                 # Always need to pay at least 1 satoshi for entry, even if minimum feerate is very low
                 assert_greater_than(total_v2_fee, 0)
 
@@ -674,19 +750,25 @@ class MempoolTRUC(BitcoinTestFramework):
             result_non_truc = node.submitpackage([tx_v2_0fee_parent["hex"], tx_v2_child["hex"]], maxfeerate=0)
             if minrelayfeerate > 0:
                 assert_equal(result_non_truc["package_msg"], "transaction failed")
-                min_fee_parent = int(get_fee(tx_v2_0fee_parent["tx"].get_vsize(), minrelayfeerate) * COIN)
+                min_fee_parent = int(get_fee(self.node_vsize(tx_v2_0fee_parent), minrelayfeerate) * COIN)
                 assert_equal(result_non_truc["tx-results"][tx_v2_0fee_parent["wtxid"]]["error"], f"min relay fee not met, 0 < {min_fee_parent}")
                 self.check_mempool([tx_v3_0fee_parent["txid"], tx_v3_child["txid"]])
             else:
                 assert_equal(result_non_truc["package_msg"], "success")
                 self.check_mempool([tx_v2_0fee_parent["txid"], tx_v2_child["txid"], tx_v3_0fee_parent["txid"], tx_v3_child["txid"]])
 
+        # QTC: each loaded wallet (the default one and the MiniWallet's) warns about the last,
+        # very high -minrelaytxfee; the framework treats unexpected stderr at shutdown as a failure.
+        warning = "Warning: -minrelaytxfee is set very high! The wallet will avoid paying less than the minimum relay fee."
+        self.stop_node(0, expected_stderr="\n".join([warning] * 2))
+        self.start_node(0, extra_args=NODE_ARGS)
+
 
     def run_test(self):
         self.log.info("Generate blocks to create UTXOs")
         node = self.nodes[0]
-        self.wallet = MiniWallet(node)
-        self.generate(self.wallet, 200)
+        self.wallet = MiniWallet(node, mode=MiniWalletMode.ADDRESS_P2MR)
+        self.generate(self.wallet, 200)  # QTC: the cached chain has no P2MR coins
         self.test_truc_max_vsize()
         self.test_truc_acceptance()
         self.test_truc_replacement()

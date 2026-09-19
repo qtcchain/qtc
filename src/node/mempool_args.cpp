@@ -317,6 +317,17 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& argsman, const CChainP
         ApplyPermitEphemeralOption(argsman.GetSetting("-permitephemeral"), mempool_opts);
     }
 
+    // QTC: pay-to-anchor outputs are relay-standard (IsStandard) for TRUC / ephemeral-dust fee
+    // bumping, but on chains that enforce P2MR-only outputs at consensus
+    // (CheckReducedDataOutputLimits) no block could include them. Never let relay policy exceed
+    // consensus, or the mempool would accept and relay transactions that can never confirm.
+    if (chainparams.GetConsensus().fEnforceP2MROnlyOutputs && mempool_opts.permitephemeral_anchor) {
+        if (argsman.IsArgSet("-permitephemeral")) {
+            LogPrintf("Warning: anchor outputs are not consensus-valid on this chain; ignoring -permitephemeral anchor\n");
+        }
+        mempool_opts.permitephemeral_anchor = false;
+    }
+
     mempool_opts.persist_v1_dat = argsman.GetBoolArg("-persistmempoolv1", mempool_opts.persist_v1_dat);
 
     ApplyArgsManOptions(argsman, mempool_opts.limits);
