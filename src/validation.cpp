@@ -3653,8 +3653,8 @@ void Chainstate::MaybeUpdateMempoolForReorg(
                 vHashUpdate.push_back(txid);
                 // Reorg-resurrected transactions were previously removed from
                 // the unbroadcast set after their first successful relay. Add
-                // them back so the periodic rebroadcast path can announce them
-                // to fresh peers on the new active chain.
+                // them back so ReattemptInitialBroadcast re-announces them to
+                // all peers on the new active chain.
                 m_mempool->AddUnbroadcastTx(txid);
             }
             ++it;

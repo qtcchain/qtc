@@ -71,6 +71,16 @@ class MempoolUnbroadcastTest(BitcoinTestFramework):
         # ensure that unbroadcast txs are persisted to mempool.dat
         self.restart_node(0)
 
+        self.log.info("Check that a fresh peer is not handed the unbroadcast set at connect time")
+        # A new connection must see the same randomized trickle as every other peer.
+        # Announcing the unbroadcast set to it immediately would reveal exactly which
+        # transactions this node originated (only ReattemptInitialBroadcast, below,
+        # re-announces the set, to all peers at once).
+        fresh_peer = node.add_p2p_connection(P2PTxInvStore())
+        ensure_for(duration=3, f=lambda: len(fresh_peer.get_invs()) == 0)
+        assert_equal(node.getmempoolinfo()['unbroadcastcount'], unbroadcast_count)
+        node.disconnect_p2ps()
+
         self.log.info("Reconnect nodes & check if they are sent to node 1")
         self.connect_nodes(0, 1)
 

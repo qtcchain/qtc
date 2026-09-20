@@ -393,11 +393,6 @@ class RPCPackagesTest(BitcoinTestFramework):
 
     def test_submitpackage(self):
         node = self.nodes[0]
-        # QTC: a fresh peer is immediately sent invs for the mempool's unbroadcast set (txs submitted
-        # via RPC while no peer was connected), which would pollute P2PTxInvStore.wait_for_broadcast().
-        # Confirm everything first so the inv-store peers below only see the packages they wait for.
-        self.generate(node, 1)
-
         self.log.info("Submitpackage only allows valid hex inputs")
         valid_tx_list = self.wallet.create_self_transfer_chain(chain_length=2)
         hex_list = [valid_tx_list[0]["hex"][:-1] + 'X', valid_tx_list[1]["hex"]]

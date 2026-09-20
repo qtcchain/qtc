@@ -4612,7 +4612,6 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         }
 
         if (auto tx_relay = peer->GetTxRelay()) {
-            bool queued_unbroadcast_for_peer{false};
             LOCK(tx_relay->m_tx_inventory_mutex);
             const auto current_time{GetTime<std::chrono::microseconds>()};
             if (pfrom.IsInboundConn()) {
@@ -4622,28 +4621,12 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                 tx_relay->m_next_inv_send_time =
                     current_time + m_rng.rand_exp_duration(OUTBOUND_INVENTORY_BROADCAST_INTERVAL);
             }
-
-            // Fresh peers should also learn about transactions that are still
-            // pending initial broadcast or were resurrected by a reorg. Queue
-            // the current unbroadcast set onto this peer once the version
-            // handshake is complete so SendMessages can trickle them out with
-            // the normal randomized inventory timing.
-            const auto unbroadcast_txids{m_mempool.GetUnbroadcastTxs()};
-            for (const auto& txid : unbroadcast_txids) {
-                const auto tx{m_mempool.get(txid)};
-                if (tx == nullptr) continue;
-
-                const uint256 inv_hash{peer->m_wtxid_relay ? tx->GetWitnessHash().ToUint256() : txid};
-                if (tx_relay->m_tx_inventory_known_filter.contains(inv_hash)) continue;
-                if (tx_relay->m_tx_inventory_to_send.size() >= MAX_TX_INVENTORY_TO_SEND) break;
-
-                tx_relay->m_tx_inventory_to_send.insert(inv_hash);
-                queued_unbroadcast_for_peer = true;
-            }
-
-            if (queued_unbroadcast_for_peer) {
-                m_connman.WakeMessageHandler();
-            }
+            // Note: the unbroadcast set is deliberately NOT queued to a fresh peer here.
+            // Doing so hands every new connection the list of transactions only this
+            // node has (i.e. its own), which fingerprints transaction origin and
+            // bypasses a not-yet-loaded bloom filter. Pending and reorg-resurrected
+            // transactions reach new peers through ReattemptInitialBroadcast, which
+            // re-announces the set to all peers on a randomized 10-15 minute timer.
         }
 
         // Signal Dandelion++ support to this peer

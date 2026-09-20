@@ -53,6 +53,7 @@ TransactionError BroadcastTransaction(NodeContext& node, const CTransactionRef t
     Txid txid = tx->GetHash();
     uint256 wtxid = tx->GetWitnessHash();
     bool callback_set = false;
+    bool newly_accepted{false};
     int active_height{0};
 
     {
@@ -108,6 +109,7 @@ TransactionError BroadcastTransaction(NodeContext& node, const CTransactionRef t
             }
 
             // Transaction was accepted to the mempool.
+            newly_accepted = true;
 
             if (wait_callback && node.validation_signals) {
                 // For transactions broadcast from outside the wallet, make sure
@@ -167,11 +169,13 @@ TransactionError BroadcastTransaction(NodeContext& node, const CTransactionRef t
             node.peerman->RelayTransaction(txid, wtxid);
         }
 
-        if (!stemmed) {
-            // Only add to unbroadcast set when NOT using Dandelion++ stem relay.
-            // When stemmed, the embargo mechanism handles rebroadcast; adding to
-            // the unbroadcast set would cause ReattemptInitialBroadcast to fluff
-            // the transaction to all peers, bypassing Dandelion++ privacy.
+        if (!stemmed && newly_accepted) {
+            // The mempool tracks locally submitted transactions to make a
+            // best-effort initial broadcast. Only a newly accepted transaction
+            // enters the set (as upstream): re-submitting one that is already in
+            // the mempool must not re-flag it for rebroadcast. When stemmed, the
+            // Dandelion++ embargo handles rebroadcast; adding to the unbroadcast
+            // set would fluff the transaction to all peers and bypass stem privacy.
             node.mempool->AddUnbroadcastTx(txid);
         }
     }
