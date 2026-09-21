@@ -1,0 +1,84 @@
+# QTC release-signing keys
+
+Generated at the offline key ceremony on 2026-09-20/21 (runbook `doc/launch/`, ceremony kit). Verify these values
+against a second channel (the seed domain's website and the release announcement) before trusting a build.
+
+## 1. Update-manifest signing key (ML-DSA-44, post-quantum)
+
+Used by `qtc-util verifyupdatesig` and, once enabled, by the node's auto-update verifier
+(`-autoupdatepubkeyalgo=ml-dsa-44 -autoupdatepubkey=<hex>`). The launch release ships with auto-update OFF.
+
+- Algorithm: `ml-dsa-44`
+- SHA-256 fingerprint of the public key hex: `01839846fa960234bcca75039cbc08e687a9cefc150422b446ed7ee2db2967ce`
+- Public key (1312 bytes, hex):
+
+```
+9278b0d1d3ca1337ad4376922cb22a2bdbfc7f144002f639c2b91ba310e91c4c696beba1ad24b98ab327c602c68b7e8a
+d1ddca14da0b3d9ca11d20cdf82b44c443d01601338f7972ceba1cea37e27b4f83f4fdd185c153134470b899e95d46cd
+2c63cb262c017ed818f488fbfa07dd36d6e0a6f3649e40da28871edcc2c7a51ba8cf003302f9964f947e2b167d25171b
+a88445a9fe8e396b40636635e5e509c2fda4944a3cc5144580c37cbd575843bcb25b8308ef18104e378f6b281e76d0e9
+cbbc339615d148bc956e693b7d33fad49ed6aedbcab72caf23bf637a7708f3208f7e709ae7d6dcefaa15ec24b24ae8e0
+fe5014ecad989e9143af8a95f11ee25604a1d1ae8480701c5a59ad16850eb6199c3e09248f88a488a5027fc09817c37e
+c94f2efad2ffca477b75d2edef01ca64bfb3189f1a5c394d4981d974fcf084bc9f5dc0d341b4ec0c84d1deacd770cbc4
+0f13a4560cf26554d91d01471d051620c2f9470b5b1969f6383277ecfff2fed5198bf6cfd5b7b0fd6715935723e04f8f
+4daf91653bf7acae2c43f467be5dfa77d8581be2c6a5e25d7954edef55448ff081ddf570f3def6224105f642de966622
+cccec1ea1e3fb34cba28379540380ed3019e21fde23975d0e5271555063db3ff22357ef1adb2f7736f86c1de0899b02b
+8cc62a98cd2ad55217ea88cf99e1de6e892779cc46a96f7a1291a0069928f5d7d2662e0c3a3b6fa62c45a4e65ebcc9c2
+14a1af552e7b9107447e9b2afdc456abc6b3ec560a75f1dea58c53331ed6de7589a8cf03be8b06cb8e1db925757c1b27
+76e8388e8af8869c750e287f4a11d890e6c0a13da79bce865f2fb00998e7084386bb106b112e4617658b199e4917868e
+f665f99eda9fb96fedfcd475297ce832a569391ff2e067829cf0a6af90eb7cf2ca325e01ed8c8fb0a07fc1211a024203
+0c2b1a07ca8f1bca5a127eb38cbac7a5fcdac831aaac1b62243c114b86eed5aae67892a4fc702795abea7275d535ac27
+f10be1229b03dd484c54db212b208d2d29fbd788e1fd9d34ce0121e9b108288b56fe49e3a6b85cb1c7a30a56eccabad5
+dafd2c3571fabda8858601fb87570504e7f714d043365df0a4cf5117187b1d7f79a01359a8e52b98ef9b1ba0ef8fbda4
+02f3fe942dd6cd12db561737dc7ba6d938ad4302fdecbdea5d337a8c8fe4776817e0560c53c0d455dfd4af36c71d4274
+12f5feb97262599e805519474c5ac6a24ba7160badc39cf2345fc88e571d2d41ea183ea78a78e9adaaf265cb7e5cc4bb
+a4d9803e224eb24fddf182fab7fe99399614ddf5ba949f24e23bb913ad92e540ed0d339feab02514aa9b7afd129ba87c
+7ab0b7c53a4d2974b2263e9303e6b5e3821b17d0fb531b7005b8255b1da04f8b41b5236d61a6be04aac53b7ec1d340c5
+824174e8882c0dbf6fb772b664b11b4694489dd9260e99c559b2d8d97df2f15c7d09bdfb7df0e338b0a7660fd354acac
+7efa1933ab0bde4ffe789f307a6eb538653e6eb6829b51c0cc9fb51a6c285b638e1aca9220ba614553cc8adafeedb1c9
+ad91b263a870bb72a670f5c015de906a75414e9a131fb569db39c992f33ca578604686806310e1c4d900581afc258fb6
+726601e47c21c26b21170bae3f8b8b8153c7de16da385128103de963f100438011c50c086443c3e360704373c9648994
+4d9320cbb50ad436d1d6ebaba72c9c178488d0cc5c23fe119bb4f5097e7e91c2ac47b7bdd7568c1b979a8e3ce74083ac
+67744ca6dd758d26da13b0a71bcaf14ef6de6e1bcba53ab60a3f4080dd69b65a161db6d86c334ec3e9f6f84bbfe5f95d
+0cc7a560795be598308d2ce19e567191
+```
+
+Verify a signed file:
+
+```
+qtc-util verifyupdatesig ml-dsa-44 <pubkey-hex> <file> <file>.sig
+```
+
+## 2. Checksum-signing key (OpenPGP, ed25519)
+
+Signs `SHA256SUMS` for every release. Classical key; it protects the download page only, the ML-DSA key above
+protects the update channel.
+
+- User ID: `QTC Release Signing <release@qtc.gold>`
+- Fingerprint: `72DD 01B8 E4BD 52FF BE1D  6576 1E28 9F6E CD6C BF30`
+- Valid: 2026-09-21 to 2028-09-20 (rotated before expiry)
+
+```
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEarB9VBYJKwYBBAHaRw8BAQdAv7IIgxNzMjK09gaE+LlAMvu/Q72gen/15mxe
+RlpcBEO0JlFUQyBSZWxlYXNlIFNpZ25pbmcgPHJlbGVhc2VAcXRjLmdvbGQ+iJkE
+ExYKAEEWIQRy3QG45L1S/74dZXYeKJ9uzWy/MAUCarB9VAIbAwUJA8JnAAULCQgH
+AgIiAgYVCgkICwIEFgIDAQIeBwIXgAAKCRAeKJ9uzWy/MAbmAQDSKplyqjGg7qbC
+j2YiPjFctLe4GH/KNoNacDRFGjiuDwD8CkRE1jJ8dumGg6IpCE0ZOYeMD4zKf1mT
+yDuHdYSu2gE=
+=jHdC
+-----END PGP PUBLIC KEY BLOCK-----
+```
+
+Import and verify:
+
+```
+gpg --import qtc-release-signing.asc
+gpg --verify SHA256SUMS.asc SHA256SUMS
+```
+
+## 3. What is not here
+
+No private material exists on any networked machine. The seeds live on paper and on two encrypted USB sticks held
+offline; release signatures are produced on an air-gapped machine and only the `.sig`/`.asc` files come online.
