@@ -57,10 +57,10 @@ Get JSON output and don't prompt for user input (no auto key import):
 ```
 
 Rely only on local GPG state and manually specified keys, while requiring a
-threshold of at least 10 trusted signatures:
+threshold of at least 1 trusted signature (the QTC release-signing key, see doc/release-signing-keys.md):
 ```sh
 ./contrib/verify-binaries/verify.py \
-    --trusted-keys 74E2DEF5D77260B98BC19438099BAD163C70FBFA,9D3CC86A72F8494342EA5FD10A41BDC3F4FAFF1C \
+    --trusted-keys 72DD01B8E4BD52FFBE1D65761E289F6ECD6CBF30 \
     --min-good-sigs 10 pub 22.0-linux
 ```
 
