@@ -1,0 +1,68 @@
+{{define "content"}}
+{{$t := .Data.T}}{{$dec := .Data.Dec}}
+<h1>Transaction</h1>
+<p class="mono hash">{{$t.Txid}}</p>
+{{if $t.Shielded}}<div class="banner {{if eq .Data.Chain "main"}}warn{{end}}">Shielded transaction{{if eq .Data.Chain "main"}} — unexpected on mainnet (shielded surface is disabled from genesis){{else}} (test network){{end}}: {{$t.ShieldedIn}} shielded inputs, {{$t.ShieldedOut}} shielded outputs.</div>{{end}}
+<div class="grid">
+<div class="card">
+  <h2>Summary</h2>
+  <dl>
+    <dt>Status</dt><dd>{{if $t.Unconfirmed}}<span class="badge">unconfirmed</span> in mempool{{else}}{{$t.Confirmations}} confirmations{{end}}</dd>
+    {{if not $t.Unconfirmed}}<dt>Block</dt><dd><a href="/block/{{$t.BlockHash}}">{{$t.Height}}</a> · {{utc $t.BlockTime}}</dd>{{end}}
+    <dt>Size / weight</dt><dd>{{int $t.Size}} B / {{int $t.Weight}} WU</dd>
+    {{if $t.Coinbase}}<dt>Type</dt><dd>coinbase</dd>{{else}}
+    <dt>Fee</dt><dd>{{qtc $t.Fee}} ({{rate $t.FeeRate}} atoms/B)</dd>
+    <dt>Input value</dt><dd>{{qtc $t.InputValue}}</dd>{{end}}
+    <dt>Output value</dt><dd>{{qtc $t.OutputValue}}</dd>
+    <dt>Version</dt><dd>{{$t.Version}}</dd>
+    <dt>Locktime</dt><dd>{{$t.Locktime}}{{if $t.AntiFeeSnipe}} <span class="badge">anti-fee-sniping</span>{{end}}</dd>
+    <dt>Hash (wtxid)</dt><dd class="mono">{{$t.Hash}}</dd>
+  </dl>
+</div>
+<div class="card">
+  <h2>Inputs ({{len $t.Vin}})</h2>
+  <ol class="io">
+  {{range $i, $in := $t.Vin}}
+    <li>
+      {{if $in.Coinbase}}<span class="badge">coinbase</span> <span class="mono">{{$in.Coinbase}}</span>
+      {{else if $in.Nullifier}}<span class="badge">shielded</span> nullifier <span class="mono">{{short $in.Nullifier}}</span>
+      {{else}}
+      <span class="mono"><a href="/tx/{{$in.Txid}}">{{short $in.Txid}}</a>:{{$in.Vout}}</span>
+      {{if $in.Address}}<br><a class="mono" href="/address/{{$in.Address}}">{{$in.Address}}</a>{{end}}
+      <br><strong>{{qtc $in.Value}}</strong>
+      {{with index $dec $i}}{{if .IsP2MR}}
+        <div class="pq">
+          <span class="badge pq">P2MR</span>
+          {{if eq .Algorithm "mldsa44"}}ML-DSA-44{{else if eq .Algorithm "slhdsa"}}SLH-DSA{{else if eq .Algorithm "multisig"}}PQ multisig ({{.Keys}} keys){{else if eq .Algorithm "csfs"}}CHECKSIGFROMSTACK{{else}}unknown leaf{{end}}
+          {{if .Variant}}<span class="badge">{{.Variant}}</span>{{end}}
+          · sig {{.SigBytes}} B · leaf {{.LeafBytes}} B · leaf version 0x{{printf "%02x" .LeafVersion}} · {{.Siblings}} merkle sibling{{if ne .Siblings 1}}s{{end}}
+          {{if .Note}}<br><em>{{.Note}}</em>{{end}}
+        </div>
+      {{end}}{{end}}
+      {{end}}
+      <details><summary>sequence {{$in.Sequence}}{{if $in.Witness}}, witness {{len $in.Witness}} items{{end}}</summary>
+        {{range $in.Witness}}<div class="mono wrap-any small">{{.}}</div>{{end}}
+      </details>
+    </li>
+  {{end}}
+  </ol>
+</div>
+<div class="card">
+  <h2>Outputs ({{len $t.Vout}})</h2>
+  <ol class="io" start="0">
+  {{range $t.Vout}}
+    <li>
+      {{if .Address}}<a class="mono" href="/address/{{.Address}}">{{.Address}}</a>{{else}}<span class="mono wrap-any">{{.Asm}}</span>{{end}}
+      <br><strong>{{qtc .Value}}</strong> <span class="badge">{{typeName .Type}}</span>
+      {{if lt .Value 11583}}{{if gt .Value 0}}<span class="badge warn">dust</span>{{end}}{{end}}
+      {{if .SpentBy}}· spent by <a class="mono" href="/tx/{{.SpentBy}}">{{short .SpentBy}}</a>{{end}}
+      {{if .NoteCommitment}}<br>note commitment <span class="mono">{{short .NoteCommitment}}</span>{{end}}
+      <details><summary>script</summary><div class="mono wrap-any small">{{.Script}}</div></details>
+    </li>
+  {{end}}
+  </ol>
+</div>
+</div>
+<div class="card"><details><summary>Raw transaction hex ({{len $t.Hex}} chars)</summary><div class="mono wrap-any small">{{$t.Hex}}</div></details>
+<p><a href="/api/v1/tx/{{$t.Txid}}">JSON</a> · <a href="/api/v1/tx/{{$t.Txid}}/hex">hex</a></p></div>
+{{end}}

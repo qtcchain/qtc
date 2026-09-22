@@ -1,0 +1,25 @@
+{{define "content"}}
+<h1>JSON API</h1>
+<div class="card">
+<p>Base path <span class="mono">/api/v1</span>. Amounts are integers in atoms. Hashes are big-endian hex.</p>
+<table><thead><tr><th>Method</th><th>Path</th><th>Returns</th></tr></thead><tbody>
+<tr><td>GET</td><td class="mono">/chain</td><td>tip, difficulty, mempool size, indexer lag</td></tr>
+<tr><td>GET</td><td class="mono">/status</td><td>indexer status</td></tr>
+<tr><td>GET</td><td class="mono">/blocks?before=&amp;limit=</td><td>block summaries, newest first</td></tr>
+<tr><td>GET</td><td class="mono">/block/{hash|height}</td><td>block record with confirmations</td></tr>
+<tr><td>GET</td><td class="mono">/block/{hash|height}/header</td><td>the 182-byte header fields</td></tr>
+<tr><td>GET</td><td class="mono">/tx/{txid}</td><td>decoded transaction with P2MR witness decoding</td></tr>
+<tr><td>GET</td><td class="mono">/tx/{txid}/hex</td><td>raw hex</td></tr>
+<tr><td>GET</td><td class="mono">/tx/{txid}/status</td><td>confirmation status</td></tr>
+<tr><td>POST</td><td class="mono">/tx/broadcast</td><td><span class="mono">{"hex": "…"}</span> → <span class="mono">{"txid": "…"}</span>; 64 KiB limit, testmempoolaccept first, rate limited</td></tr>
+<tr><td>GET</td><td class="mono">/address/{addr}</td><td>balance and counters</td></tr>
+<tr><td>GET</td><td class="mono">/address/{addr}/txs?before=&amp;limit=</td><td>history, newest first</td></tr>
+<tr><td>GET</td><td class="mono">/address/{addr}/utxo?from=&amp;limit=</td><td>unspent outputs with script_pubkey for wallet verification</td></tr>
+<tr><td>GET</td><td class="mono">/mempool</td><td>count, bytes, fee-rate histogram</td></tr>
+<tr><td>GET</td><td class="mono">/mempool/txids</td><td>txid list</td></tr>
+<tr><td>GET</td><td class="mono">/fees</td><td>estimatesmartfee in atoms/B</td></tr>
+<tr><td>GET</td><td class="mono">/difficulty</td><td>getdifficultyhealth plus the last 120 block samples</td></tr>
+<tr><td>GET</td><td class="mono">/search?q=</td><td>resolves height, hash, digest, txid, address or prefix</td></tr>
+</tbody></table>
+</div>
+{{end}}

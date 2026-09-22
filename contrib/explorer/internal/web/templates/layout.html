@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} · QTC {{.Chain}} explorer</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="wrap bar">
+    <a class="brand" href="/">QTC<span class="net net-{{.Chain}}">{{.Chain}}</span></a>
+    <nav>
+      <a href="/blocks">Blocks</a>
+      <a href="/mempool">Mempool</a>
+      <a href="/difficulty">Difficulty</a>
+      <a href="/api">API</a>
+      <a href="/status">Status</a>
+    </nav>
+    <form class="search" action="/search" method="get">
+      <input type="search" name="q" placeholder="height, block hash, digest, txid, address, or prefix" value="{{.Query}}" required>
+      <button type="submit">Search</button>
+    </form>
+  </div>
+</header>
+{{if ne .Chain "main"}}<div class="banner">This is the <strong>{{.Chain}}</strong> network. Coins here have no value.</div>{{end}}
+{{if .Status.Halted}}<div class="banner warn">Indexer halted: {{.Status.LastError}}</div>{{else if gt .Status.Lag 3}}<div class="banner warn">Indexer is {{.Status.Lag}} blocks behind the node.</div>{{end}}
+<main class="wrap">
+{{template "content" .}}
+</main>
+<footer class="wrap">
+  <span>Indexed height {{.Status.IndexedHeight}} · node {{.Status.NodeHeight}} · {{.Status.Docs}} documents in Bleve</span>
+  <span>Amounts in QTC; 1 QTC = 100,000,000 atoms. No witness discount: 1 vB = 1 byte.</span>
+</footer>
+</body>
+</html>

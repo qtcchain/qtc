@@ -1,0 +1,54 @@
+{{define "content"}}
+{{$d := .Data}}
+<section class="grid">
+  <div class="card">
+    <h2>Chain</h2>
+    <dl>
+      <dt>Height</dt><dd>{{.Status.IndexedHeight}}</dd>
+      {{with $d.Health}}
+      <dt>Difficulty</dt><dd>{{with index . "tip"}}{{diff (index . "difficulty")}}{{end}}</dd>
+      <dt>Target spacing</dt><dd>{{$d.Target}} s</dd>
+      {{with index . "recent"}}<dt>Mean interval (120)</dt><dd>{{rate (index . "mean_interval_s")}} s</dd>{{end}}
+      {{with index . "network"}}<dt>Peers</dt><dd>{{index . "connected_peers"}}</dd>{{end}}
+      {{end}}
+      <dt>Mempool</dt><dd>{{.Status.MempoolSize}} tx</dd>
+    </dl>
+  </div>
+  <div class="card span2">
+    <h2>Block intervals (last {{len $d.Recent}})</h2>
+    {{chart $d.Recent $d.Target}}
+  </div>
+</section>
+<section class="card">
+  <h2>Latest blocks <a class="more" href="/blocks">all →</a></h2>
+  <table>
+    <thead><tr><th>Height</th><th>Age</th><th>Txs</th><th>Size</th><th>Interval</th><th>Reward</th><th>Hash</th></tr></thead>
+    <tbody>
+    {{range $d.Blocks}}
+    <tr>
+      <td><a href="/block/{{.Hash}}">{{.Height}}</a></td>
+      <td>{{ago .Time}}</td>
+      <td>{{.NTx}}</td>
+      <td>{{int .Size}} B</td>
+      <td>{{.Interval}} s</td>
+      <td>{{qtc .CoinbaseValue}}{{if .Penalised}} <span class="badge warn">penalty</span>{{end}}</td>
+      <td class="mono"><a href="/block/{{.Hash}}">{{short .Hash}}</a></td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+</section>
+<section class="card">
+  <h2>Mempool <a class="more" href="/mempool">all →</a></h2>
+  {{if $d.Mempool}}
+  <table>
+    <thead><tr><th>Txid</th><th>Size</th><th>Fee</th><th>Rate</th><th>Seen</th></tr></thead>
+    <tbody>
+    {{range $d.Mempool}}
+    <tr><td class="mono"><a href="/tx/{{.Txid}}">{{short .Txid}}</a></td><td>{{int .Size}} B</td><td>{{qtc .Fee}}</td><td>{{if .Size}}{{rate (divf .Fee .Size)}}{{end}} atoms/B</td><td>{{ago .FirstSeen}}</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}<p class="muted">Mempool is empty.</p>{{end}}
+</section>
+{{end}}
