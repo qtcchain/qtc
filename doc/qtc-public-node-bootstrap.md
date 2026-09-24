@@ -34,11 +34,11 @@ Create `~/.qtc/qtc.conf` (QTC runtime canonical config path):
 ```ini
 server=1
 listen=1
-port=19335
+port=19755
 
 rpcbind=127.0.0.1
 rpcallowip=127.0.0.1
-rpcport=19334
+rpcport=19754
 
 # Keep archival history for deterministic bootstrap service
 prune=0
@@ -50,18 +50,16 @@ fixedseeds=1
 addnode=157.230.194.146:19755
 addnode=167.99.181.131:19755
 addnode=209.38.113.122:19755
-addnode=146.190.179.86:19335
-addnode=164.90.246.229:19335
 ```
 
 Notes:
 
-- `19335` is the QTC mainnet P2P port.
-- `19334` is the QTC mainnet default RPC port.
+- `19755` is the QTC mainnet P2P port.
+- `19754` is the QTC mainnet default RPC port.
 - `addnode=` seeds initial peers while preserving broader peer discovery.
 - the DNS seeds are `seed.qtc.gold` and `seed.qtc.exchange` (two providers, two registrars);
-  direct IP addnodes to the two inbound launch nodes are optional
-  archive-node hints for controlled troubleshooting
+  the three `addnode=` entries are the fixed public seed nodes (Singapore, Toronto,
+  Frankfurt) and match `contrib/seeds/nodes_main.txt`
 - `getblocktemplate` enforces an outbound peer floor on mainnet by default
   (`-miningminoutboundpeers=3`) to reduce isolated-mining orphan risk.
   Set `-miningminoutboundpeers=0` only for intentional isolated lab mining.
@@ -96,7 +94,7 @@ Notes:
 
 Expected:
 
-- peers connected on `:19335`,
+- peers connected on `:19755`,
 - `networkactive: true`,
 - `pruned: false` in `getblockchaininfo`.
 - continuous progress in `blocks` and `headers` (no long-lived stall).
