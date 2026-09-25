@@ -538,3 +538,15 @@ overshoot for no safety gain.
 **Consequences:** launch-day checklist item "floor + genesis regen" is a single script run; the test chains already
 carry the value, so the burn-in is a faithful rehearsal of mainnet difficulty behaviour. Revisit only if the launch
 fleet changes below one RTX 6000 Ada equivalent.
+
+**Signed off by the owner on 2026-09-25 ("keep the floor"), with the burn-in evidence in hand:**
+
+- Two-miner fleet (RTX 6000 Ada 16,200 digests/s + RTX 4090 ≈ 23,500 digests/s, ≈ 39,000–43,000 total): the test chain
+  left the floor within a day of the second miner joining and ASERT converged toward 600 s (bits `1e00e917` and
+  tightening at block 1,481; verifier 0 mismatches over the whole window). 693 blocks in 72 h at 377 s average while
+  climbing off the floor.
+- Single RTX 6000 Ada (blocks 392–787, 69 h): 937 s average at the floor — no stall, ASERT pinned. The benchmark figure
+  of 25,060 digests/s that predicted 600 s for this case overstated the sustained rate; the live rate is 16,200/s.
+- Consequence recorded as a launch requirement: **at least two GPU miners at launch**; a single-card fleet is a
+  degraded mode that still produces blocks (≈ 15–18 min) but does not hold the target spacing.
+- Applied at the launch-day genesis regeneration only; mainnet stays at `0x1e033333` in the tree until then.
