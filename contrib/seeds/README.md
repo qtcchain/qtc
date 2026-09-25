@@ -72,3 +72,21 @@ python3 makeseeds.py -a asmap-filled.dat -s seeds_testnet4.txt -m 72600 > nodes_
 python3 makeseeds.py -a asmap-filled.dat -s seeds_signet.txt > nodes_signet.txt
 python3 generate-seeds.py . > ../../src/chainparamsseeds.h
 ```
+
+## DNS records the seed names need
+
+Nodes do not resolve the bare seed name. Like Bitcoin Core, `ThreadDNSAddressSeed` prepends the required service
+bits and looks up `x<bits>.<seed>` (for QTC's launch flags that is `x9.seed.qtc.gold`, `x9.testnet-seed.qtc.gold`,
+and the same under `qtc.exchange`). If only the bare `seed.<domain>` A records exist, every lookup is NXDOMAIN, the
+node logs `0 addresses found from DNS seeds` and falls back to an `addr-fetch` connection to the seed host itself,
+which is a single point of contact. Each seed name therefore needs a **wildcard** A record set alongside the bare
+one:
+
+| Zone | Records (each pointing at every seed IP) |
+|---|---|
+| qtc.gold (Cloudflare, DNS-only) | `seed`, `*.seed`, `testnet-seed`, `*.testnet-seed` |
+| qtc.exchange (DigitalOcean DNS) | `seed`, `*.seed`, `testnet-seed`, `*.testnet-seed` |
+
+Verify from a machine without a local caching resolver: `dig +short A x9.testnet-seed.qtc.gold` must return the seed
+IPs, and a node started with `-forcednsseed=1` must log `N addresses found from DNS seeds` with N > 0. Found and
+fixed during the testnet burn-in on 2026-09-25 (programme log §30).
