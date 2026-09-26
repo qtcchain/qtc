@@ -321,6 +321,11 @@ void RegenerateCommitments(CBlock& block, ChainstateManager& chainman);
 
 /** Apply -blockmintxfee and -blockmaxweight options from ArgsManager to BlockAssembler options. */
 void ApplyArgsManOptions(const ArgsManager& gArgs, BlockAssembler::Options& options);
+/** Output-shape rule the block assembler applies before selecting a mempool transaction; must agree with
+ *  CheckReducedDataOutputLimits in validation.cpp (P2MR, pay-to-anchor and bounded OP_RETURN only on
+ *  chains with fReducedDataLimits). Exposed for unit tests. */
+bool TemplateOutputsPassReducedDataLimits(const CTransaction& tx, const Consensus::Params& consensus);
+
 } // namespace node
 
 #endif // BITCOIN_NODE_MINER_H
