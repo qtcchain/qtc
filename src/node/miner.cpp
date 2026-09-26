@@ -78,7 +78,11 @@ bool IsP2MROutputScript(const CScript& script_pub_key)
         if (script_size > consensus.nMaxTxoutScriptPubKeyBytes) {
             return false;
         }
-        if (consensus.fEnforceP2MROnlyOutputs && !IsP2MROutputScript(txout.scriptPubKey)) {
+        // Mirror CheckReducedDataOutputLimits (validation.cpp): besides P2MR, the 4-byte pay-to-anchor
+        // output is consensus-valid, so the assembler must not leave anchor-creating transactions
+        // sitting in the mempool unminable.
+        if (consensus.fEnforceP2MROnlyOutputs && !IsP2MROutputScript(txout.scriptPubKey) &&
+            !txout.scriptPubKey.IsPayToAnchor()) {
             return false;
         }
     }
@@ -801,6 +805,12 @@ PackageSelectionCandidate BuildPackageSelectionCandidate(const CTxMemPool& mempo
     return lhs.iter->GetTx().GetHash() < rhs.iter->GetTx().GetHash();
 }
 } // namespace
+
+bool TemplateOutputsPassReducedDataLimits(const CTransaction& tx, const Consensus::Params& consensus)
+{
+    return PassesReducedDataOutputLimits(tx, consensus);
+}
+
 
 int64_t GetMinimumTime(const CBlockIndex* pindexPrev, const Consensus::Params& consensus_params)
 {

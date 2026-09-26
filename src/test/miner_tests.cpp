@@ -12,6 +12,7 @@
 #include <hash.h>
 #include <interfaces/mining.h>
 #include <node/miner.h>
+#include <chainparams.h>
 #include <policy/policy.h>
 #include <pow.h>
 #include <rpc/server_util.h>
@@ -1741,6 +1742,36 @@ BOOST_AUTO_TEST_CASE(height_overflow_guards)
 
     LOCK(cs_main);
     tip->nHeight = original_height;
+}
+
+
+BOOST_AUTO_TEST_CASE(template_output_rule_matches_consensus_for_anchor_outputs)
+{
+    // Regression: the assembler's copy of the reduced-data output rule rejected pay-to-anchor outputs
+    // after consensus admitted them, so anchor-creating transactions sat in every mempool unminable
+    // (found on the testnet burn-in, 2026-09-26).
+    const auto main_params = CreateChainParams(*m_node.args, ChainType::MAIN);
+    const Consensus::Params& consensus = main_params->GetConsensus();
+    BOOST_REQUIRE(consensus.fReducedDataLimits);
+    BOOST_REQUIRE(consensus.fEnforceP2MROnlyOutputs);
+
+    const CScript p2mr = CScript() << OP_2 << std::vector<unsigned char>(32, 0xab);
+    const CScript anchor = CScript() << OP_1 << std::vector<unsigned char>{0x4e, 0x73};
+    const CScript p2wpkh = CScript() << OP_0 << std::vector<unsigned char>(20, 0xcd);
+
+    CMutableTransaction tx;
+    tx.vin.emplace_back(COutPoint(Txid::FromUint256(uint256{1}), 0));
+    tx.vout.emplace_back(CAmount{100000}, anchor);
+    tx.vout.emplace_back(CAmount{50 * COIN}, p2mr);
+    BOOST_CHECK(node::TemplateOutputsPassReducedDataLimits(CTransaction(tx), consensus));
+
+    CMutableTransaction bad{tx};
+    bad.vout[0].scriptPubKey = p2wpkh;
+    BOOST_CHECK(!node::TemplateOutputsPassReducedDataLimits(CTransaction(bad), consensus));
+
+    CMutableTransaction oversized{tx};
+    oversized.vout[0].scriptPubKey = CScript() << OP_RETURN << std::vector<unsigned char>(consensus.nMaxOpReturnBytes, 0x51);
+    BOOST_CHECK(!node::TemplateOutputsPassReducedDataLimits(CTransaction(oversized), consensus));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
