@@ -1607,6 +1607,59 @@ BOOST_AUTO_TEST_CASE(update_time_clamps_to_future_mtp_policy)
     SetMockTime(0);
 }
 
+BOOST_AUTO_TEST_CASE(frozen_ceiling_template_gets_random_search_start)
+{
+    // Regression: after a stall longer than the future-drift window, every template for the tip is
+    // byte-identical (nTime pinned at MTP + drift, same coinbase), and a zero-start nonce search
+    // re-scanned the same range on each generatetoaddress call, deadlocking the chain
+    // (testnet burn-in T1, 2026-09-27).
+    auto consensus{m_node.chainman->GetConsensus()};
+    consensus.fMatMulPOW = true;
+    consensus.nMatMulMaxFutureMtpDriftHeight = 0;
+    consensus.nMatMulMaxFutureMtpDrift = 3'600;
+
+    auto chain{MakeIndexChain(/*count=*/11, /*start_time=*/1'700'000'000, /*spacing=*/90)};
+    const CBlockIndex* tip{&chain.back()};
+    const auto max_time{node::GetMaximumTime(tip, consensus)};
+    BOOST_REQUIRE(max_time.has_value());
+
+    FastRandomContext rng{/*fDeterministic=*/true};
+    CBlockHeader header{};
+
+    // Normal operation: time still advancing, zero start kept (templates differ by nTime).
+    header.nTime = *max_time - 600;
+    BOOST_CHECK(!node::TemplateTimeFrozenAtCeiling(header, tip, consensus, *max_time - 600));
+    BOOST_CHECK_EQUAL(node::SelectMatMulSearchStartNonce(header, tip, consensus, *max_time - 600, rng), 0U);
+
+    // Exactly at the ceiling but wall clock not past it: the next second still yields a new template.
+    header.nTime = *max_time;
+    BOOST_CHECK(!node::TemplateTimeFrozenAtCeiling(header, tip, consensus, *max_time));
+
+    // Stalled past the ceiling: UpdateTime pins nTime, and the search start must be randomised.
+    const int64_t now{*max_time + 14 * 3'600};
+    SetMockTime(now);
+    header.nTime = 0;
+    node::UpdateTime(&header, consensus, tip);
+    BOOST_CHECK_EQUAL(header.GetBlockTime(), *max_time);
+    BOOST_CHECK(node::TemplateTimeFrozenAtCeiling(header, tip, consensus, now));
+    const uint64_t first{node::SelectMatMulSearchStartNonce(header, tip, consensus, now, rng)};
+    const uint64_t second{node::SelectMatMulSearchStartNonce(header, tip, consensus, now, rng)};
+    BOOST_CHECK_NE(first, second);
+    BOOST_CHECK_LT(first, uint64_t{1} << 63);
+    BOOST_CHECK_LT(second, uint64_t{1} << 63);
+
+    // A caller-chosen nonce is never overridden.
+    header.nNonce64 = 42;
+    BOOST_CHECK_EQUAL(node::SelectMatMulSearchStartNonce(header, tip, consensus, now, rng), 42U);
+
+    // Drift cap inactive: nothing is frozen.
+    auto disabled{consensus};
+    disabled.nMatMulMaxFutureMtpDriftHeight = std::numeric_limits<int32_t>::max();
+    header.nNonce64 = 0;
+    BOOST_CHECK(!node::TemplateTimeFrozenAtCeiling(header, tip, disabled, now));
+    SetMockTime(0);
+}
+
 BOOST_AUTO_TEST_CASE(a5_timewarp_drift_reconciliation_prevents_boundary_halt)
 {
     // a5 fix: at a drift-cap activation boundary an unprotected predecessor can carry a blocktime
