@@ -4704,7 +4704,12 @@ static RPCHelpMan getnetworkhashps()
     };
 }
 
-static bool GenerateBlock(ChainstateManager& chainman, CBlock&& block, uint64_t& max_tries, std::shared_ptr<const CBlock>& block_out, bool process_new_block, const NodeContext* node_context = nullptr)
+//! Serializes the post-mining stale-tip check, validity check and submission
+//! across concurrent GenerateBlock callers, so that of two blocks mined on the
+//! same tip only the first is submitted. Always acquired before cs_main.
+static GlobalMutex g_generate_block_submit_mutex;
+
+static bool GenerateBlock(ChainstateManager& chainman, CBlock&& block, uint64_t& max_tries, std::shared_ptr<const CBlock>& block_out, bool process_new_block, const NodeContext* node_context = nullptr, bool test_block_validity = false)
 {
     block_out.reset();
     block.hashMerkleRoot = BlockMerkleRoot(block);
@@ -4869,27 +4874,53 @@ static bool GenerateBlock(ChainstateManager& chainman, CBlock&& block, uint64_t&
     LogDebug(BCLog::MINING, "GenerateBlock: mining completed, block hash=%s, process_new_block=%s\n",
              block_out->GetHash().GetHex(), process_new_block ? "true" : "false");
 
-    if (!process_new_block) return true;
+    if (!process_new_block && !test_block_validity) return true;
 
-    // Verify the chain tip has not changed during the (potentially long) mining
-    // loop. If the tip moved, the mined block is stale and ProcessNewBlock would
-    // either reject it or, worse, hit an assertion in TestBlockValidity.
+    LOCK(g_generate_block_submit_mutex);
     {
+        // Verify the chain tip has not changed during the (potentially long) mining
+        // loop. If the tip moved, the mined block is stale: ProcessNewBlock would
+        // store it as a sibling that is not on the active chain, and
+        // TestBlockValidity can only check blocks built on the current tip.
         LOCK(chainman.GetMutex());
-        const CBlockIndex* current_tip = chainman.ActiveChain().Tip();
+        CBlockIndex* current_tip = chainman.ActiveChain().Tip();
         if (!current_tip || current_tip->GetBlockHash() != tip_hash_before_mining) {
             LogWarning("GenerateBlock: chain tip changed during mining (before=%s, now=%s); mined block is stale\n",
                        tip_hash_before_mining.GetHex(),
                        current_tip ? current_tip->GetBlockHash().GetHex() : "null");
             throw JSONRPCError(RPC_INTERNAL_ERROR, "chain tip changed during mining; mined block is stale");
         }
+
+        // Callers skip the pre-mining TestBlockValidity when the block's PoW fields
+        // (such as the MatMul seeds) are only set while solving; check it now.
+        if (test_block_validity) {
+            BlockValidationState state;
+            if (!TestBlockValidity(state, chainman.GetParams(), chainman.ActiveChainstate(), *block_out, current_tip, /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/false)) {
+                LogWarning("GenerateBlock: TestBlockValidity failed at height %d: %s\n", next_height, state.ToString());
+                throw JSONRPCError(RPC_VERIFY_ERROR, strprintf("TestBlockValidity failed: %s", state.ToString()));
+            }
+        }
     }
 
+    if (!process_new_block) return true;
+
+    // ProcessNewBlock must be called without cs_main. Concurrent GenerateBlock
+    // callers wait on g_generate_block_submit_mutex and then see the new tip,
+    // but a block from a peer can still connect first, so confirm afterwards
+    // that the submitted block is on the active chain.
     LogDebug(BCLog::MINING, "GenerateBlock: submitting block %s via ProcessNewBlock\n",
              block_out->GetHash().GetHex());
     if (!chainman.ProcessNewBlock(block_out, /*force_processing=*/true, /*min_pow_checked=*/true, nullptr)) {
         LogWarning("GenerateBlock: ProcessNewBlock rejected block %s\n", block_out->GetHash().GetHex());
         throw JSONRPCError(RPC_INTERNAL_ERROR, "ProcessNewBlock, block not accepted");
+    }
+    {
+        LOCK(chainman.GetMutex());
+        const CBlockIndex* pindex = chainman.m_blockman.LookupBlockIndex(block_out->GetHash());
+        if (!pindex || !chainman.ActiveChain().Contains(pindex)) {
+            LogWarning("GenerateBlock: block %s was accepted but is not on the active chain\n", block_out->GetHash().GetHex());
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "chain tip changed during mining; mined block is stale");
+        }
     }
     LogDebug(BCLog::MINING, "GenerateBlock: block %s accepted successfully\n", block_out->GetHash().GetHex());
 
@@ -5139,6 +5170,8 @@ static RPCHelpMan generateblock()
 
     ChainstateManager& chainman = EnsureChainman(node);
     CheckCoinbaseOutputScriptOrThrow(chainman.GetParams().GetConsensus(), coinbase_output_script);
+    // Whether TestBlockValidity is deferred until GenerateBlock has solved the block.
+    bool skip_pow_template_check{false};
     {
         LOCK(chainman.GetMutex());
         {
@@ -5173,7 +5206,7 @@ static RPCHelpMan generateblock()
         LogDebug(BCLog::MINING, "generateblock: building block at height %d, prev=%s, ntx=%zu\n",
                  next_height, pindex_prev->GetBlockHash().GetHex(), block.vtx.size());
         const auto& consensus = chainman.GetConsensus();
-        const bool skip_pow_template_check =
+        skip_pow_template_check =
             consensus.fMatMulPOW ||
             (consensus.fKAWPOW && !consensus.fSkipKAWPOWValidation &&
                 next_height >= consensus.nKAWPOWHeight);
@@ -5187,14 +5220,14 @@ static RPCHelpMan generateblock()
             }
             LogDebug(BCLog::MINING, "generateblock: TestBlockValidity passed for height %d\n", next_height);
         } else {
-            LogDebug(BCLog::MINING, "generateblock: skipping TestBlockValidity (skip_pow_template_check=true) for height %d\n", next_height);
+            LogDebug(BCLog::MINING, "generateblock: deferring TestBlockValidity until the block is solved for height %d\n", next_height);
         }
     }
 
     std::shared_ptr<const CBlock> block_out;
     uint64_t max_tries{DEFAULT_MAX_TRIES};
 
-    if (!GenerateBlock(chainman, std::move(block), max_tries, block_out, process_new_block, &node) || !block_out) {
+    if (!GenerateBlock(chainman, std::move(block), max_tries, block_out, process_new_block, &node, /*test_block_validity=*/skip_pow_template_check) || !block_out) {
         LogWarning("generateblock: GenerateBlock failed or returned no block\n");
         throw JSONRPCError(RPC_MISC_ERROR, "Failed to make block.");
     }
