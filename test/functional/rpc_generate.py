@@ -127,9 +127,8 @@ class RPCGenerateTest(BitcoinTestFramework):
         # Ensure that generateblock can be called concurrently by many threads.
         # QTC: MatMul solving is slow enough for concurrent callers to race. The
         # node rejects a block whose parent is no longer the tip with an explicit
-        # stale-tip error, so tolerate exactly that error. A block that passes
-        # the check just before a racing block connects is still stored as a
-        # same-height sibling, so not every returned block extends the chain.
+        # stale-tip error, so tolerate exactly that error. Every block it does
+        # return must be on the active chain.
         self.log.info('Generate blocks in parallel')
         height_before = node.getblockcount()
 
@@ -148,20 +147,14 @@ class RPCGenerateTest(BitcoinTestFramework):
             mined = [h for hashes in threads.map(generate_50_blocks, rpcs) for h in hashes]
         for block_hash in mined:
             assert_greater_than(node.getblockheader(block_hash)['height'], height_before)
-        assert_greater_than(node.getblockcount(), height_before)
-        assert node.getblockcount() <= height_before + len(mined)
+            assert_greater_than(node.getblockheader(block_hash)['confirmations'], 0)
+        assert_equal(node.getblockcount(), height_before + len(mined))
 
         self.log.info('Fail to generate block with out of order txs')
         txid1 = miniwallet.send_self_transfer(from_node=node)['txid']
         utxo1 = miniwallet.get_utxo(txid=txid1)
         rawtx2 = miniwallet.create_self_transfer(utxo_to_spend=utxo1)['hex']
-        # QTC: on MatMul chains generateblock skips the pre-mining TestBlockValidity
-        # (the MatMul seeds are only derived while solving), so mine without
-        # submitting and check that the node rejects the solved block.
-        tip_before = node.getbestblockhash()
-        out_of_order_block = self.generateblock(node, address, [rawtx2, txid1], submit=False)['hex']
-        assert_equal(node.submitblock(out_of_order_block), 'bad-txns-inputs-missingorspent')
-        assert_equal(node.getbestblockhash(), tip_before)
+        assert_raises_rpc_error(-25, 'TestBlockValidity failed: bad-txns-inputs-missingorspent', self.generateblock, node, address, [rawtx2, txid1])
 
         self.log.info('Fail to generate block with txid not in mempool')
         missing_txid = '0000000000000000000000000000000000000000000000000000000000000000'
