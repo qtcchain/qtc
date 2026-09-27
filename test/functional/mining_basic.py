@@ -28,6 +28,8 @@ from test_framework.messages import (
     DEFAULT_BLOCK_RESERVED_WEIGHT,
     MAX_BLOCK_WEIGHT,
     MINIMUM_BLOCK_RESERVED_WEIGHT,
+    from_hex,
+    msg_headers,
     ser_uint256,
     WITNESS_SCALE_FACTOR
 )
@@ -35,7 +37,7 @@ from test_framework.messages import (
 # QTC: the template also reserves the mandatory MatMul C' payload (n^2 * 4 bytes + compactsize,
 # regtest n = 64) so that the block still fits once the payload is attached after solving.
 QTC_PAYLOAD_RESERVED_WEIGHT = 64 * 64 * 4 + 3
-from test_framework.p2p import P2PDataStore
+from test_framework.p2p import P2PDataStore, P2PInterface
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.authproxy import JSONRPCException
 from test_framework.util import (
@@ -209,12 +211,16 @@ class MiningTest(BitcoinTestFramework):
         self.restart_node_allow_nonstd(0, extra_args=['-miningmaxheaderlag=2'])
         self.connect_nodes(0, 1)
 
-        # Build a deterministic header-only gap on node0.
+        # Build a deterministic header-only gap on node0. QTC: submitheader is
+        # refused on MatMul chains, so a P2P peer announces node1's headers and
+        # never serves the blocks, which node0 then requests from it in vain.
         self.disconnect_nodes(0, 1)
         delayed_hashes = self.generate(self.nodes[1], 4, sync_fun=self.no_op)
-        for block_hash in delayed_hashes:
-            header_hex = self.nodes[1].getblockheader(block_hash, False)
-            self.nodes[0].submitheader(header_hex)
+        headers = [from_hex(CBlockHeader(), self.nodes[1].getblockheader(block_hash, False)) for block_hash in delayed_hashes]
+        header_peer = self.nodes[0].add_p2p_connection(P2PInterface())
+        header_peer.send_and_ping(msg_headers(headers=headers))
+        self.wait_until(lambda: self.nodes[0].getblockchaininfo()["headers"] == self.nodes[1].getblockcount())
+        assert_equal(self.nodes[0].getblockcount() + 4, self.nodes[1].getblockcount())
 
         tip_time = self.nodes[0].getblockheader(self.nodes[0].getbestblockhash())["time"]
         self.nodes[0].setmocktime(tip_time)
@@ -225,6 +231,9 @@ class MiningTest(BitcoinTestFramework):
             NORMAL_GBT_REQUEST_PARAMS,
         )
 
+        # Drop the peer holding the in-flight block requests so node0 fetches
+        # the blocks from node1 straight away.
+        self.nodes[0].disconnect_p2ps()
         self.connect_nodes(0, 1)
         self.sync_blocks([self.nodes[0], self.nodes[1]])
         tip_time = self.nodes[0].getblockheader(self.nodes[0].getbestblockhash())["time"]
@@ -729,7 +738,10 @@ class MiningTest(BitcoinTestFramework):
         assert_raises_rpc_error(-8, "getblocktemplate must be called with the segwit rule set", node.getblocktemplate, {})
 
         self.log.info("getblocktemplate: Test valid block")
-        assert_template(node, block, 'missing-product-payload' if pow_short_circuit[0] else None)
+        # QTC: a proposal is checked without proof of work, which on MatMul chains
+        # also skips the product payload check, so proposals report their
+        # transaction-level result just like upstream.
+        assert_template(node, block, None)
 
         self.log.info("submitblock: Test block decode failure")
         assert_raises_rpc_error(-22, "Block decode failed", node.submitblock, block.serialize()[:-15].hex())
@@ -789,15 +801,24 @@ class MiningTest(BitcoinTestFramework):
         bad_tx.vin[0].prevout.hash = 255
         bad_tx.rehash()
         bad_block.vtx.append(bad_tx)
-        assert_template(node, bad_block, 'missing-product-payload' if pow_short_circuit[0] else 'bad-txns-inputs-missingorspent')
-        assert_submitblock(bad_block, 'missing-product-payload' if pow_short_circuit[0] else 'bad-txns-inputs-missingorspent')
+        assert_template(node, bad_block, 'bad-txns-inputs-missingorspent')
+        # QTC: a block missing its product payload is rejected as BLOCK_MUTATED,
+        # which blames the sender's copy and does not mark the header invalid,
+        # so a resubmission reports the same reason rather than duplicate-invalid.
+        if pow_short_circuit[0]:
+            assert_submitblock(bad_block, 'missing-product-payload', 'missing-product-payload')
+        else:
+            assert_submitblock(bad_block, 'bad-txns-inputs-missingorspent')
 
         self.log.info("getblocktemplate: Test nonfinal transaction")
         bad_block = copy.deepcopy(block)
         bad_block.vtx[0].nLockTime = 2**32 - 1
         bad_block.vtx[0].rehash()
-        assert_template(node, bad_block, 'missing-product-payload' if pow_short_circuit[0] else 'bad-txns-nonfinal')
-        assert_submitblock(bad_block, 'missing-product-payload' if pow_short_circuit[0] else 'bad-txns-nonfinal')
+        assert_template(node, bad_block, 'bad-txns-nonfinal')
+        if pow_short_circuit[0]:
+            assert_submitblock(bad_block, 'missing-product-payload', 'missing-product-payload')
+        else:
+            assert_submitblock(bad_block, 'bad-txns-nonfinal')
 
         self.log.info("getblocktemplate: Test bad tx count")
         # The tx count is immediately after the block header
