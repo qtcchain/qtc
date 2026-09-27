@@ -864,6 +864,25 @@ int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParam
     return nNewTime - nOldTime;
 }
 
+bool TemplateTimeFrozenAtCeiling(const CBlockHeader& header, const CBlockIndex* pindexPrev,
+                                 const Consensus::Params& consensus, int64_t now)
+{
+    if (pindexPrev == nullptr) return false;
+    const auto max_time{GetMaximumTime(pindexPrev, consensus)};
+    return max_time.has_value() && header.GetBlockTime() >= *max_time && now > *max_time;
+}
+
+uint64_t SelectMatMulSearchStartNonce(const CBlockHeader& header, const CBlockIndex* pindexPrev,
+                                      const Consensus::Params& consensus, int64_t now,
+                                      FastRandomContext& rng)
+{
+    if (header.nNonce64 != 0 || !TemplateTimeFrozenAtCeiling(header, pindexPrev, consensus, now)) {
+        return header.nNonce64;
+    }
+    // Keep the start in the lower half so the solver's remaining nonce range stays effectively unbounded.
+    return rng.randbits(63);
+}
+
 void RegenerateCommitments(CBlock& block, ChainstateManager& chainman)
 {
     CMutableTransaction tx{*block.vtx.at(0)};

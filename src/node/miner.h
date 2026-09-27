@@ -35,6 +35,8 @@ class Chainstate;
 class ChainstateManager;
 
 namespace Consensus { struct Params; };
+class FastRandomContext;
+
 namespace node { struct NodeContext; };
 
 namespace node {
@@ -315,6 +317,23 @@ int64_t GetMinimumTime(const CBlockIndex* pindexPrev, const Consensus::Params& c
 std::optional<int64_t> GetMaximumTime(const CBlockIndex* pindexPrev, const Consensus::Params& consensus_params);
 
 int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParams, const CBlockIndex* pindexPrev);
+
+/**
+ * True when the header time is pinned at the future-drift ceiling while wall-clock time is past it.
+ * In that state UpdateTime cannot advance nTime, so successive templates for the same tip and payout
+ * are byte-identical and only the nonce distinguishes one search from the next.
+ */
+bool TemplateTimeFrozenAtCeiling(const CBlockHeader& header, const CBlockIndex* pindexPrev,
+                                 const Consensus::Params& consensus, int64_t now);
+
+/**
+ * Nonce at which a MatMul search should start. Returns header.nNonce64 unchanged unless the template
+ * is frozen at the drift ceiling and still carries the default zero nonce; then a random start in
+ * [0, 2^63) is drawn so repeated calls search fresh ranges instead of re-scanning the same one.
+ */
+uint64_t SelectMatMulSearchStartNonce(const CBlockHeader& header, const CBlockIndex* pindexPrev,
+                                      const Consensus::Params& consensus, int64_t now,
+                                      FastRandomContext& rng);
 
 /** Update an old GenerateCoinbaseCommitment from CreateNewBlock after the block txs have changed */
 void RegenerateCommitments(CBlock& block, ChainstateManager& chainman);

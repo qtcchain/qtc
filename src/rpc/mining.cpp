@@ -4731,6 +4731,21 @@ static bool GenerateBlock(ChainstateManager& chainman, CBlock&& block, uint64_t&
         kawpow_active = consensus.fKAWPOW && next_height >= consensus.nKAWPOWHeight;
         parent_median_time_past = pindex_prev->GetMedianTimePast();
         tip_hash_before_mining = chainman.ActiveChain().Tip()->GetBlockHash();
+        if (matmul_active) {
+            // A template whose time is pinned at the future-drift ceiling is identical on every call
+            // (same tip, same coinbase, same nTime), so a zero-start search would re-scan the same
+            // nonce range forever and deadlock the chain after a long stall (testnet burn-in T1,
+            // 2026-09-27). Start such searches at a random nonce instead.
+            FastRandomContext rng;
+            const uint64_t start_nonce{node::SelectMatMulSearchStartNonce(
+                block, pindex_prev, consensus, TicksSinceEpoch<std::chrono::seconds>(NodeClock::now()), rng)};
+            if (start_nonce != block.nNonce64) {
+                LogDebug(BCLog::MINING, "GenerateBlock: template time frozen at drift ceiling %d, starting nonce search at %llu\n",
+                         block.GetBlockTime(), static_cast<unsigned long long>(start_nonce));
+                block.nNonce64 = start_nonce;
+                block.nNonce = static_cast<uint32_t>(start_nonce);
+            }
+        }
         LogDebug(BCLog::MINING, "GenerateBlock: starting for height %d, prevhash=%s, tip=%s, matmul=%s, kawpow=%s, max_tries=%lu\n",
                  next_height, block.hashPrevBlock.GetHex(), tip_hash_before_mining.GetHex(),
                  matmul_active ? "true" : "false", kawpow_active ? "true" : "false",
