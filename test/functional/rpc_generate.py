@@ -8,10 +8,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 from test_framework.authproxy import JSONRPCException
 from test_framework.blocktools import COINBASE_MATURITY
+from test_framework.segwit_addr import decode_segwit_address, encode_segwit_address
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.wallet import MiniWallet, MiniWalletMode
 from test_framework.util import (
     assert_equal,
+    assert_greater_than,
     assert_raises_rpc_error,
 )
 
@@ -32,10 +34,21 @@ class RPCGenerateTest(BitcoinTestFramework):
         self.test_generateblock()
 
     def test_generatetoaddress(self):
-        block_hash = self.generatetoaddress(self.nodes[0], 1, 'mneYUmWYsuk7kySiURxCi3AGxrAqZxLgPZ')[0]
-        block = self.nodes[0].getblock(block_hash, 2)
-        assert 'matrix_c_words' not in block
-        assert_raises_rpc_error(-5, "Invalid address", self.generatetoaddress, self.nodes[0], 1, '3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy')
+        node = self.nodes[0]
+        # QTC: coinbases pay to witness v2 P2MR, so mine to the MiniWallet's P2MR address.
+        address = MiniWallet(node, mode=MiniWalletMode.ADDRESS_P2MR).get_address()
+        block_hash = self.generatetoaddress(node, 1, address)[0]
+        block = node.getblock(block_hash, 2)
+        assert_equal(block['tx'][0]['vout'][0]['scriptPubKey']['address'], address)
+        # QTC D8: regtest requires the MatMul product payload from genesis.
+        assert_greater_than(block['matrix_c_words'], 0)
+
+        # The same P2MR witness program under the mainnet HRP is not a regtest address.
+        witver, witprog = decode_segwit_address('qtcrt', address)
+        assert_equal(witver, 2)
+        mainnet_address = encode_segwit_address('qtc', witver, witprog)
+        assert mainnet_address.startswith('qtc1z')
+        assert_raises_rpc_error(-5, "Invalid address", self.generatetoaddress, node, 1, mainnet_address)
 
     def test_generateblock(self):
         node = self.nodes[0]
@@ -112,17 +125,43 @@ class RPCGenerateTest(BitcoinTestFramework):
         assert_equal(node.getrawtransaction(txid=txid, verbose=False, blockhash=hash), rawtx)
 
         # Ensure that generateblock can be called concurrently by many threads.
+        # QTC: MatMul solving is slow enough for concurrent callers to race. The
+        # node rejects a block whose parent is no longer the tip with an explicit
+        # stale-tip error, so tolerate exactly that error. A block that passes
+        # the check just before a racing block connects is still stored as a
+        # same-height sibling, so not every returned block extends the chain.
         self.log.info('Generate blocks in parallel')
-        generate_50_blocks = lambda n: [n.generateblock(output=address, transactions=[]) for _ in range(50)]
+        height_before = node.getblockcount()
+
+        def generate_50_blocks(n):
+            hashes = []
+            for _ in range(50):
+                try:
+                    hashes.append(n.generateblock(output=address, transactions=[])['hash'])
+                except JSONRPCException as e:
+                    assert_equal(e.error['code'], -32603)
+                    assert_equal(e.error['message'], 'chain tip changed during mining; mined block is stale')
+            return hashes
+
         rpcs = [node.cli for _ in range(6)]
         with ThreadPoolExecutor(max_workers=len(rpcs)) as threads:
-            list(threads.map(generate_50_blocks, rpcs))
+            mined = [h for hashes in threads.map(generate_50_blocks, rpcs) for h in hashes]
+        for block_hash in mined:
+            assert_greater_than(node.getblockheader(block_hash)['height'], height_before)
+        assert_greater_than(node.getblockcount(), height_before)
+        assert node.getblockcount() <= height_before + len(mined)
 
         self.log.info('Fail to generate block with out of order txs')
         txid1 = miniwallet.send_self_transfer(from_node=node)['txid']
         utxo1 = miniwallet.get_utxo(txid=txid1)
         rawtx2 = miniwallet.create_self_transfer(utxo_to_spend=utxo1)['hex']
-        assert_raises_rpc_error(-25, 'TestBlockValidity failed: bad-txns-inputs-missingorspent', self.generateblock, node, address, [rawtx2, txid1])
+        # QTC: on MatMul chains generateblock skips the pre-mining TestBlockValidity
+        # (the MatMul seeds are only derived while solving), so mine without
+        # submitting and check that the node rejects the solved block.
+        tip_before = node.getbestblockhash()
+        out_of_order_block = self.generateblock(node, address, [rawtx2, txid1], submit=False)['hex']
+        assert_equal(node.submitblock(out_of_order_block), 'bad-txns-inputs-missingorspent')
+        assert_equal(node.getbestblockhash(), tip_before)
 
         self.log.info('Fail to generate block with txid not in mempool')
         missing_txid = '0000000000000000000000000000000000000000000000000000000000000000'
