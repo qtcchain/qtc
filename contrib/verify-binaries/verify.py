@@ -163,14 +163,31 @@ class SigData:
         self.name = ""
         self.trusted = False
         self.status = ""
+        # From VALIDSIG: the signing (sub)key fingerprint and its primary key fingerprint.
+        self.fingerprint = ""
+        self.primary_fingerprint = ""
 
     def __bool__(self):
         return self.key is not None
 
     def __repr__(self):
         return (
-            "SigData(%r, %r, trusted=%s, status=%r)" %
-            (self.key, self.name, self.trusted, self.status))
+            "SigData(%r, %r, trusted=%s, status=%r, fingerprint=%r)" %
+            (self.key, self.name, self.trusted, self.status,
+             self.primary_fingerprint or self.fingerprint))
+
+    def matches_key(self, key: str) -> bool:
+        """Whether a normalized key spec (a full fingerprint or a 16-hex long key id)
+        identifies the key that made this signature."""
+        fprs = [f for f in (self.fingerprint, self.primary_fingerprint) if f]
+        if len(key) in (40, 64):
+            return key in fprs
+        if len(key) == 16:
+            # v4 key ids are the low 64 bits of the fingerprint; v5/v6 ids are the high 64.
+            ids = {(self.key or "").upper()}
+            ids |= {f[-16:] if len(f) == 40 else f[:16] for f in fprs}
+            return key in ids
+        return False
 
 
 def parse_gpg_result(
@@ -217,6 +234,14 @@ def parse_gpg_result(
         elif line_begins_with(r"BADSIG(?:\s|$)", line):
             curr_sigdata.key, curr_sigdata.name = line.split(maxsplit=3)[2:4]
             curr_sigs = bad_sigs
+
+        elif line_begins_with(r"VALIDSIG(?:\s|$)", line):
+            # VALIDSIG <fpr> <date> <ts> <expire> <ver> <reserved> <pk-algo> <hash-algo>
+            #          <sig-class> [<primary-key-fpr>]
+            validsig_split = line.split()
+            curr_sigdata.fingerprint = validsig_split[2].upper()
+            if len(validsig_split) >= 12:
+                curr_sigdata.primary_fingerprint = validsig_split[11].upper()
 
         elif line_begins_with(r"ERRSIG(?:\s|$)", line):
             curr_sigdata.key, _, _, _, _, _ = line.split()[2:8]
@@ -360,6 +385,25 @@ def prompt_yn(prompt) -> bool:
         got = input(prompt).lower()
     return got == 'y'
 
+def parse_trusted_keys(spec: str) -> set[str]:
+    """Normalize a comma-separated --trusted-keys list. Each entry may be a full
+    fingerprint (40 or 64 hex, spaces allowed) or a 16-hex long key id, optionally
+    0x-prefixed. Short (8-hex) key ids are ignored: they are trivially collidable."""
+    keys = set()
+    for raw in (spec or "").split(','):
+        key = raw.replace(' ', '').upper()
+        if key.startswith('0X'):
+            key = key[2:]
+        if not key:
+            continue
+        if not re.fullmatch(r'[0-9A-F]+', key) or len(key) not in (16, 40, 64):
+            log.warning(f"ignoring --trusted-keys entry {raw.strip()!r}: expected a full "
+                        "fingerprint or a 16-hex long key id")
+            continue
+        keys.add(key)
+    return keys
+
+
 def verify_shasums_signature(
     signature_file_path: str, sums_file_path: str, args: argparse.Namespace
 ) -> tuple[
@@ -383,13 +427,11 @@ def verify_shasums_signature(
     # which pubkeys convince us that this sums file is legitimate. In other words,
     # which pubkeys within the Bitcoin community do we trust for the purposes of
     # binary verification?
-    trusted_keys = set()
-    if args.trusted_keys:
-        trusted_keys |= set(args.trusted_keys.split(','))
+    trusted_keys = parse_trusted_keys(args.trusted_keys)
 
     # Tally signatures and make sure we have enough goods to fulfill
     # our threshold.
-    good_trusted = [sig for sig in good if sig.trusted or sig.key in trusted_keys]
+    good_trusted = [sig for sig in good if sig.trusted or any(sig.matches_key(k) for k in trusted_keys)]
     good_untrusted = [sig for sig in good if sig not in good_trusted]
     num_trusted = len(good_trusted) + len(good_untrusted)
     log.info(f"got {num_trusted} good signatures")
@@ -430,7 +472,8 @@ def parse_sums_file(sums_file_path: str, filename_filter: list[str]) -> list[lis
     # extract hashes/filenames of binaries to verify from hash file;
     # each line has the following format: "<hash> <binary_filename>"
     with open(sums_file_path, 'r', encoding='utf8') as hash_file:
-        return [line.split()[:2] for line in hash_file if len(filename_filter) == 0 or any(f in line for f in filename_filter)]
+        return [line.split()[:2] for line in hash_file
+                if line.strip() and (len(filename_filter) == 0 or any(f in line for f in filename_filter))]
 
 
 def verify_binary_hashes(hashes_to_verify: list[list[str]]) -> tuple[ReturnCode, dict[str, str]]:
@@ -571,11 +614,50 @@ def verify_published_handler(args: argparse.Namespace) -> ReturnCode:
     return ReturnCode.SUCCESS
 
 
-def verify_binaries_handler(args: argparse.Namespace) -> ReturnCode:
-    binary_to_basename = {}
-    for file in args.binary:
-        binary_to_basename[PurePath(file).name] = file
+def match_binaries_to_sums(
+    entries: list[list[str]], binaries: list[str], sums_dir: Path
+) -> t.Optional[list[list[str]]]:
+    """Map each binary given on the command line to exactly one SHA256SUMS entry.
 
+    Entries may carry a directory prefix (e.g. "aarch64-linux-gnu/qtc-<ver>-...tar.gz").
+    A binary matches an entry by relative path first (the entry, resolved against the
+    directory holding SHA256SUMS, is the same file), and otherwise by basename. A
+    basename shared by several entries is ambiguous and rejected. Returns
+    [hash, binary path] pairs, or None if any binary is unmatched or ambiguous."""
+    files_to_hash = []
+    claimed: dict[str, str] = {}
+    ok = True
+    for binary in binaries:
+        binary_resolved = Path(binary).resolve()
+        candidates = [e for e in entries if (sums_dir / e[1]).resolve() == binary_resolved]
+        if not candidates:
+            name = PurePath(binary).name
+            candidates = [e for e in entries if PurePath(e[1]).name == name]
+        if not candidates:
+            log.error(f"{binary} is not listed in the checksum file")
+            ok = False
+            continue
+        if len({e[1] for e in candidates}) > 1:
+            listed = ', '.join(e[1] for e in candidates)
+            log.error(f"{binary} is ambiguous: its name matches several checksum entries "
+                      f"({listed}); pass it by its path relative to the checksum file")
+            ok = False
+            continue
+        if len({e[0] for e in candidates}) > 1:
+            log.error(f"{binary}: checksum file lists {candidates[0][1]} with conflicting hashes")
+            ok = False
+            continue
+        file_hash, entry = candidates[0]
+        if entry in claimed:
+            log.error(f"{binary} and {claimed[entry]} both match checksum entry {entry}")
+            ok = False
+            continue
+        claimed[entry] = binary
+        files_to_hash.append([file_hash, binary])
+    return files_to_hash if ok else None
+
+
+def verify_binaries_handler(args: argparse.Namespace) -> ReturnCode:
     sums_sig_path = None
     if args.sums_sig_file:
         sums_sig_path = Path(args.sums_sig_file)
@@ -589,22 +671,21 @@ def verify_binaries_handler(args: argparse.Namespace) -> ReturnCode:
         return sigs_status
 
     # Extract hashes and filenames
-    hashes_to_verify = parse_sums_file(args.sums_file, [k for k, n in binary_to_basename.items()])
+    hashes_to_verify = parse_sums_file(args.sums_file, [])
     if not hashes_to_verify:
-        log.error(f"No files in {args.sums_file} match the specified binaries")
+        log.error(f"No files listed in {args.sums_file}")
         return ReturnCode.NO_BINARIES_MATCH
 
     # Make sure all files are accounted for
     sums_file_path = Path(args.sums_file)
     missing_files = []
     files_to_hash = []
-    if len(binary_to_basename) > 0:
-        for file_hash, file in hashes_to_verify:
-            files_to_hash.append([file_hash, binary_to_basename[file]])
-            del binary_to_basename[file]
-        if len(binary_to_basename) > 0:
-            log.error(f"Not all specified binaries are in {args.sums_file}")
+    if args.binary:
+        matched = match_binaries_to_sums(hashes_to_verify, args.binary, sums_file_path.parent)
+        if matched is None:
+            log.error(f"Not all specified binaries match exactly one entry in {args.sums_file}")
             return ReturnCode.NO_BINARIES_MATCH
+        files_to_hash = matched
     else:
         log.info(f"No binaries specified, assuming all files specified in {args.sums_file} are located relatively")
         for file_hash, file in hashes_to_verify:
@@ -667,7 +748,9 @@ def main():
     parser.add_argument(
         '--trusted-keys', action='store', nargs='?',
         default=os.environ.get('BINVERIFY_TRUSTED_KEYS', ''),
-        help='A list of trusted signer GPG keys, separated by commas. Not "trusted keys" in the GPG sense.',
+        help=(
+            'A list of trusted signer GPG keys (full fingerprints or 16-hex long key ids), '
+            'separated by commas. Not "trusted keys" in the GPG sense.'),
     )
     parser.add_argument(
         '--json', action='store_true',

@@ -91,3 +91,13 @@ Verify only a subset of the files listed in a local checksum file
     ~/Downloads/bitcoin-24.0.1-x86_64-linux-gnu.tar.gz \
     ~/Downloads/bitcoin-24.0.1-arm-linux-gnueabihf.tar.gz
 ```
+
+QTC's `SHA256SUMS` lists each file under a directory prefix (for example
+`aarch64-linux-gnu/qtc-<version>-aarch64-linux-gnu.tar.gz`). A binary given on the
+command line matches its entry by path relative to the checksum file, or otherwise by
+basename; a basename listed under more than one directory is rejected as ambiguous and
+must be given by its relative path.
+
+`--trusted-keys` accepts full fingerprints (as printed by `gpg --fingerprint`) or 16-hex
+long key ids, comma separated. A fingerprint matches signatures made by that key or by
+any of its signing subkeys.
