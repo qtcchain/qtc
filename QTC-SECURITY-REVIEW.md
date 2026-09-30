@@ -275,8 +275,9 @@ Fixed in the working tree (commit pending the full-suite result), no consensus c
 Consensus fork applied 2026-09-10 (QTC-LAUNCH-SAFETY.md §12): N-1, M-8, N-5, the S-1/S-2/C-3/C-4 gate, C-2 default, and
 the genesis regeneration. GPU digest kernels ported and un-gated 2026-09-10 (Metal on M5, CUDA on A6000; A6000 ≈ 8,800 attempts/s at mainnet
 shape). powLimit sized from the measured A6000 and applied 2026-09-10 (H2 closed; re-check after the RTX 4000 Ada measurement). Still open: H1 at launch (regenerate again),
-H3 via minimum chain work and a checkpoint post-launch, M-11 (stubbed template readiness guard), porting the upstream
-functional suites (M-9).
+H3 via minimum chain work and a checkpoint post-launch, porting the upstream functional suites (M-9). M-11 was
+implemented (see the fixes list below); the assembler/consensus output-rule split found on the burn-in is closed by
+making the assembler call the consensus rule.
 
 ## What was NOT covered
 No fuzzing, no functional-test runs, no dynamic analysis; no review of the miner/pool/stratum tooling outside this tree;
