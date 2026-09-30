@@ -988,11 +988,11 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_matmul_activation)
     BOOST_CHECK_EQUAL(consensus.nMatMulParentMtpSeedHeight, 0);
     BOOST_CHECK(consensus.IsMatMulParentMtpSeedActive(0));
     BOOST_CHECK(consensus.IsMatMulParentMtpSeedActive(130'500));
-    BOOST_CHECK_EQUAL(UintToArith256(consensus.powLimit).GetCompact(), 0x1e033333U); // Option B floor sized from the measured A6000 (H2, D3)
+    BOOST_CHECK_EQUAL(UintToArith256(consensus.powLimit).GetCompact(), 0x1e011da5U); // Option B floor sized from the measured A6000 (H2, D3)
     // Guard: genesis nBits MUST equal compact(powLimit). Consensus clamps a looser
     // anchor, but rpc GetTarget (CHECK_NONFATAL DeriveTarget) aborts on block 0.
-    BOOST_CHECK_EQUAL(UintToArith256(consensus.powLimit).GetCompact(), 0x1e033333U);
-    BOOST_CHECK(DeriveTarget(0x1e033333U, consensus.powLimit).has_value());
+    BOOST_CHECK_EQUAL(UintToArith256(consensus.powLimit).GetCompact(), 0x1e011da5U);
+    BOOST_CHECK(DeriveTarget(0x1e011da5U, consensus.powLimit).has_value());
     BOOST_CHECK_EQUAL(consensus.nMatMulDimension, 512U);
     BOOST_CHECK_EQUAL(consensus.nMatMulTranscriptBlockSize, 16U);
     BOOST_CHECK_EQUAL(consensus.nMatMulNoiseRank, 8U);
@@ -1123,7 +1123,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_REGTEST_invalid_asert_override_rejected_at_star
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_genesis_header_fields_frozen)
 {
     const auto params = CreateChainParams(*m_node.args, ChainType::MAIN);
-    assert_qtc_genesis_header_fields(*params, 1789063200U, 0U, "1e033333", 1U); // nBits == compact(powLimit)
+    assert_qtc_genesis_header_fields(*params, 1790809200U, 0U, "1e011da5", 1U); // nBits == compact(powLimit)
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_genesis_hashes_frozen)
@@ -1131,7 +1131,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_genesis_hashes_frozen)
     const auto params = CreateChainParams(*m_node.args, ChainType::MAIN);
     assert_qtc_genesis_hashes(
         *params,
-        "9ba00506445039aa7315dc1ce61eded19ec75d31edbfed3643cb1e4f3c3db8e2",
+        "4040450ec30f1f9a7ef2d12578e1ea66d0838d7d8181b62c066953ca3baf3406",
         "68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23");
 }
 
@@ -2374,7 +2374,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_hardening_anchor_consistency)
     BOOST_CHECK_EQUAL(it_0->second.GetHex(), consensus.hashGenesisBlock.GetHex());
     BOOST_CHECK_EQUAL(
         it_0->second.GetHex(),
-        "9ba00506445039aa7315dc1ce61eded19ec75d31edbfed3643cb1e4f3c3db8e2");
+        "4040450ec30f1f9a7ef2d12578e1ea66d0838d7d8181b62c066953ca3baf3406");
 
     BOOST_CHECK(params->GetAvailableSnapshotHeights().empty());
     BOOST_CHECK(!params->AssumeutxoForHeight(55000).has_value());
