@@ -252,6 +252,77 @@ BOOST_AUTO_TEST_CASE(recently_active_lagging_peers_still_count_for_fork_safety)
     BOOST_CHECK_EQUAL(node::GetMiningChainGuardRecommendedAction(status), "propagate_tip");
 }
 
+BOOST_AUTO_TEST_CASE(peer_height_prefers_sync_then_common_then_starting_height)
+{
+    BOOST_CHECK_EQUAL(node::ResolveMiningChainGuardPeerHeight(120, 110, 5), 120);
+    BOOST_CHECK_EQUAL(node::ResolveMiningChainGuardPeerHeight(-1, 110, 5), 110);
+    BOOST_CHECK_EQUAL(node::ResolveMiningChainGuardPeerHeight(-1, -1, 5), 5);
+    BOOST_CHECK_EQUAL(node::ResolveMiningChainGuardPeerHeight(-1, -1, 0), 0);
+    BOOST_CHECK_EQUAL(node::ResolveMiningChainGuardPeerHeight(-1, -1, -1), -1);
+}
+
+BOOST_AUTO_TEST_CASE(genesis_peers_with_only_starting_height_form_consensus)
+{
+    // Mainnet launch, 2026-09-30: local tip is genesis and three outbound
+    // peers are connected, but no header has been exchanged yet, so
+    // nSyncHeight and nCommonHeight are -1 for all of them. Their handshake
+    // starting height (0) is the tip, and must read as consensus rather than
+    // "insufficient_peer_consensus" (which made the supervisor churn peers).
+    node::MiningChainGuardOptions options;
+    options.enabled = true;
+    BOOST_CHECK_EQUAL(options.min_peer_count, 3);
+
+    std::vector<node::MiningChainGuardPeerSample> peers;
+    for (int i = 0; i < 3; ++i) {
+        node::MiningChainGuardPeerSample sample;
+        sample.height = node::ResolveMiningChainGuardPeerHeight(
+            /*sync_height=*/-1, /*common_height=*/-1, /*starting_height=*/0);
+        peers.push_back(sample); // no block time or announcement yet either
+    }
+
+    const auto filtered = node::FilterMiningChainGuardPeerHeights(
+        /*local_tip_height=*/0,
+        /*now=*/1000,
+        peers,
+        options);
+    BOOST_CHECK_EQUAL(filtered.size(), 3U);
+
+    const auto status = node::EvaluateMiningChainGuard(
+        /*local_tip_height=*/0,
+        /*initial_block_download=*/false,
+        /*network_active=*/true,
+        filtered,
+        options);
+
+    BOOST_CHECK(status.healthy);
+    BOOST_CHECK_EQUAL(status.reason, "healthy");
+    BOOST_CHECK_EQUAL(status.peer_count, 3);
+    BOOST_CHECK_EQUAL(status.median_peer_tip, 0);
+    BOOST_CHECK_EQUAL(status.near_tip_peers, 3);
+    BOOST_CHECK(!node::ShouldPauseMiningByChainGuard(status));
+    BOOST_CHECK_EQUAL(node::GetMiningChainGuardRecommendedAction(status), "continue");
+}
+
+BOOST_AUTO_TEST_CASE(genesis_peers_without_any_height_signal_still_report_insufficient_consensus)
+{
+    // A peer that has not even completed the version handshake contributes nothing.
+    node::MiningChainGuardOptions options;
+    options.enabled = true;
+
+    std::vector<node::MiningChainGuardPeerSample> peers(3);
+    for (auto& sample : peers) {
+        sample.height = node::ResolveMiningChainGuardPeerHeight(-1, -1, -1);
+    }
+
+    const auto filtered = node::FilterMiningChainGuardPeerHeights(0, 1000, peers, options);
+    BOOST_CHECK(filtered.empty());
+
+    const auto status = node::EvaluateMiningChainGuard(0, false, true, filtered, options);
+    BOOST_CHECK(!status.healthy);
+    BOOST_CHECK_EQUAL(status.reason, "insufficient_peer_consensus");
+    BOOST_CHECK_EQUAL(node::GetMiningChainGuardRecommendedAction(status), "add_outbound_peers");
+}
+
 BOOST_AUTO_TEST_CASE(network_inactive_keeps_mining_with_recovery_warning)
 {
     node::MiningChainGuardOptions options;

@@ -146,7 +146,11 @@ with `QTC_MINING_BOOTSTRAP_PEERS` (or the legacy
 `--no-default-bootstrap-peers` only for controlled lab deployments. The loop
 will issue `disconnectnode` calls for obviously stale manual peers followed by
 `addnode ... onetry` refreshes after repeated weak-peer observations while
-continuing to mine if templates remain available. If the node still does not
+continuing to mine if templates remain available. A manual peer with no
+synced header or block is only treated as stale when its handshake starting
+height is more than `QTC_MINING_PEER_STALE_STARTING_HEIGHT_LAG` (default 2)
+blocks below the local tip; at genesis, or right after a peer joins an idle
+network, nothing has been announced yet and such peers are left alone. If the node still does not
 make tip progress for `QTC_MINING_SYNC_STALL_RESTART_SECS`, the supervisor
 escalates to a daemon restart so startup recovery can rebuild local state
 instead of sitting on a stuck process. Once the node has been healthy, the loop
