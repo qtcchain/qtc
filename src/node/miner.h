@@ -327,9 +327,22 @@ bool TemplateTimeFrozenAtCeiling(const CBlockHeader& header, const CBlockIndex* 
                                  const Consensus::Params& consensus, int64_t now);
 
 /**
+ * True when the header time is pinned at the minimum time (MTP + 1, or the timewarp floor) while
+ * wall-clock time is still before it. UpdateTime clamps nTime up to that floor whenever the clock
+ * lags it, e.g. when mining is opened before the genesis time T0, so every template for the tip is
+ * byte-identical until the clock catches up. Mirror of TemplateTimeFrozenAtCeiling.
+ */
+bool TemplateTimeFrozenAtFloor(const CBlockHeader& header, const CBlockIndex* pindexPrev,
+                               const Consensus::Params& consensus, int64_t now);
+
+/** True when the header time is frozen at either bound (see the two helpers above). */
+bool TemplateTimeFrozen(const CBlockHeader& header, const CBlockIndex* pindexPrev,
+                        const Consensus::Params& consensus, int64_t now);
+
+/**
  * Nonce at which a MatMul search should start. Returns header.nNonce64 unchanged unless the template
- * is frozen at the drift ceiling and still carries the default zero nonce; then a random start in
- * [0, 2^63) is drawn so repeated calls search fresh ranges instead of re-scanning the same one.
+ * time is frozen at either bound and the header still carries the default zero nonce; then a random
+ * start in [0, 2^63) is drawn so repeated calls search fresh ranges instead of re-scanning the same one.
  */
 uint64_t SelectMatMulSearchStartNonce(const CBlockHeader& header, const CBlockIndex* pindexPrev,
                                       const Consensus::Params& consensus, int64_t now,

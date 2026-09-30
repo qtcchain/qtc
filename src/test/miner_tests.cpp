@@ -1612,7 +1612,8 @@ BOOST_AUTO_TEST_CASE(frozen_ceiling_template_gets_random_search_start)
     // Regression: after a stall longer than the future-drift window, every template for the tip is
     // byte-identical (nTime pinned at MTP + drift, same coinbase), and a zero-start nonce search
     // re-scanned the same range on each generatetoaddress call, deadlocking the chain
-    // (testnet burn-in T1, 2026-09-27).
+    // (testnet burn-in T1, 2026-09-27). The mirror case, nTime pinned at the minimum-time floor
+    // while the wall clock is still before it, is covered below.
     auto consensus{m_node.chainman->GetConsensus()};
     consensus.fMatMulPOW = true;
     consensus.nMatMulMaxFutureMtpDriftHeight = 0;
@@ -1629,6 +1630,8 @@ BOOST_AUTO_TEST_CASE(frozen_ceiling_template_gets_random_search_start)
     // Normal operation: time still advancing, zero start kept (templates differ by nTime).
     header.nTime = *max_time - 600;
     BOOST_CHECK(!node::TemplateTimeFrozenAtCeiling(header, tip, consensus, *max_time - 600));
+    BOOST_CHECK(!node::TemplateTimeFrozenAtFloor(header, tip, consensus, *max_time - 600));
+    BOOST_CHECK(!node::TemplateTimeFrozen(header, tip, consensus, *max_time - 600));
     BOOST_CHECK_EQUAL(node::SelectMatMulSearchStartNonce(header, tip, consensus, *max_time - 600, rng), 0U);
 
     // Exactly at the ceiling but wall clock not past it: the next second still yields a new template.
@@ -1642,6 +1645,8 @@ BOOST_AUTO_TEST_CASE(frozen_ceiling_template_gets_random_search_start)
     node::UpdateTime(&header, consensus, tip);
     BOOST_CHECK_EQUAL(header.GetBlockTime(), *max_time);
     BOOST_CHECK(node::TemplateTimeFrozenAtCeiling(header, tip, consensus, now));
+    BOOST_CHECK(!node::TemplateTimeFrozenAtFloor(header, tip, consensus, now));
+    BOOST_CHECK(node::TemplateTimeFrozen(header, tip, consensus, now));
     const uint64_t first{node::SelectMatMulSearchStartNonce(header, tip, consensus, now, rng)};
     const uint64_t second{node::SelectMatMulSearchStartNonce(header, tip, consensus, now, rng)};
     BOOST_CHECK_NE(first, second);
@@ -1652,11 +1657,61 @@ BOOST_AUTO_TEST_CASE(frozen_ceiling_template_gets_random_search_start)
     header.nNonce64 = 42;
     BOOST_CHECK_EQUAL(node::SelectMatMulSearchStartNonce(header, tip, consensus, now, rng), 42U);
 
-    // Drift cap inactive: nothing is frozen.
+    // Drift cap inactive: nothing is frozen at the ceiling.
     auto disabled{consensus};
     disabled.nMatMulMaxFutureMtpDriftHeight = std::numeric_limits<int32_t>::max();
     header.nNonce64 = 0;
     BOOST_CHECK(!node::TemplateTimeFrozenAtCeiling(header, tip, disabled, now));
+    BOOST_CHECK(!node::TemplateTimeFrozen(header, tip, disabled, now));
+    BOOST_CHECK_EQUAL(node::SelectMatMulSearchStartNonce(header, tip, disabled, now, rng), 0U);
+
+    // Mirror case (mainnet launch, 2026-09-30): mining opened 46 minutes before the genesis time
+    // T0. With the clock still before min_time = MTP + 1, UpdateTime clamps nTime UP to the floor,
+    // so every template is byte-identical until the wall clock passes T0; a zero start re-scanned
+    // the same nonce range on every call and no block could be found until then.
+    const int64_t min_time{node::GetMinimumTime(tip, consensus)};
+    BOOST_REQUIRE_LT(min_time, *max_time);
+    const int64_t before_genesis{min_time - 46 * 60};
+    SetMockTime(before_genesis);
+    header.nTime = 0;
+    header.nNonce64 = 0;
+    node::UpdateTime(&header, consensus, tip);
+    BOOST_CHECK_EQUAL(header.GetBlockTime(), min_time);
+    BOOST_CHECK(node::TemplateTimeFrozenAtFloor(header, tip, consensus, before_genesis));
+    BOOST_CHECK(!node::TemplateTimeFrozenAtCeiling(header, tip, consensus, before_genesis));
+    BOOST_CHECK(node::TemplateTimeFrozen(header, tip, consensus, before_genesis));
+    const uint64_t floor_first{node::SelectMatMulSearchStartNonce(header, tip, consensus, before_genesis, rng)};
+    const uint64_t floor_second{node::SelectMatMulSearchStartNonce(header, tip, consensus, before_genesis, rng)};
+    BOOST_CHECK_NE(floor_first, floor_second);
+    BOOST_CHECK_NE(floor_first, 0U);
+    BOOST_CHECK_LT(floor_first, uint64_t{1} << 63);
+    BOOST_CHECK_LT(floor_second, uint64_t{1} << 63);
+
+    // The floor does not depend on the drift cap: still frozen with the cap inactive.
+    BOOST_CHECK(node::TemplateTimeFrozenAtFloor(header, tip, disabled, before_genesis));
+    BOOST_CHECK(node::TemplateTimeFrozen(header, tip, disabled, before_genesis));
+
+    // A caller-chosen nonce is never overridden at the floor either.
+    header.nNonce64 = 42;
+    BOOST_CHECK_EQUAL(node::SelectMatMulSearchStartNonce(header, tip, consensus, before_genesis, rng), 42U);
+    header.nNonce64 = 0;
+
+    // Wall clock reaches T0: UpdateTime advances nTime again from here on, so the zero start is kept.
+    BOOST_CHECK(!node::TemplateTimeFrozenAtFloor(header, tip, consensus, min_time));
+    BOOST_CHECK(!node::TemplateTimeFrozen(header, tip, consensus, min_time));
+    BOOST_CHECK_EQUAL(node::SelectMatMulSearchStartNonce(header, tip, consensus, min_time, rng), 0U);
+    SetMockTime(min_time + 1);
+    node::UpdateTime(&header, consensus, tip);
+    BOOST_CHECK_EQUAL(header.GetBlockTime(), min_time + 1);
+    BOOST_CHECK(!node::TemplateTimeFrozen(header, tip, consensus, min_time + 1));
+
+    // A header time above the floor with the clock behind it is not a floor freeze (nothing pins it).
+    header.nTime = min_time + 600;
+    BOOST_CHECK(!node::TemplateTimeFrozenAtFloor(header, tip, consensus, before_genesis));
+
+    // No previous index: never frozen.
+    BOOST_CHECK(!node::TemplateTimeFrozenAtFloor(header, nullptr, consensus, before_genesis));
+    BOOST_CHECK(!node::TemplateTimeFrozen(header, nullptr, consensus, before_genesis));
     SetMockTime(0);
 }
 
