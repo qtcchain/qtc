@@ -853,11 +853,26 @@ bool TemplateTimeFrozenAtCeiling(const CBlockHeader& header, const CBlockIndex* 
     return max_time.has_value() && header.GetBlockTime() >= *max_time && now > *max_time;
 }
 
+bool TemplateTimeFrozenAtFloor(const CBlockHeader& header, const CBlockIndex* pindexPrev,
+                               const Consensus::Params& consensus, int64_t now)
+{
+    if (pindexPrev == nullptr) return false;
+    const int64_t header_time{header.GetBlockTime()};
+    return header_time <= GetMinimumTime(pindexPrev, consensus) && now < header_time;
+}
+
+bool TemplateTimeFrozen(const CBlockHeader& header, const CBlockIndex* pindexPrev,
+                        const Consensus::Params& consensus, int64_t now)
+{
+    return TemplateTimeFrozenAtCeiling(header, pindexPrev, consensus, now) ||
+           TemplateTimeFrozenAtFloor(header, pindexPrev, consensus, now);
+}
+
 uint64_t SelectMatMulSearchStartNonce(const CBlockHeader& header, const CBlockIndex* pindexPrev,
                                       const Consensus::Params& consensus, int64_t now,
                                       FastRandomContext& rng)
 {
-    if (header.nNonce64 != 0 || !TemplateTimeFrozenAtCeiling(header, pindexPrev, consensus, now)) {
+    if (header.nNonce64 != 0 || !TemplateTimeFrozen(header, pindexPrev, consensus, now)) {
         return header.nNonce64;
     }
     // Keep the start in the lower half so the solver's remaining nonce range stays effectively unbounded.

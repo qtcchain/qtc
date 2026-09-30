@@ -4780,16 +4780,21 @@ static bool GenerateBlock(ChainstateManager& chainman, CBlock&& block, uint64_t&
         parent_median_time_past = pindex_prev->GetMedianTimePast();
         tip_hash_before_mining = chainman.ActiveChain().Tip()->GetBlockHash();
         if (matmul_active) {
-            // A template whose time is pinned at the future-drift ceiling is identical on every call
+            // A template whose time is pinned at either time bound is identical on every call
             // (same tip, same coinbase, same nTime), so a zero-start search would re-scan the same
-            // nonce range forever and deadlock the chain after a long stall (testnet burn-in T1,
-            // 2026-09-27). Start such searches at a random nonce instead.
+            // nonce range forever: at the future-drift ceiling after a long stall (testnet burn-in
+            // T1, 2026-09-27), and at the minimum-time floor while the wall clock is still before
+            // it (mining opened ahead of the genesis time T0, mainnet launch 2026-09-30). Start such
+            // searches at a random nonce instead.
             FastRandomContext rng;
+            const int64_t now_seconds{TicksSinceEpoch<std::chrono::seconds>(NodeClock::now())};
             const uint64_t start_nonce{node::SelectMatMulSearchStartNonce(
-                block, pindex_prev, consensus, TicksSinceEpoch<std::chrono::seconds>(NodeClock::now()), rng)};
+                block, pindex_prev, consensus, now_seconds, rng)};
             if (start_nonce != block.nNonce64) {
-                LogDebug(BCLog::MINING, "GenerateBlock: template time frozen at drift ceiling %d, starting nonce search at %llu\n",
-                         block.GetBlockTime(), static_cast<unsigned long long>(start_nonce));
+                LogDebug(BCLog::MINING, "GenerateBlock: template time %d frozen at %s (now %d), starting nonce search at %llu\n",
+                         block.GetBlockTime(),
+                         node::TemplateTimeFrozenAtCeiling(block, pindex_prev, consensus, now_seconds) ? "drift ceiling" : "minimum-time floor",
+                         now_seconds, static_cast<unsigned long long>(start_nonce));
                 block.nNonce64 = start_nonce;
                 block.nNonce = static_cast<uint32_t>(start_nonce);
             }
