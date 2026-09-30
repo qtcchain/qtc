@@ -138,7 +138,7 @@ BOOST_AUTO_TEST_CASE(mainnet_genesis_nbits_equals_powlimit_compact)
     const uint32_t mainnet_genesis_nbits = chain_params->GenesisBlock().nBits;
 
     BOOST_CHECK_EQUAL(pow_limit.GetCompact(), mainnet_genesis_nbits);
-    BOOST_CHECK_EQUAL(mainnet_genesis_nbits, 0x1e033333U);
+    BOOST_CHECK_EQUAL(mainnet_genesis_nbits, 0x1e011da5U);
 
     arith_uint256 genesis_target{};
     genesis_target.SetCompact(mainnet_genesis_nbits);

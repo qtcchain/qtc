@@ -164,7 +164,7 @@ public:
         // ahead over ~8 days); 100 CPU cores ~6 floor blocks/day. Model and alternatives:
         // iCloud QTC/software/QTC_powLimit_Sizing_2026-09-10 (powlimit_sizing.py). Re-run the
         // model if the launch fleet changes materially; genesis is regenerated at launch (H1).
-        consensus.powLimit = uint256{"0000033333000000000000000000000000000000000000000000000000000000"};
+        consensus.powLimit = uint256{"0000011da5000000000000000000000000000000000000000000000000000000"}; // launch floor D5 (0x1e011da5): Node B (RTX 6000 Ada) alone holds 600 s; signed off 2026-09-25
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
         consensus.nPowTargetSpacing = 600; // QTC: 10-minute blocks (Bitcoin)
         consensus.fPowAllowMinDifficultyBlocks = false;
@@ -356,16 +356,16 @@ public:
         m_assumed_chain_state_size = 1;
 
         genesis = CreateQTCGenesisBlock(
-            1789063200,  // Sep 10, 2026 18:00:00 UTC — consensus fork v0.0.5 (REGENERATE AGAIN within hours of the real launch, security review H1)
+            1790809200,  // Sep 30, 2026 23:00:00 UTC — mainnet launch genesis (T0), regenerated on launch day (security review H1)
             0,
             1,
-            0x1e033333,  // == compact(powLimit); QTC Option B at 600 s, floor sized from the measured A6000 (H2)
+            0x1e011da5,  // == compact(powLimit); launch floor D5
             1,
             consensus.nInitialSubsidy,
             static_cast<uint16_t>(consensus.nMatMulDimension),
             uint256{"07226e4fdc368a067ef904b9fdddf9763e2782fda4e695788240077805643edd"});
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"9ba00506445039aa7315dc1ce61eded19ec75d31edbfed3643cb1e4f3c3db8e2"});
+        assert(consensus.hashGenesisBlock == uint256{"4040450ec30f1f9a7ef2d12578e1ea66d0838d7d8181b62c066953ca3baf3406"});
         assert(genesis.hashMerkleRoot == uint256{"68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23"});
         // AUDIT D1: validate the immutable MatMul-ASERT schedule at construction so
         // an invalid parameter set aborts node startup instead of failing closed
