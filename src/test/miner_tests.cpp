@@ -1825,6 +1825,20 @@ BOOST_AUTO_TEST_CASE(template_output_rule_matches_consensus_for_anchor_outputs)
     CMutableTransaction oversized{tx};
     oversized.vout[0].scriptPubKey = CScript() << OP_RETURN << std::vector<unsigned char>(consensus.nMaxOpReturnBytes, 0x51);
     BOOST_CHECK(!node::TemplateOutputsPassReducedDataLimits(CTransaction(oversized), consensus));
+
+    // The assembler now calls the consensus function itself; every verdict above must match it exactly,
+    // including the consensus reject reasons for the two failures.
+    for (const auto* mtx : {&tx, &bad, &oversized}) {
+        BlockValidationState state;
+        BOOST_CHECK_EQUAL(node::TemplateOutputsPassReducedDataLimits(CTransaction(*mtx), consensus),
+                          CheckReducedDataOutputLimits(CTransaction(*mtx), state, consensus));
+    }
+    BlockValidationState bad_state;
+    BOOST_CHECK(!CheckReducedDataOutputLimits(CTransaction(bad), bad_state, consensus));
+    BOOST_CHECK_EQUAL(bad_state.GetRejectReason(), "bad-txns-nonp2mr-output");
+    BlockValidationState oversized_state;
+    BOOST_CHECK(!CheckReducedDataOutputLimits(CTransaction(oversized), oversized_state, consensus));
+    BOOST_CHECK_EQUAL(oversized_state.GetRejectReason(), "bad-txns-opreturn-size");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

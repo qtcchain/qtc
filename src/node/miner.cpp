@@ -64,29 +64,10 @@ bool IsP2MROutputScript(const CScript& script_pub_key)
 [[nodiscard]] bool PassesReducedDataOutputLimits(const CTransaction& tx,
                                                  const Consensus::Params& consensus)
 {
-    if (!consensus.fReducedDataLimits) return true;
-
-    for (const auto& txout : tx.vout) {
-        const size_t script_size{txout.scriptPubKey.size()};
-        const bool is_op_return{script_size > 0 && txout.scriptPubKey[0] == OP_RETURN};
-        if (is_op_return) {
-            if (script_size > consensus.nMaxOpReturnBytes) {
-                return false;
-            }
-            continue;
-        }
-        if (script_size > consensus.nMaxTxoutScriptPubKeyBytes) {
-            return false;
-        }
-        // Mirror CheckReducedDataOutputLimits (validation.cpp): besides P2MR, the 4-byte pay-to-anchor
-        // output is consensus-valid, so the assembler must not leave anchor-creating transactions
-        // sitting in the mempool unminable.
-        if (consensus.fEnforceP2MROnlyOutputs && !IsP2MROutputScript(txout.scriptPubKey) &&
-            !txout.scriptPubKey.IsPayToAnchor()) {
-            return false;
-        }
-    }
-    return true;
+    // The assembler applies the consensus rule itself rather than a mirrored copy: a drifted copy once left
+    // anchor-creating transactions unminable while consensus admitted them (testnet burn-in, 2026-09-26).
+    BlockValidationState state;
+    return CheckReducedDataOutputLimits(tx, state, consensus);
 }
 
 [[nodiscard]] std::vector<uint256> CollectReferencedShieldedNettingManifests(const CTransaction& tx)
