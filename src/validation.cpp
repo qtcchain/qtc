@@ -9726,7 +9726,7 @@ static bool CheckWitnessMalleation(const CBlock& block, bool expect_witness_comm
     return true;
 }
 
-static bool CheckReducedDataOutputLimits(const CTransaction& tx, BlockValidationState& state, const Consensus::Params& consensus_params)
+bool CheckReducedDataOutputLimits(const CTransaction& tx, BlockValidationState& state, const Consensus::Params& consensus_params)
 {
     if (!consensus_params.fReducedDataLimits) return true;
 
