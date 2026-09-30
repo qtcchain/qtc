@@ -19,6 +19,15 @@ static const uint64_t DEFAULT_MAX_TRIES{100000000};
  * -miningmaxpeersyncheightlag and -miningmaxheaderlag; on test chains the
  * connectivity and header-lag groups are only enforced when the operator set a
  * non-zero threshold, on mainnet they are always enforced.
+ *
+ * Only outbound peers count towards the peer floors. An outbound connection is
+ * one this node chose to open (addrman selection or an operator addnode), so an
+ * attacker cannot satisfy the floor simply by connecting to the miner; inbound
+ * connections are unauthenticated and cheap to sybil. Operators running a fleet
+ * should addnode each other on both sides, so every fleet peer is outbound
+ * (manual) for both nodes and counts. The mainnet default floor is 2: the
+ * built-in launch mesh has three public hosts, and a miner that is itself one
+ * of them can only reach the other two.
  */
 struct MiningTemplateReadinessPolicy {
     bool enforce_connectivity{true};
@@ -41,6 +50,38 @@ struct MiningTemplateReadinessObservation {
     bool peerman_available{false};
     size_t synced_outbound_peers{0};
 };
+
+/** Where the height used for the synced-outbound rule came from. */
+enum class MiningPeerHeightSource {
+    NONE,            //!< neither a sync height nor a starting height is known
+    SYNC_HEIGHT,     //!< net_processing best known block (headers were exchanged)
+    STARTING_HEIGHT, //!< version-handshake starting height (no headers exchanged yet)
+};
+
+/** Per-peer result of ClassifyMiningPeerSync. */
+struct MiningPeerSyncStatus {
+    MiningPeerHeightSource source{MiningPeerHeightSource::NONE};
+    int sync_lag{-1};
+    bool counts_as_synced{false};
+};
+
+/**
+ * Decide whether one outbound peer counts towards -miningminsyncedoutboundpeers.
+ *
+ * sync_height is the peer's best known block from net_processing (-1 until the
+ * peer has sent us a header, inv or block). At genesis, and for any peer that
+ * connected while the network was idle, nothing has been announced yet and the
+ * sync height stays -1 even though the peer is exactly at our tip. In that case
+ * only, fall back to the starting height the peer reported in its version
+ * handshake and count it as synced when it is within the lag window of the
+ * active tip. A known sync height always wins over the starting height, so a
+ * peer that is really lagging cannot be talked back in via the handshake.
+ */
+MiningPeerSyncStatus ClassifyMiningPeerSync(
+    int active_tip_height,
+    int64_t max_peer_sync_height_lag,
+    int sync_height,
+    int starting_height);
 
 /** Why a template was refused: an RPCErrorCode and the message reported to the caller. */
 struct MiningTemplateRefusal {

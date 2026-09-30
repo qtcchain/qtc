@@ -78,6 +78,18 @@ MiningChainGuardStatus EvaluateMiningChainGuard(
     const std::vector<int>& peer_heights,
     const MiningChainGuardOptions& options);
 
+/**
+ * Height one outbound peer contributes to the chain-guard consensus sample.
+ * Prefers the net_processing sync height (best known block), then the last
+ * common block, then the version-handshake starting height. The last fallback
+ * covers genesis and idle-network joins: until a peer announces a header, inv
+ * or block, both net_processing heights are -1 even when the peer is exactly
+ * at our tip, and without it three fresh peers at height 0 would read as
+ * "insufficient_peer_consensus" and trigger peer churn. Returns -1 when
+ * nothing is known.
+ */
+int ResolveMiningChainGuardPeerHeight(int sync_height, int common_height, int starting_height);
+
 std::vector<int> FilterMiningChainGuardPeerHeights(
     int local_tip_height,
     int64_t now,

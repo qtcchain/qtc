@@ -61,12 +61,22 @@ Notes:
   the three `addnode=` entries are the fixed public seed nodes (Singapore, Toronto,
   Frankfurt) and match `contrib/seeds/nodes_main.txt`
 - `getblocktemplate` enforces an outbound peer floor on mainnet by default
-  (`-miningminoutboundpeers=3`) to reduce isolated-mining orphan risk.
-  Set `-miningminoutboundpeers=0` only for intentional isolated lab mining.
+  (`-miningminoutboundpeers=2`) to reduce isolated-mining orphan risk. Only
+  outbound connections count: a peer this node chose to open (addrman or
+  `addnode`), never an inbound one, because inbound connections are
+  unauthenticated and cheap to sybil. Fleet operators who want their own
+  nodes to count should `addnode` each other on both sides so every fleet
+  link is outbound for both ends. The default is two because the launch mesh
+  is three public hosts and a miner that is itself a mesh host can only reach
+  the other two. Set `-miningminoutboundpeers=0` only for intentional isolated
+  lab mining.
 - `getblocktemplate` also enforces that at least two outbound peers are actually
   near tip on mainnet by default
   (`-miningminsyncedoutboundpeers=2`, `-miningmaxpeersyncheightlag=1`).
   This reduces stale/forked mining when outbound peers are connected but lagging.
+  A peer that has not announced any header yet (at genesis, or one that joined
+  while the network was idle) is judged by its version-handshake starting
+  height instead, so a fresh network at height 0 can start mining.
   Set `-miningminsyncedoutboundpeers=0` only for intentional isolated lab mining.
 - `getblocktemplate` also enforces a validated-tip/header-lag bound on mainnet
   by default (`-miningmaxheaderlag=3`) so miners do not work from templates that

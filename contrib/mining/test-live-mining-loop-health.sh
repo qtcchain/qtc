@@ -840,6 +840,53 @@ fi
 
 cleanup_pidfile "${NODE_PIDFILE}"
 
+# Genesis launch: every manual peer has synced_headers/synced_blocks -1 because
+# no header has been exchanged yet. Peers whose handshake starting height is at
+# the local tip (0) must be left alone; only a peer with no height at all is stale.
+STATE_DIR="${TMPDIR}/state-peer-genesis"
+RESULTS_DIR="${TMPDIR}/results-peer-genesis"
+mkdir -p "${STATE_DIR}" "${RESULTS_DIR}"
+NODE_PIDFILE="${STATE_DIR}/managed.pid"
+
+sed \
+  -e 's/^    echo 100$/    echo 0/' \
+  -e 's/"local_tip":100/"local_tip":0/' \
+  -e 's#^\[{"inbound":false,"addr":"stale-a.example:19335".*$#[{"inbound":false,"addr":"genesis-a.example:19335","connection_type":"manual","synced_headers":-1,"synced_blocks":-1,"startingheight":0},{"inbound":false,"addr":"genesis-b.example:19335","connection_type":"manual","synced_headers":-1,"synced_blocks":-1,"startingheight":0},{"inbound":false,"addr":"nohandshake-a.example:19335","connection_type":"manual","synced_headers":-1,"synced_blocks":-1,"startingheight":-1}]#' \
+  "${TMPDIR}/fake-cli-peer-stall" > "${TMPDIR}/fake-cli-peer-genesis"
+chmod +x "${TMPDIR}/fake-cli-peer-genesis"
+grep -q 'genesis-a.example' "${TMPDIR}/fake-cli-peer-genesis"
+
+STATE_DIR="${STATE_DIR}" \
+QTC_MINING_CLI="${TMPDIR}/fake-cli-peer-genesis" \
+QTC_MINING_DAEMON="${TMPDIR}/fake-qtcd-peer-stall" \
+QTC_MINING_NODE_PIDFILE="${NODE_PIDFILE}" \
+QTC_MINING_BOOTSTRAP_ADDNODES="node-a.example:19335,node-b.example:19335" \
+QTC_MINING_PEER_REMEDIATION_THRESHOLD=1 \
+QTC_MINING_PEER_REMEDIATION_COOLDOWN_SECS=0 \
+QTC_MINING_HEALTH_RESTART_THRESHOLD=2 \
+QTC_MINING_RESTART_COOLDOWN_SECS=0 \
+QTC_MINING_WAIT_FOR_RPC_SECS=1 \
+QTC_MINING_STARTUP_GRACE_SECS=0 \
+QTC_MINING_SYNC_STALL_RESTART_SECS=0 \
+QTC_MINING_MAX_LOOPS=5 \
+"${SCRIPT_DIR}/live-mining-loop.sh" \
+  --results-dir="${RESULTS_DIR}" \
+  --address-file="${TMPDIR}/address.txt" \
+  --sleep=0 >/dev/null 2>&1
+
+grep -q "peer-stale-disconnect reason=insufficient_peer_consensus attempted=1 disconnected=1 failed=0" "${RESULTS_DIR}/live-mining-health.log"
+grep -q "disconnectnode nohandshake-a.example:19335" "${STATE_DIR}/disconnect.log"
+if grep -q "disconnectnode genesis-" "${STATE_DIR}/disconnect.log"; then
+  echo "peers at the genesis tip with no headers exchanged yet must not be disconnected" >&2
+  exit 1
+fi
+if grep -q "genesis-.*stale_manual_peer" "${RESULTS_DIR}/disabled-peer-mesh.txt" 2>/dev/null; then
+  echo "peers at the genesis tip must not be cooled off as stale mesh peers" >&2
+  exit 1
+fi
+
+cleanup_pidfile "${NODE_PIDFILE}"
+
 STATE_DIR="${TMPDIR}/state-idle"
 RESULTS_DIR="${TMPDIR}/results-idle"
 mkdir -p "${STATE_DIR}" "${RESULTS_DIR}"

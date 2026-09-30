@@ -217,6 +217,14 @@ MiningChainGuardStatus EvaluateMiningChainGuard(
     return status;
 }
 
+int ResolveMiningChainGuardPeerHeight(const int sync_height, const int common_height, const int starting_height)
+{
+    if (sync_height >= 0) return sync_height;
+    if (common_height >= 0) return common_height;
+    if (starting_height >= 0) return starting_height;
+    return -1;
+}
+
 std::vector<int> FilterMiningChainGuardPeerHeights(
     int local_tip_height,
     int64_t now,
@@ -308,8 +316,13 @@ MiningChainGuardStatus GetMiningChainGuardStatus(const NodeContext& node)
         // cannot signal that peers are ahead of us. Restricting the sample to
         // outbound peers (above) is what bounds spoofing here; treat the median
         // as a hint for the mining guard, not as validated chain state.
-        const int peer_height =
-            state_stats.nSyncHeight >= 0 ? state_stats.nSyncHeight : state_stats.nCommonHeight;
+        //
+        // Before any header has been exchanged (genesis, or a peer that joined
+        // while the network was idle) both heights are -1; the handshake
+        // starting height is then used so peers sitting at our tip count as
+        // consensus instead of as missing (see ResolveMiningChainGuardPeerHeight).
+        const int peer_height = ResolveMiningChainGuardPeerHeight(
+            state_stats.nSyncHeight, state_stats.nCommonHeight, state_stats.m_starting_height);
         if (peer_height >= 0) {
             MiningChainGuardPeerSample sample;
             sample.height = peer_height;

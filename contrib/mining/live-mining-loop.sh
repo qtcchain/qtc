@@ -28,6 +28,12 @@ PEER_REMEDIATION_COOLDOWN_SECS="${QTC_MINING_PEER_REMEDIATION_COOLDOWN_SECS:-30}
 PEER_CACHE_LIMIT="${QTC_MINING_PEER_CACHE_LIMIT:-24}"
 PEER_REFRESH_LIMIT="${QTC_MINING_PEER_REFRESH_LIMIT:-12}"
 PEER_MESH_DISABLE_SECS="${QTC_MINING_PEER_MESH_DISABLE_SECS:-600}"
+# A manual peer with no synced header/block yet is only "stale" when its
+# handshake starting height is more than this many blocks below the local tip.
+# At genesis (and whenever a peer joins an idle network) nothing has been
+# announced yet, so synced_headers/synced_blocks are -1 for a peer that is
+# exactly at our tip; disconnecting it would only churn the launch mesh.
+PEER_STALE_STARTING_HEIGHT_LAG="${QTC_MINING_PEER_STALE_STARTING_HEIGHT_LAG:-2}"
 HEALTHY_PUBLIC_PEER_TARGET="${QTC_MINING_HEALTHY_PUBLIC_PEER_TARGET:-4}"
 HEALTHY_FULL_RELAY_PEER_TARGET="${QTC_MINING_HEALTHY_FULL_RELAY_PEER_TARGET:-4}"
 SYNC_STALL_RESTART_SECS="${QTC_MINING_SYNC_STALL_RESTART_SECS:-300}"
@@ -818,6 +824,10 @@ disconnect_stale_outbound_peers() {
   local attempted=0
   local disconnected=0
   local failed=0
+  local local_tip="${last_local_tip:-0}"
+  if (( local_tip < 0 )); then
+    local_tip=0
+  fi
 
   tmp_err="$(mktemp)"
   if ! peer_json="$(rpc_cli getpeerinfo 2>"${tmp_err}")"; then
@@ -842,8 +852,10 @@ disconnect_stale_outbound_peers() {
       | select((.inbound // false) | not)
       | select((.connection_type // "") == "manual")
       | select((.synced_headers // -1) < 0 and (.synced_blocks // -1) < 0)
+      | select((.startingheight // -1) < 0 or (.startingheight // -1) < ($tip - $lag))
       | .addr // empty
-    ' <<<"${peer_json}" | awk 'NF && !seen[$0]++'
+    ' --argjson tip "${local_tip}" --argjson lag "${PEER_STALE_STARTING_HEIGHT_LAG}" \
+      <<<"${peer_json}" | awk 'NF && !seen[$0]++'
   )
 
   if (( attempted == 0 )); then

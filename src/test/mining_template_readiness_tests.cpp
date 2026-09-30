@@ -27,7 +27,7 @@ MiningTemplateReadinessPolicy MainnetLikePolicy()
     // Mirrors the mainnet defaults of -miningmin*/-miningmax* in rpc/mining.cpp.
     MiningTemplateReadinessPolicy policy;
     policy.enforce_connectivity = true;
-    policy.min_outbound_peers = 3;
+    policy.min_outbound_peers = 2;
     policy.min_synced_outbound_peers = 2;
     policy.max_peer_sync_height_lag = 1;
     policy.enforce_header_lag = true;
@@ -188,6 +188,94 @@ BOOST_AUTO_TEST_CASE(zero_thresholds_on_mainnet_still_require_peers_and_sync)
 }
 
 // ---------------------------------------------------------------------------
+// Per-peer sync classification: genesis / idle-network starting-height fallback
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(genesis_peer_with_starting_height_at_tip_counts_as_synced)
+{
+    // Mainnet launch: tip is genesis, no header has been exchanged with anyone,
+    // so every peer reports sync_height -1 but a starting height of 0.
+    const auto status = ClassifyMiningPeerSync(
+        /*active_tip_height=*/0, /*max_peer_sync_height_lag=*/1, /*sync_height=*/-1, /*starting_height=*/0);
+    BOOST_CHECK(status.source == MiningPeerHeightSource::STARTING_HEIGHT);
+    BOOST_CHECK_EQUAL(status.sync_lag, 0);
+    BOOST_CHECK(status.counts_as_synced);
+}
+
+BOOST_AUTO_TEST_CASE(starting_height_fallback_respects_lag_window)
+{
+    // Within the window: counts. Beyond it: does not, and is reported as lagging.
+    auto status = ClassifyMiningPeerSync(/*tip=*/100, /*lag=*/1, /*sync=*/-1, /*start=*/99);
+    BOOST_CHECK(status.source == MiningPeerHeightSource::STARTING_HEIGHT);
+    BOOST_CHECK_EQUAL(status.sync_lag, 1);
+    BOOST_CHECK(status.counts_as_synced);
+
+    status = ClassifyMiningPeerSync(/*tip=*/100, /*lag=*/1, /*sync=*/-1, /*start=*/98);
+    BOOST_CHECK(status.source == MiningPeerHeightSource::STARTING_HEIGHT);
+    BOOST_CHECK_EQUAL(status.sync_lag, 2);
+    BOOST_CHECK(!status.counts_as_synced);
+
+    // A peer whose handshake claims to be ahead of us has lag 0, as with sync height.
+    status = ClassifyMiningPeerSync(/*tip=*/100, /*lag=*/1, /*sync=*/-1, /*start=*/105);
+    BOOST_CHECK_EQUAL(status.sync_lag, 0);
+    BOOST_CHECK(status.counts_as_synced);
+}
+
+BOOST_AUTO_TEST_CASE(known_sync_height_wins_over_starting_height)
+{
+    // A peer that really lags cannot be talked back in via its handshake height.
+    auto status = ClassifyMiningPeerSync(/*tip=*/100, /*lag=*/1, /*sync=*/50, /*start=*/100);
+    BOOST_CHECK(status.source == MiningPeerHeightSource::SYNC_HEIGHT);
+    BOOST_CHECK_EQUAL(status.sync_lag, 50);
+    BOOST_CHECK(!status.counts_as_synced);
+
+    // And a stale handshake height does not hurt a peer whose headers are current.
+    status = ClassifyMiningPeerSync(/*tip=*/100, /*lag=*/1, /*sync=*/100, /*start=*/0);
+    BOOST_CHECK(status.source == MiningPeerHeightSource::SYNC_HEIGHT);
+    BOOST_CHECK_EQUAL(status.sync_lag, 0);
+    BOOST_CHECK(status.counts_as_synced);
+}
+
+BOOST_AUTO_TEST_CASE(peer_with_no_height_signal_is_not_synced)
+{
+    const auto status = ClassifyMiningPeerSync(/*tip=*/0, /*lag=*/1, /*sync=*/-1, /*start=*/-1);
+    BOOST_CHECK(status.source == MiningPeerHeightSource::NONE);
+    BOOST_CHECK_EQUAL(status.sync_lag, -1);
+    BOOST_CHECK(!status.counts_as_synced);
+}
+
+BOOST_AUTO_TEST_CASE(genesis_launch_topology_passes_mainnet_policy)
+{
+    // The 2026-09-30 launch miner: tip and best header at genesis, three
+    // outbound peers, all with sync_height -1 and starting height 0. Counting
+    // them via the starting-height fallback satisfies the synced-peer floor.
+    const auto policy = MainnetLikePolicy();
+    size_t synced{0};
+    for (int i = 0; i < 3; ++i) {
+        if (ClassifyMiningPeerSync(0, policy.max_peer_sync_height_lag, -1, 0).counts_as_synced) ++synced;
+    }
+    BOOST_CHECK_EQUAL(synced, 3U);
+
+    MiningTemplateReadinessObservation obs;
+    obs.has_tip = true;
+    obs.tip_height = 0;
+    obs.has_best_header = true;
+    obs.best_header_height = 0;
+    obs.initial_block_download = false;
+    obs.connected_peers = 3;
+    obs.outbound_peers = 3;
+    obs.peerman_available = true;
+    obs.synced_outbound_peers = synced;
+    BOOST_CHECK(!CheckMiningTemplateReadiness(policy, obs).has_value());
+
+    // Without the fallback (the pre-fix count of 0) the same node is refused.
+    obs.synced_outbound_peers = 0;
+    const auto refusal = CheckMiningTemplateReadiness(policy, obs);
+    BOOST_REQUIRE(refusal.has_value());
+    BOOST_CHECK(Contains(refusal->message, "has 0 synced outbound peers"));
+}
+
+// ---------------------------------------------------------------------------
 // Pure decision: refusing cases (fail closed)
 // ---------------------------------------------------------------------------
 
@@ -218,12 +306,29 @@ BOOST_AUTO_TEST_CASE(no_peers_refuses)
 BOOST_AUTO_TEST_CASE(too_few_outbound_peers_refuses)
 {
     auto obs = ReadyObservation();
-    obs.outbound_peers = 2; // < 3
+    obs.outbound_peers = 1; // < 2
     const auto refusal = CheckMiningTemplateReadiness(MainnetLikePolicy(), obs);
     BOOST_REQUIRE(refusal.has_value());
     BOOST_CHECK_EQUAL(refusal->code, RPC_CLIENT_NOT_CONNECTED);
-    BOOST_CHECK(Contains(refusal->message, "has 2 outbound peers, requires at least 3 for getblocktemplate"));
+    BOOST_CHECK(Contains(refusal->message, "has 1 outbound peers, requires at least 2 for getblocktemplate"));
+    BOOST_CHECK(Contains(refusal->message, "inbound peers do not count"));
     BOOST_CHECK(Contains(refusal->message, "-miningminoutboundpeers=0"));
+}
+
+BOOST_AUTO_TEST_CASE(inbound_peers_do_not_satisfy_outbound_floor)
+{
+    // Launch-day topology of one miner: 1 outbound + 4 inbound. Inbound
+    // connections are unauthenticated and never count towards the floor.
+    auto obs = ReadyObservation();
+    obs.connected_peers = 5;
+    obs.outbound_peers = 1;
+    const auto refusal = CheckMiningTemplateReadiness(MainnetLikePolicy(), obs);
+    BOOST_REQUIRE(refusal.has_value());
+    BOOST_CHECK_EQUAL(refusal->code, RPC_CLIENT_NOT_CONNECTED);
+    BOOST_CHECK(Contains(refusal->message, "outbound peers, requires at least"));
+
+    obs.outbound_peers = 2; // the mainnet default floor
+    BOOST_CHECK(!CheckMiningTemplateReadiness(MainnetLikePolicy(), obs).has_value());
 }
 
 BOOST_AUTO_TEST_CASE(initial_block_download_refuses)

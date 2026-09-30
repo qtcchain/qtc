@@ -310,6 +310,13 @@ dump-floor and stall-recovery machinery.
   no peers → too few outbound → initial block download → too few synced outbound → validated tip too far behind the best
   header) with the `-miningmin*`/`-miningmaxheaderlag` thresholds; always enforced on mainnet, opt-in on test chains so
   a lone regtest node still mines. Unit suite `mining_template_readiness_tests` (16 cases incl. real RPC).
+  Launch-day follow-up (2026-09-30, for v0.1.1): at genesis no header has been exchanged, so every peer's sync
+  height is -1 and the synced-outbound floor could never be met (deadlock: nobody may mine, so nobody announces a
+  block). The guard now falls back to the version-handshake starting height only while the sync height is unknown; a
+  known sync height always wins. The mainnet outbound floor is 2 (the launch mesh is three hosts; a mesh host reaches
+  only two), still outbound-only. The advisory chain guard uses the same fallback so fresh peers at the tip read as
+  consensus instead of `insufficient_peer_consensus`. Tests added to `mining_template_readiness_tests` and
+  `mining_chain_guard_tests`.
 - **Info items**: help text for `-miningchainguard`, `-miningchainguarddefaultmesh`, the three auto-update options (no
   default compiled in), the four `-mining*` thresholds, `-reorghysteresisdepth`/`-reorgprotectionprofile` (emergency
   profile uses depth 1) now match the code; bootstrap doc defaults corrected.
