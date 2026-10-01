@@ -223,7 +223,7 @@ $ scripts/wallet_secure_backup.py \
     --encrypt-output
 ```
 
-With `--encrypt-output`, the wrapper keeps the timestamped top-level export tree for metadata and index files, but writes each wallet itself as a native encrypted archive instead of a plaintext wallet bundle directory. In this mode the script preserves the native RPC default for `include_viewing_keys`, so post-61000 exports stay metadata-only unless you explicitly request otherwise through the RPC surface. `--remove-plaintext` remains accepted as a compatibility no-op because there are no plaintext per-wallet bundle directories in this mode.
+With `--encrypt-output`, the wrapper keeps the timestamped top-level export tree for metadata and index files, but writes each wallet itself as a native encrypted archive instead of a plaintext wallet bundle directory. In this mode the script preserves the native RPC default for `include_viewing_keys`, so exports stay metadata-only unless you explicitly request otherwise through the RPC surface. `--remove-plaintext` remains accepted as a compatibility no-op because there are no plaintext per-wallet bundle directories in this mode.
 
 If the target datadir is on `testnet`, `testnet4`, `signet`, or `regtest`, add the corresponding base CLI flag with `--cli-arg`, for example `--cli-arg=-regtest`.
 

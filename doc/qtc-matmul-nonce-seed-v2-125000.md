@@ -4,14 +4,13 @@
 
 # QTC MatMul Nonce-Bound Seed V2
 
-Date: 2026-06-07
-Branch: `audit/v2-rebalance-pool-credit-probe`
-Activation: height `125000`
+Date: 2026-06-07 (predecessor network); adopted by QTC from genesis
+Activation on QTC: height `0` (mainnet, testnet, regtest)
 
 ## Summary
 
-This branch closes the e1 MatMul-PoW amortization issue for blocks at and above height
-`125000`.
+This rule closes the e1 MatMul-PoW amortization issue. On QTC it applies to every block; on the
+predecessor network, where it was first deployed, it activated at height `125000`.
 
 Before this rule, MatMul matrix seeds were derived as:
 
@@ -38,8 +37,8 @@ timestamp, merkle root, target bits, version, or dimension changes A/B.
 
 ## Consensus And Mining Changes
 
-- `Consensus::Params::nMatMulNonceSeedHeight` is set to `125000` on mainnet, testnet,
-  testnet4, and signet.
+- `Consensus::Params::nMatMulNonceSeedHeight` is `0` on QTC mainnet, testnet and regtest
+  (it was `125000` on the predecessor network).
 - Regtest has `-regtestmatmulnonceseedheight=<n>` for activation-boundary testing.
 - `SetDeterministicMatMulSeeds(...)` selects the legacy derivation before activation and seed-v2
   at/after activation.
@@ -62,12 +61,9 @@ timestamp, merkle root, target bits, version, or dimension changes A/B.
 
 ## Boundary Safety
 
-The rule is deliberately height-gated rather than retroactive. Blocks below `125000` keep the
-historical seed contract. Blocks at and above `125000` must satisfy seed-v2.
-
-As of the local mainnet node check on 2026-06-07, mainnet was at height `122920`, so the
-activation remained in the future. If mainnet reaches `125000` before this release is broadly
-deployed, do not ship this exact activation unchanged; reassess the height first.
+The rule is height-gated in the code so that a network can adopt it mid-chain. On QTC the gate is
+height `0`, so there is no legacy seed contract on the live chain and no boundary to manage; the
+regtest option exists only for testing the gate itself.
 
 ## Tests
 

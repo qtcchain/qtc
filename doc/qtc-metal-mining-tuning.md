@@ -248,7 +248,7 @@ Useful examples:
 ./build-qtc/bin/qtc-matmul-solve-bench \
   --backend metal \
   --block-height 1000 \
-  --nonce-seed-height 125000
+  --nonce-seed-height 0
 ```
 
 For lower-level digest microbenchmarks, use `qtc-matmul-metal-bench`. That tool
