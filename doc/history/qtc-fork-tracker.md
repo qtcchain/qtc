@@ -1,3 +1,7 @@
+> **Historical record.** Internal working tracker kept while QTC was forked from its predecessor code base
+> (2026-08/09). Decisions recorded here were superseded by the launch documents in `doc/launch/` and by the
+> mainnet parameters in `src/kernel/chainparams.cpp`. Kept for the engineering record; not a user document.
+
 # QTC — fork of upstream v0.33.1 (working tracker)
 
 **Goal:** a brand-new chain "QTC" forked from upstream **v0.33.1** (the last release
@@ -7,8 +11,7 @@ transition that landed in v0.33.2). QTC keeps the **full QTC stack** — MatMul
 shielded pool — but with a fresh genesis, its own network identity, and the
 v4/Epoch-A latest-GPU fork left disabled.
 
-Worktree: `/Users/gavinwhyte/Documents/qtc/qtc-chain` · branch `qtc-main` (base
-tag `v0.33.1`, `944a6844`). Isolated from the QTC working tree.
+Development branch `qtc-main` (base tag `v0.33.1` of the predecessor code base, `944a6844`).
 
 ## Chosen QTC identity values
 

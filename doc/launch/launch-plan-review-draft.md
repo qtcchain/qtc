@@ -152,7 +152,7 @@ over about eight days with roughly 163 blocks minted ahead of schedule, as model
 - `network/QTC_Security_Review_v2_2026-09-09` (+ subsystem reports), `network/QTC_H4_Fix_Options_Model_2026-09-09`, `network/QTC_MatMul_PoW_Literature_Comparison_2026-09-09`.
 - `software/QTC_Release_v0.0.5/6/7_Notes`, `software/QTC_GPU_Kernel_Port_2026-09-10`, `software/QTC_powLimit_Sizing_2026-09-10`, `software/QTC_Consensus_Fix_Model_2026-09-10`, `software/QTC_Repo_Publish_Log_2026-09-09`.
 - `fees/QTC_vs_Bitcoin_Fee_Structure_2026-09-10`, `fees/QTC_Dust_and_Sigop_Quote_Fix_2026-09-10`.
-- In-tree: `QTC-LAUNCH-SAFETY.md`, `QTC-SECURITY-REVIEW.md`, `QTC-FORK.md`.
+- In-tree: `QTC-LAUNCH-SAFETY.md`, `QTC-SECURITY-REVIEW.md`, `doc/history/qtc-fork-tracker.md`.
 
 ## 13. Review and sign-off
 

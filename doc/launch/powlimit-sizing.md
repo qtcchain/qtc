@@ -84,7 +84,7 @@ genesis nBits     = 0x1e033333   // must equal compact(powLimit); genesis hash c
   `9ba00506445039aa7315dc1ce61eded19ec75d31edbfed3643cb1e4f3c3db8e2` (was `44c4f064…1504d4`); merkle unchanged
   `68668615…`. Test, testnet4, signet, regtest and shieldedv2dev genesis unchanged.
 - Pinned values updated in `pow_tests`, `matmul_dgw_tests`, `pq_genesis_tests`; trackers `QTC-LAUNCH-SAFETY.md` (§13,
-  D3 checked), `QTC-SECURITY-REVIEW.md` (H2 closed), `QTC-FORK.md`.
+  D3 checked), `QTC-SECURITY-REVIEW.md` (H2 closed), `doc/history/qtc-fork-tracker.md`.
 - Verified: pow/matmul_dgw/pq_genesis/matmul_params/matmul_asert/chainparams/validation_chainstate suites no errors;
   main boots on the new genesis, test chain unchanged, five strict-validation regtest blocks mined; full unit suite
   3,292 cases, no errors, before commit.

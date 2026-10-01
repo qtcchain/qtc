@@ -1,14 +1,14 @@
 # QTC launch-safety proposal — difficulty curve, floors, and activation discipline
 
-**Status:** Option B **APPLIED to mainnet consensus** on 2026-09-06 (§8). `powLimit`
-**sized from the measured A6000 on 2026-09-10** (§13); the genesis must still be
-regenerated with a launch-day timestamp before any public launch (H1).
-**Basis:** QTC's own difficulty history (v0.33.1 → v0.34.5) and the two incidents
+**Status:** Option B **applied to mainnet consensus** on 2026-09-06 (§8); `powLimit` sized from measured GPU
+rates (§13, final launch floor `0x1e011da5`, see `doc/launch/powlimit-sizing.md`); genesis regenerated at T0 and
+**launched 2026-09-30 23:00 UTC**.
+**Basis:** the predecessor code base's difficulty history (its v0.33.1 → v0.34.5) and the two incidents
 it records in-code: the ASERT "dump floor" (shipped at 191,714 after a stall could
 unwind difficulty ~2000×) and the network split at 199,295/199,299 (a flag-day
 re-anchor shipped after the height was already mined).
 
-## 1. What QTC inherits today (v0.33.1 base) — and why it is the wrong default
+## 1. What QTC inherited from the predecessor code base (v0.33.1) — and why it was the wrong default
 
 | Field (mainnet) | Inherited value | Hazard for a fresh chain |
 |---|---|---|
@@ -99,7 +99,7 @@ Every future consensus height must satisfy, at release tag time:
 `height ≥ current_tip + (2 release cycles of blocks)`, and must **never** be a
 height already reachable or mined. Ship the software carrying the height
 *before* the height, with a supermajority of reachable peers upgraded. This is
-QTC's own §G invariant, and the 199,299 split is what violating it costs.
+the predecessor's own §G invariant, and the 199,299 split is what violating it costs.
 
 ### D7 — Early-chain reorg insurance
 While hashrate is tiny: pin checkpoints frequently (e.g. every ~1,000 blocks for
