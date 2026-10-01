@@ -1,7 +1,8 @@
 # QTC release-signing keys
 
 Generated at the offline key ceremony on 2026-09-20/21 (runbook `doc/launch/`, ceremony kit). Verify these values
-against a second channel (the seed domain's website and the release announcement) before trusting a build.
+against the second channel, <https://keys.qtc.gold/> (also <https://qtc.events/keys/>), and the release announcement before
+trusting a build.
 
 ## 1. Update-manifest signing key (ML-DSA-44, post-quantum)
 
