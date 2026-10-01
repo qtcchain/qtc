@@ -167,10 +167,8 @@ qtc-cli -rpcwallet=mywallet z_planshieldfunds 25.0 "qtcs1..."
 qtc-cli -rpcwallet=mywallet z_shieldfunds 25.0 "qtcs1..."
 ```
 
-Do not use these as current production ingress after the v0.32 sunset: new
-shielded credits are disabled by consensus. See
-[qtc-shielded-sweep-best-practices.md](qtc-shielded-sweep-best-practices.md)
-for historical chunking, fees, and stuck-transaction recovery.
+These RPCs are retained for viewing and recovery only: on QTC mainnet the shielded pool is closed
+from genesis and new shielded credits are rejected by consensus.
 
 ## 3. Self-custody mining and useful-work APIs
 

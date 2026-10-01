@@ -87,7 +87,7 @@ class Ledger:
         self.pool_balance = next_balance
 
 
-# Constrain-and-preserve framework (see doc/shielded_sunset_125000_plan.md). The model mirrors the
+# Constrain-and-preserve framework (predecessor sunset plan, retired from doc/). The model mirrors the
 # merged consensus code: DS-5 makes a rebalance pool-neutral (state value_balance == 0); the 125000
 # pool-credit gate rejects credits + rollover machinery as part of the full sunset freeze.
 
