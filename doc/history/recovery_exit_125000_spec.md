@@ -1,3 +1,5 @@
+> **Historical record from the predecessor code base.** Specification of the stranded-note recovery exit after the predecessor's block-125000 shielded sunset; on QTC the shielded pool is closed from genesis and this path is never activated (`nShieldedRecoveryExitActivationHeight` = never). On QTC mainnet the relevant activation heights are 0 (the rule applies from genesis) or the feature is closed from genesis; nothing here describes a future QTC activation.
+
 # RECOVERY_EXIT — transparent-claim stranded-note recovery (post-125,000)
 
 **Decision (owner):** preserve stranded-note rescue after the 125,000 sunset only for notes whose frozen

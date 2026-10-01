@@ -317,7 +317,7 @@ struct Params {
      *  125,000 sunset only after strict zero-output sunset gating, mempool commitment/nullifier
      *  reservation, and block-level atomic dual retirement are present. Must be >= nShieldedSunsetHeight
      *  when set.
-     *  See doc/recovery_exit_125000_spec.md. */
+     *  See doc/history/recovery_exit_125000_spec.md. */
     int32_t nShieldedRecoveryExitActivationHeight{std::numeric_limits<int32_t>::max()};
     /** QTC security review S-1/S-2/C-3/C-4: when set, every shielded bundle is rejected before any parsing beyond
      *  structure, value-balance or proof work, and shielded transactions are non-standard. True on chains whose

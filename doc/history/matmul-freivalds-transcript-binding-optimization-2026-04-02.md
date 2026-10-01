@@ -1,3 +1,5 @@
+> **Historical record from the predecessor code base.** Design and rollout note for the product-digest mining contract, activated at block 61000 on the predecessor network. On QTC mainnet the relevant activation heights are 0 (the rule applies from genesis) or the feature is closed from genesis; nothing here describes a future QTC activation.
+
 # MatMul Freivalds Transcript Binding Optimization
 
 **Status**: Historical design and rollout document

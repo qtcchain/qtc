@@ -1,3 +1,5 @@
+> **Historical record from the predecessor code base.** Design note on settlement finality coupling written against the predecessor network (reorg protection from block 61000). On QTC mainnet the relevant activation heights are 0 (the rule applies from genesis) or the feature is closed from genesis; nothing here describes a future QTC activation.
+
 # QTC as a credible settlement floor for EVX — finality coupling & reorg hardening
 
 Status: historical design note. The v0.32.10 qtc-node hardening branch supersedes

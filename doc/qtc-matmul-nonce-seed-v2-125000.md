@@ -1,3 +1,7 @@
+> **QTC note.** On QTC mainnet, testnet and regtest `nMatMulNonceSeedHeight` is **0**: the nonce-bound seed-v2 rule
+> described below applies from genesis and there is no legacy seed contract on the live chain. The height `125000`
+> in this document is the activation height on the predecessor network where the rule was first deployed.
+
 # QTC MatMul Nonce-Bound Seed V2
 
 Date: 2026-06-07
