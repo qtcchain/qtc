@@ -1,3 +1,6 @@
+> **Historical record from the predecessor code base** (March 2026). The shielded pool is closed from genesis on
+> QTC mainnet; this snapshot is kept only so the audit trail of the inherited code remains traceable.
+
 # Shielded Audit Tracker (Historical Snapshot)
 
 Date: 2026-03-20

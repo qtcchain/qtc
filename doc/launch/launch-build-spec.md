@@ -231,4 +231,4 @@ interface.
 - `QTC/network/`: minimum viable launch network (+ diagram), deployment spec and cost, security reviews, H4 model, literature comparison.
 - `QTC/software/`: release notes v0.0.5–v0.0.7, GPU kernel port, powLimit sizing (+ `powlimit_sizing.py`), consensus fork and fix model, repository publish log (go-public procedure), genesis scripts (`genesis_regen_hooks.py`, `genesis_bake4.py`), this build spec.
 - `QTC/fees/`: fee structure comparison, dust and sigop quote fix.
-- In-tree: `QTC-LAUNCH-SAFETY.md` (§7 stall simulation, §13 floor), `QTC-SECURITY-REVIEW.md`, `QTC-FORK.md`, `contrib/mining/README.md`, `contrib/faststart/README.md`, `contrib/autoupdate/BOOTSTRAP.md`, `contrib/devtools/github-protect-main.sh`.
+- In-tree: `QTC-LAUNCH-SAFETY.md` (§7 stall simulation, §13 floor), `QTC-SECURITY-REVIEW.md`, `doc/history/qtc-fork-tracker.md`, `contrib/mining/README.md`, `contrib/faststart/README.md`, `contrib/autoupdate/BOOTSTRAP.md`, `contrib/devtools/github-protect-main.sh`.

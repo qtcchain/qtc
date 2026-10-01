@@ -10,4 +10,4 @@ plan. The iCloud copies (`QTC/`, `QTC/software/`) are the working versions; thes
 | `launch-planning-note.md` | Record of the decisions taken on 2026-09-11/12 (4-week baseline, two seed domains, floor) and the blockers |
 | `powlimit-sizing.md` | How the mainnet `powLimit` was sized from the measured A6000; model script in `contrib/qtc-launch/powlimit_sizing.py` |
 
-Related in-tree trackers: `QTC-LAUNCH-SAFETY.md`, `QTC-SECURITY-REVIEW.md`, `QTC-FORK.md`.
+Related in-tree trackers: `QTC-LAUNCH-SAFETY.md`, `QTC-SECURITY-REVIEW.md`, `doc/history/qtc-fork-tracker.md`.
