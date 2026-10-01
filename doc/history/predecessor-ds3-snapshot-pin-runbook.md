@@ -1,3 +1,5 @@
+> **Historical record from the predecessor code base.** Operator runbook for shielded-state assumeutxo pins on the predecessor network (block 125000). On QTC mainnet the relevant activation heights are 0 (the rule applies from genesis) or the feature is closed from genesis; nothing here describes a future QTC activation.
+
 # DS-3 — operator runbook: filling the assumeutxo shielded-state pins
 
 **What DS-3 is.** The assumeutxo snapshot's shielded section (pool balance + nullifier set +

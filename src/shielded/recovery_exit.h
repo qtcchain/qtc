@@ -3,7 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 //
 // RECOVERY_EXIT — transparent-claim stranded-note recovery (post-125,000).
-// See doc/recovery_exit_125000_spec.md.
+// See doc/history/recovery_exit_125000_spec.md.
 //
 // SAFE ROUTE (per audit): consensus does NOT trust a claimant-supplied nullifier. It DERIVES the exact
 // normal-path nullifier from the revealed NOTE itself — `ComputeSmileNullifierFromNote(SMILE_GLOBAL_SEED,

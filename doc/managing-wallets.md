@@ -1,7 +1,7 @@
 # Managing the Wallet
 
 Note: QTC operational runbooks usually set explicit `-datadir` / `-conf` paths
-(for example `/var/lib/qtc` or `~/.qtc/bitcoin.conf`). Default directory paths
+(for example `/var/lib/qtc` or `~/.qtc/qtc.conf`). Default directory paths
 below apply when those options are not provided.
 
 For QTC-native P2MR custody, PQ multisig, timelocked recovery, external-signer
@@ -164,7 +164,7 @@ QTC now provides a native per-wallet RPC for consistent backup exports:
 
 - `backupwalletbundle` writes a new bundle directory for the selected wallet
 - it captures the `backupwallet` file, descriptor exports, shielded viewing-key exports when permitted, `getbalances` + `z_gettotalbalance` snapshots, integrity metadata, and a manifest
-- after the post-61000 privacy fork, omitted `include_viewing_keys` defaults to `false`
+- omitted `include_viewing_keys` defaults to `false`
 - if the wallet is encrypted and locked, `qtc-cli -stdinwalletpassphrase` can prompt for the passphrase without echo and relock the wallet after export
 
 Example:

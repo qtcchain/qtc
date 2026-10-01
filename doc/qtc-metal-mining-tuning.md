@@ -47,25 +47,14 @@ Recommended readiness check:
 ./build-qtc/bin/qtc-matmul-backend-info --backend metal
 ```
 
-Recommended throughput benchmark for the current production product-digest
-mining path before nonce-bound seed activation:
+Recommended throughput benchmark for the mainnet mining path (on QTC the product-digest and nonce-bound
+seed rules apply from genesis, so any block height exercises them; the examples use `1000`):
 
 ```bash
 ./build-qtc/bin/qtc-matmul-solve-bench \
   --backend metal \
-  --block-height 61000
-```
-
-`block_height=61000` is important for benchmarking because it exercises the
-product-digest path rather than the older transcript-only path.
-
-Recommended throughput benchmark for the post-`nMatMulNonceSeedHeight` path:
-
-```bash
-./build-qtc/bin/qtc-matmul-solve-bench \
-  --backend metal \
-  --block-height 125000 \
-  --nonce-seed-height 125000
+  --block-height 1000 \
+  --nonce-seed-height 0
 ```
 
 The nonce-seed path has separate batching defaults because A/B matrices are
@@ -127,7 +116,7 @@ On the local Apple M4 Max Mac Studio reference host with
 - `prefetch_depth=1`
 - `gpu_inputs=auto/off`
 
-Measured on that host with `qtc-matmul-solve-bench --backend metal --block-height 61000`:
+Measured on that host with `qtc-matmul-solve-bench --backend metal --block-height 1000 --nonce-seed-height 0` (measured when the product-digest path was new; figures are indicative):
 
 - old conservative auto tuple (`4/4/4/2`, solver/pool/prepare/prefetch):
   about `95.5k` nonces/s mean before the April 20 code-level optimization pass
@@ -180,7 +169,7 @@ Equivalent benchmark command:
 ```bash
 ./build-qtc/bin/qtc-matmul-solve-bench \
   --backend metal \
-  --block-height 61000 \
+  --block-height 1000 --nonce-seed-height 0 \
   --solver-threads 6 \
   --prepare-workers 5 \
   --pool-slots 5 \
@@ -239,18 +228,18 @@ Useful examples:
 ```bash
 ./build-qtc/bin/qtc-matmul-solve-bench \
   --backend metal \
-  --block-height 61000
+  --block-height 1000 --nonce-seed-height 0
 
 ./build-qtc/bin/qtc-matmul-solve-bench \
   --backend metal \
-  --block-height 61000 \
+  --block-height 1000 --nonce-seed-height 0 \
   --solver-threads 1 \
   --pool-slots 1 \
   --batch-size 1
 
 ./build-qtc/bin/qtc-matmul-solve-bench \
   --backend metal \
-  --block-height 61000 \
+  --block-height 1000 --nonce-seed-height 0 \
   --solver-threads 3 \
   --prepare-workers 3 \
   --pool-slots 3 \
@@ -258,7 +247,7 @@ Useful examples:
 
 ./build-qtc/bin/qtc-matmul-solve-bench \
   --backend metal \
-  --block-height 125000 \
+  --block-height 1000 \
   --nonce-seed-height 125000
 ```
 
