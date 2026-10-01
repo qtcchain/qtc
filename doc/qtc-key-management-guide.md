@@ -17,7 +17,6 @@ Use this guide together with:
 - [Managing Wallets](managing-wallets.md)
 - [Offline Signing Tutorial](offline-signing-tutorial.md)
 - [Support for signing transactions outside of QTC](external-signer.md)
-- [QTC Shielded Pool Guide](qtc-shielded-pool-guide.md)
 - [PSBT support](psbt.md)
 
 ## 1. QTC Security Model
@@ -460,7 +459,6 @@ After backup or restore:
 - [QTC PQ Multisig Specification](qtc-pq-multisig-spec.md)
 - [QTC PQ Multisig Tutorial](qtc-pq-multisig-tutorial.md)
 - [Managing Wallets](managing-wallets.md)
-- [QTC Shielded Pool Guide](qtc-shielded-pool-guide.md)
 - [Support for signing transactions outside of QTC](external-signer.md)
 - [PSBT support](psbt.md)
 

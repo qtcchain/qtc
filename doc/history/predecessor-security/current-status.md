@@ -1,3 +1,7 @@
+> **Historical record from the predecessor code base.** These documents describe the shielded-pool hardening
+> programme and audits of the inherited code (activation heights 61000/125000 on the predecessor network). On QTC
+> mainnet the shielded pool is closed from genesis. Kept so the audit trail of inherited code stays traceable.
+
 # QTC Security Current Status
 
 This file is the stable branch-level summary for the shielded hardening program
