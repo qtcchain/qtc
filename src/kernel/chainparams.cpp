@@ -332,7 +332,10 @@ public:
         // Mainnet anchor refreshed on 2026-07-10 at height 155'700 from a
         // synced canonical node so stale history below the current public
         // release floor is rejected quickly.
-        consensus.nMinimumChainWork = uint256{}; // fresh chain: no accumulated work to require yet
+        // QTC H3 (v0.1.3): minimum chain work = work at the first mainnet checkpoint (height 300,
+        // 2026-10-02 06:32 UTC). A syncing node ignores any chain with less work than this, so a
+        // forged low-work header chain cannot stall or mislead IBD. Raise with each release.
+        consensus.nMinimumChainWork = uint256{"00000000000000000000000000000000000000000000000000000001305c4fa5"};
         // No anchored assume-valid block on a brand-new chain.
         consensus.defaultAssumeValid = uint256{};
 
@@ -406,14 +409,18 @@ public:
         checkpointData = {
             {
                 {0, consensus.hashGenesisBlock},
+                // QTC H3 (v0.1.3): first post-genesis checkpoint, 110 blocks deep when pinned,
+                // identical on every launch node. Forks below this height are rejected outright.
+                {300, uint256{"4773201dbff9b0411c0826e72e5c70a4782b7ce79a09177d38de27969f6551d1"}},
             }
         };
-        // No assumeutxo snapshots and no historical chain-tx stats on a fresh chain.
+        // No assumeutxo snapshots yet.
         m_assumeutxo_data = {};
+        // getchaintxstats 299 <block 300> on the launch chain (coinbase-only blocks so far).
         chainTxData = ChainTxData{
-            .nTime = 0,
-            .tx_count = 0,
-            .dTxRate = 0,
+            .nTime = 1790934732,
+            .tx_count = 301,
+            .dTxRate = 0.002418800307406059,
         };
     }
 };

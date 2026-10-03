@@ -10,6 +10,9 @@ v1 (morning of 2026-09-09) is superseded. v1's H4 was fixed by O5 (`573e4608`). 
 
 ---
 
+> **H3 closed in v0.1.3 (2026-10-03):** first mainnet checkpoint at height 300, minimum chain work = work at that
+> block, chain-tx statistics anchored; see `doc/release-notes/release-notes-0.1.3.md`. assume-valid deliberately unset.
+
 ## Corrections to v1
 
 - **"12-block reorg limit" is not a fork-choice rule.** `nMaxReorgDepth` only sizes prune retention

@@ -2352,29 +2352,39 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_qtc_network_identity)
 
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_hardening_anchor_consistency)
 {
-    // QTC is a brand-new chain forked from QTC v0.33.1 with a fresh genesis.
-    // It has no historical hardening anchor yet: no accumulated chain work to
-    // require, no assume-valid block, no chain-tx statistics, no assumeutxo
-    // snapshots, and only the genesis checkpoint. This test freezes exactly
-    // that "fresh chain" state so a future anchor is added deliberately (and
-    // this test updated alongside it), never inherited from QTC by accident.
+    // QTC mainnet launched 2026-09-30 from a fresh genesis. v0.1.3 (security review H3)
+    // adds the first hardening anchor read from the live chain: a checkpoint at height
+    // 300, a minimum chain work equal to the work at that block, and chain-tx statistics
+    // from getchaintxstats at that block. assume-valid stays unset (coinbase-only history,
+    // nothing to skip) and there are no assumeutxo snapshots. This test freezes exactly
+    // that state so every later anchor change is deliberate and reviewed here.
     const auto params = CreateChainParams(*m_node.args, ChainType::MAIN);
     const auto consensus = params->GetConsensus();
 
-    BOOST_CHECK(consensus.nMinimumChainWork.IsNull());
+    BOOST_CHECK_EQUAL(consensus.nMinimumChainWork.GetHex(),
+                      "00000000000000000000000000000000000000000000000000000001305c4fa5");
     BOOST_CHECK(consensus.defaultAssumeValid.IsNull());
-    BOOST_CHECK_EQUAL(params->TxData().nTime, 0);
-    BOOST_CHECK_EQUAL(params->TxData().tx_count, 0);
-    BOOST_CHECK_EQUAL(params->TxData().dTxRate, 0.0);
+    BOOST_CHECK_EQUAL(params->TxData().nTime, 1790934732);
+    BOOST_CHECK_EQUAL(params->TxData().tx_count, 301);
+    BOOST_CHECK_CLOSE(params->TxData().dTxRate, 0.002418800307406059, 1e-9);
 
     const auto& checkpoints = params->Checkpoints().mapCheckpoints;
-    BOOST_REQUIRE_EQUAL(checkpoints.size(), 1U);
+    BOOST_REQUIRE_EQUAL(checkpoints.size(), 2U);
     const auto it_0 = checkpoints.find(0);
     BOOST_REQUIRE(it_0 != checkpoints.end());
     BOOST_CHECK_EQUAL(it_0->second.GetHex(), consensus.hashGenesisBlock.GetHex());
     BOOST_CHECK_EQUAL(
         it_0->second.GetHex(),
         "4040450ec30f1f9a7ef2d12578e1ea66d0838d7d8181b62c066953ca3baf3406");
+    const auto it_300 = checkpoints.find(300);
+    BOOST_REQUIRE(it_300 != checkpoints.end());
+    BOOST_CHECK_EQUAL(
+        it_300->second.GetHex(),
+        "4773201dbff9b0411c0826e72e5c70a4782b7ce79a09177d38de27969f6551d1");
+    // The minimum chain work must never exceed the work of the checkpoint it is derived from
+    // being reachable: it is strictly below the launch chain's work at height 410 (…1ade86d80).
+    BOOST_CHECK(UintToArith256(consensus.nMinimumChainWork) <
+                UintToArith256(uint256{"00000000000000000000000000000000000000000000000000000001ade86d80"}));
 
     BOOST_CHECK(params->GetAvailableSnapshotHeights().empty());
     BOOST_CHECK(!params->AssumeutxoForHeight(55000).has_value());
