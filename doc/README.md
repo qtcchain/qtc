@@ -35,6 +35,7 @@ Bitcoin Core documents that still apply are listed at the end.
 ## Releases and security
 
 - [Release process](release-process.md), [release notes](release-notes/), [release-signing keys](release-signing-keys.md)
+- [Upgrade policy](upgrade-policy.md) — release kinds, the peer protocol floor, flag-day activation for consensus changes
 - [GitHub release automation](qtc-github-release-automation.md)
 - [Security documentation](security/README.md), [security review](/QTC-SECURITY-REVIEW.md), [reporting a vulnerability](/SECURITY.md)
 - [Historical documents](history/)
