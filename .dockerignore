@@ -15,7 +15,6 @@ build-qtc*
 build-fuzz*
 build-asan*
 build_bench
-ci
 .ci-*
 *.venv
 venv
