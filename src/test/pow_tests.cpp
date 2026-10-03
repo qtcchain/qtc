@@ -30,6 +30,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include <util/strencodings.h>
+
 #include <boost/test/unit_test.hpp>
 #include <matmul/backend_capabilities.h>
 
@@ -2338,7 +2340,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_qtc_network_identity)
     BOOST_CHECK_EQUAL(msg[0], 0x51);
     BOOST_CHECK_EQUAL(msg[1], 0x54);
     BOOST_CHECK_EQUAL(msg[2], 0x43);
-    BOOST_CHECK_EQUAL(msg[3], 0x01);
+    BOOST_CHECK_EQUAL(msg[3], 0x21); // v2 network (mainnet reset, Oct 2026); the v1 chain used 0x01
     BOOST_CHECK_EQUAL(params->GetDefaultPort(), 19755);
     BOOST_CHECK_EQUAL(params->Bech32HRP(), "qtc");
     BOOST_CHECK_EQUAL(params->Base58Prefix(CChainParams::PUBKEY_ADDRESS).at(0), 58);
@@ -2389,6 +2391,17 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_hardening_anchor_consistency)
     BOOST_CHECK(params->GetAvailableSnapshotHeights().empty());
     BOOST_CHECK(!params->AssumeutxoForHeight(55000).has_value());
     BOOST_CHECK(!params->AssumeutxoForHeight(155700).has_value());
+
+    // QTC v2 treasury allocation (owner decision 2026-10-03): 2 000 000 QTC in block 1 to the ceremony treasury
+    // address; total supply 23 000 000. Any change here is a consensus change and must be deliberate.
+    BOOST_CHECK_EQUAL(consensus.nTreasuryPremineHeight, 1);
+    BOOST_CHECK_EQUAL(consensus.nTreasuryPremineAmount, CAmount{2'000'000 * COIN});
+    BOOST_CHECK_EQUAL(HexStr(consensus.treasuryPremineScript),
+                      "522058dd0cb7668399503edc13a9d67dcf21a6be63a23958bdb2dfe3614e563154d6");
+    BOOST_CHECK(consensus.TreasuryPremineActiveAt(1));
+    BOOST_CHECK(!consensus.TreasuryPremineActiveAt(2));
+    // v2 network identity: message start distinct from the v1 chain's 51 54 43 01.
+    BOOST_CHECK_EQUAL(HexStr(params->MessageStart()), "51544321");
 }
 
 BOOST_AUTO_TEST_CASE(HasValidProofOfWork_matmul_phase1_checks)

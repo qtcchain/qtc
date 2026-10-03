@@ -165,6 +165,12 @@ public:
         // iCloud QTC/software/QTC_powLimit_Sizing_2026-09-10 (powlimit_sizing.py). Re-run the
         // model if the launch fleet changes materially; genesis is regenerated at launch (H1).
         consensus.powLimit = uint256{"0000011da5000000000000000000000000000000000000000000000000000000"}; // launch floor D5 (0x1e011da5): Node B (RTX 6000 Ada) alone holds 600 s; signed off 2026-09-25
+        // QTC v2 (owner decision 2026-10-03): 2 000 000 QTC treasury allocation, minted once in block 1 to the
+        // ceremony treasury address qtc1ztrwsedmxswv4q0kuzw5avlw0yxntucaz89vtmvkluds5u4332ntqwq3gct (P2MR, witness v2).
+        // Total supply therefore 23 000 000 QTC: 2 M treasury + 21 M on the unchanged 50 QTC / 210 000-block schedule.
+        consensus.nTreasuryPremineHeight = 1;
+        consensus.nTreasuryPremineAmount = 2'000'000 * COIN;
+        consensus.treasuryPremineScript = CScript() << OP_2 << ParseHex("58dd0cb7668399503edc13a9d67dcf21a6be63a23958bdb2dfe3614e563154d6");
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
         consensus.nPowTargetSpacing = 600; // QTC: 10-minute blocks (Bitcoin)
         consensus.fPowAllowMinDifficultyBlocks = false;
@@ -349,7 +355,7 @@ public:
         pchMessageStart[0] = 0x51;
         pchMessageStart[1] = 0x54;
         pchMessageStart[2] = 0x43; // 'C'
-        pchMessageStart[3] = 0x01;
+        pchMessageStart[3] = 0x21; // QTC v2 network (mainnet reset with treasury allocation); v1 used 0x01
         nDefaultPort = 19755;
         nPruneAfterHeight = 100000;
         // Measured from the 2026-07-10 mainnet archive datadirs near height
@@ -1151,6 +1157,11 @@ public:
         if (opts.matmul_nonce_seed_height.has_value()) {
             consensus.nMatMulNonceSeedHeight = *opts.matmul_nonce_seed_height;
         }
+        if (opts.treasury_premine_height.has_value()) {
+            consensus.nTreasuryPremineHeight = *opts.treasury_premine_height;
+            consensus.nTreasuryPremineAmount = opts.treasury_premine_amount.value_or(0);
+            consensus.treasuryPremineScript = opts.treasury_premine_script.value_or(CScript{});
+        }
         if (opts.matmul_parent_mtp_seed_height.has_value()) {
             consensus.nMatMulParentMtpSeedHeight = *opts.matmul_parent_mtp_seed_height;
         }
@@ -1267,6 +1278,7 @@ public:
             opts.matmul_asert_half_life.has_value() ||
             opts.matmul_asert_half_life_upgrade_height.has_value() ||
             opts.matmul_nonce_seed_height.has_value() ||
+            opts.treasury_premine_height.has_value() ||
             opts.matmul_parent_mtp_seed_height.has_value() ||
             opts.matmul_pow_limit.has_value() ||
             opts.matmul_max_future_mtp_drift.has_value() ||
