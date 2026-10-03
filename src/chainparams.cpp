@@ -346,6 +346,25 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
         options.matmul_nonce_seed_height =
             ParseRegTestNonNegativeInt32Arg(args, "-regtestmatmulnonceseedheight");
     }
+    if (args.IsArgSet("-regtesttreasurypremineheight")) {
+        options.treasury_premine_height = ParseRegTestNonNegativeInt32Arg(args, "-regtesttreasurypremineheight");
+    }
+    if (args.IsArgSet("-regtesttreasurypremineamount")) {
+        const auto raw = args.GetArg("-regtesttreasurypremineamount", "");
+        int64_t sats{0};
+        if (!ParseInt64(raw, &sats) || sats <= 0) {
+            throw std::runtime_error(strprintf("Invalid -regtesttreasurypremineamount value (%s): expected positive integer satoshis.", raw));
+        }
+        options.treasury_premine_amount = sats;
+    }
+    if (args.IsArgSet("-regtesttreasurypreminescript")) {
+        const auto raw = args.GetArg("-regtesttreasurypreminescript", "");
+        if (!IsHex(raw) || raw.empty()) {
+            throw std::runtime_error(strprintf("Invalid -regtesttreasurypreminescript value (%s): expected scriptPubKey hex.", raw));
+        }
+        const auto bytes = ParseHex(raw);
+        options.treasury_premine_script = CScript(bytes.begin(), bytes.end());
+    }
     if (args.IsArgSet("-regtestmatmulparentmtpseedheight")) {
         options.matmul_parent_mtp_seed_height =
             ParseRegTestNonNegativeInt32Arg(args, "-regtestmatmulparentmtpseedheight");

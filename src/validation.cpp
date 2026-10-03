@@ -6041,7 +6041,20 @@ CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
     return nSubsidy;
 }
 
+static CAmount GetBlockSubsidyForBlockWithoutPremine(int nHeight, const CBlock& block, const CBlockIndex* pindexPrev, const Consensus::Params& consensusParams);
+
 CAmount GetBlockSubsidyForBlock(int nHeight, const CBlock& block, const CBlockIndex* pindexPrev, const Consensus::Params& consensusParams)
+{
+    CAmount subsidy{GetBlockSubsidyForBlockWithoutPremine(nHeight, block, pindexPrev, consensusParams)};
+    // QTC v2: the treasury allocation is minted exactly once, at nTreasuryPremineHeight, on top of the
+    // ordinary subsidy. ConnectBlock requires the matching coinbase output (bad-cb-treasury-premine).
+    if (consensusParams.TreasuryPremineActiveAt(nHeight)) {
+        subsidy += consensusParams.nTreasuryPremineAmount;
+    }
+    return subsidy;
+}
+
+static CAmount GetBlockSubsidyForBlockWithoutPremine(int nHeight, const CBlock& block, const CBlockIndex* pindexPrev, const Consensus::Params& consensusParams)
 {
     const CAmount base_subsidy{GetBlockSubsidy(nHeight, consensusParams)};
     // Consensus can objectively detect coinbase-only blocks. It cannot prove a
@@ -7815,6 +7828,23 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     if (block.vtx[0]->GetValueOut() > blockReward && state.IsValid()) {
         state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
                       strprintf("coinbase pays too much (actual=%d vs limit=%d)", block.vtx[0]->GetValueOut(), blockReward));
+    }
+    // QTC v2 treasury allocation: at the premine height the coinbase must pay exactly the premine amount to the
+    // treasury script in exactly one output. The amount was added to blockReward above, so a block that keeps the
+    // premine for the miner (or pays it elsewhere) fails here even though its total is within the limit.
+    if (state.IsValid() && params.GetConsensus().TreasuryPremineActiveAt(pindex->nHeight)) {
+        const Consensus::Params& consensus{params.GetConsensus()};
+        int matching_outputs{0};
+        for (const CTxOut& out : block.vtx[0]->vout) {
+            if (out.scriptPubKey == consensus.treasuryPremineScript && out.nValue == consensus.nTreasuryPremineAmount) {
+                ++matching_outputs;
+            }
+        }
+        if (matching_outputs != 1) {
+            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-treasury-premine",
+                          strprintf("coinbase at height %d must pay the treasury allocation of %d once (found %d matching outputs)",
+                                    pindex->nHeight, consensus.nTreasuryPremineAmount, matching_outputs));
+        }
     }
 
     auto parallel_result = control.Complete();

@@ -230,6 +230,7 @@ add_executable(test_qtc
   system_tests.cpp
   timeoffsets_tests.cpp
   torcontrol_tests.cpp
+  treasury_premine_tests.cpp
   transaction_tests.cpp
   translation_tests.cpp
   txdownload_tests.cpp
