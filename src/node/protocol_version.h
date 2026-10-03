@@ -9,12 +9,16 @@
  * network protocol versioning
  */
 
-static const int PROTOCOL_VERSION = 800001;
+// QTC v0.1.4: 800002. The protocol version advances only when a release changes P2P behaviour; the peer
+// floor below lags by one generation (doc/upgrade-policy.md). 800001 = v0.1.0 to v0.1.3.
+static const int PROTOCOL_VERSION = 800002;
 
 //! initial proto version, to be increased after version/verack negotiation
 static const int INIT_PROTO_VERSION = 209;
 
-//! disconnect from peers older than this proto version
+//! disconnect from peers older than this proto version.
+//! QTC: stays at 800001 in v0.1.4 so v0.1.0–v0.1.3 peers still connect; rises to 800002 in v0.1.5,
+//! no earlier than 14 days after v0.1.4 is published (doc/upgrade-policy.md §3).
 static const int MIN_PEER_PROTO_VERSION = 800001;
 
 //! Minimum protocol version required for SMILE v2 shielded transactions.
