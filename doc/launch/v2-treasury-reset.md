@@ -8,7 +8,7 @@ a new network identity; the first chain abandoned; the allocation disclosed ever
 
 | | v1 (launched 30 Sep 2026) | v2 |
 |---|---|---|
-| Genesis | `4040450e…3406`, T0 2026-09-30 23:00 UTC | new genesis, regenerated at the v2 T0 (same hook-and-bake procedure) |
+| Genesis | `4040450e…3406`, T0 2026-09-30 23:00 UTC | `d5f04a8a…`, T0 **2026-10-05 06:00 UTC** (1791180000), same merkle root |
 | Network magic | `51 54 43 01` | `51 54 43 21` — v1 and v2 nodes cannot connect to each other |
 | Supply | 21 000 000, all mined | **23 000 000**: 2 000 000 treasury (block 1) + 21 000 000 on the unchanged 50 QTC / 210 000-block schedule |
 | Treasury | none | `qtc1ztrwsedmxswv4q0kuzw5avlw0yxntucaz89vtmvkluds5u4332ntqwq3gct` (ceremony address; key proven by tx `c9dae50e…` on v1) |

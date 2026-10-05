@@ -33,10 +33,10 @@ Consensus
   the allocation to the treasury script in exactly one output
   (`bad-cb-treasury-premine` otherwise). No other height is affected. The block
   assembler emits the output automatically.
-- New genesis block (hash and time in `src/kernel/chainparams.cpp`, regenerated
-  at the v2 launch time). The first chain anchor from v0.1.3 (checkpoint at
-  height 300, minimum chain work) is reset with it and will be re-pinned in a
-  later release once v2 has history.
+- New genesis block `d5f04a8a320b4e7bb454c7c564ca9cf191f70d7521d2486b62274df776f4eb24`,
+  time 2026-10-05 06:00:00 UTC (1791180000). The first chain's anchor from
+  v0.1.3 (checkpoint at height 300, minimum chain work, tx statistics) is reset
+  to the fresh-chain state and will be re-pinned once v2 has history.
 - Everything else is unchanged: MatMul proof of work (n = 512), ASERT from
   block 0 with half-life 172 800 s and floor `0x1e011da5`, 600 s spacing,
   P2MR-only outputs, shielded pool closed from genesis, ports 19755 / 19754,
