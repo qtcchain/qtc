@@ -2,12 +2,12 @@
 
 QTC is a proof-of-work blockchain with post-quantum transaction signatures and a proof of work built on dense
 matrix multiplication, so the hardware that mines it is the hardware that runs AI workloads. The first mainnet
-launched on 30 September 2026; **mainnet v2**, which adds a 2 000 000 QTC treasury allocation in block 1, launches
-with release v0.2.0 (genesis below once set). See `doc/release-notes/release-notes-0.2.0.md`.
+launched on 30 September 2026; **mainnet v2**, which adds a 2 000 000 QTC treasury allocation in block 1, launched
+on **5 October 2026 at 06:00 UTC** with release v0.2.0. See `doc/release-notes/release-notes-0.2.0.md`.
 
 | | |
 |---|---|
-| Genesis block (v2) | set at the v2 launch; the v1 genesis was `4040450ec30f1f9a7ef2d12578e1ea66d0838d7d8181b62c066953ca3baf3406` |
+| Genesis block (v2) | `d5f04a8a320b4e7bb454c7c564ca9cf191f70d7521d2486b62274df776f4eb24` — 2026-10-05 06:00:00 UTC (1791180000); the v1 genesis was `4040450ec30f1f9a7ef2d12578e1ea66d0838d7d8181b62c066953ca3baf3406` |
 | Block explorer | <https://qtc.events> (testnet: <https://testnet.qtc.events>) |
 | Latest release | distributed as signed archives; verify before you run it (below) |
 
