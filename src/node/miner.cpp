@@ -1121,6 +1121,13 @@ std::shared_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     coinbaseTx.vout.resize(1);
     coinbaseTx.vout[0].scriptPubKey = m_options.coinbase_output_script;
     coinbaseTx.vout[0].nValue = nFees + GetBlockSubsidyForBlock(nHeight, *pblock, pindexPrev, chainparams.GetConsensus());
+    // QTC v2 treasury allocation: GetBlockSubsidyForBlock includes the premine at its height; consensus requires it
+    // to be paid to the treasury script in its own output, so split it off the miner's output here.
+    if (chainparams.GetConsensus().TreasuryPremineActiveAt(nHeight)) {
+        const Consensus::Params& consensus{chainparams.GetConsensus()};
+        coinbaseTx.vout[0].nValue -= consensus.nTreasuryPremineAmount;
+        coinbaseTx.vout.emplace_back(consensus.nTreasuryPremineAmount, consensus.treasuryPremineScript);
+    }
     coinbaseTx.vin[0].scriptSig = CScript() << nHeight << OP_0;
     pblock->vtx[0] = MakeTransactionRef(std::move(coinbaseTx));
     pblocktemplate->vchCoinbaseCommitment = m_chainstate.m_chainman.GenerateCoinbaseCommitment(*pblock, pindexPrev);

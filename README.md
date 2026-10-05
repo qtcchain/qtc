@@ -1,14 +1,15 @@
 # QTC
 
 QTC is a proof-of-work blockchain with post-quantum transaction signatures and a proof of work built on dense
-matrix multiplication, so the hardware that mines it is the hardware that runs AI workloads. Mainnet launched on
-**30 September 2026 at 23:00 UTC**.
+matrix multiplication, so the hardware that mines it is the hardware that runs AI workloads. The first mainnet
+launched on 30 September 2026; **mainnet v2**, which adds a 2 000 000 QTC treasury allocation in block 1, launched
+on **5 October 2026 at 06:00 UTC** with release v0.2.0. See `doc/release-notes/release-notes-0.2.0.md`.
 
 | | |
 |---|---|
-| Genesis block | `4040450ec30f1f9a7ef2d12578e1ea66d0838d7d8181b62c066953ca3baf3406` |
+| Genesis block (v2) | `d5f04a8a320b4e7bb454c7c564ca9cf191f70d7521d2486b62274df776f4eb24` — 2026-10-05 06:00:00 UTC (1791180000); the v1 genesis was `4040450ec30f1f9a7ef2d12578e1ea66d0838d7d8181b62c066953ca3baf3406` |
 | Block explorer | <https://qtc.events> (testnet: <https://testnet.qtc.events>) |
-| Latest release | see [Releases](https://github.com/qtcchain/qtc/releases); verify before you run it (below) |
+| Latest release | distributed as signed archives; verify before you run it (below) |
 
 This repository holds the full node (`qtcd`), the RPC client (`qtc-cli`), the wallet, the mining tools and the test
 suites. The code base descends from Bitcoin Core; the consensus layer, signatures and network are QTC's own.
@@ -36,17 +37,18 @@ suites. The code base descends from Bitcoin Core; the consensus layer, signature
 | Block interval | 600 s target |
 | Difficulty | ASERT from block 0, half-life 172 800 s (2 days); hard floor `0x1e011da5` |
 | Block size | 24 MB serialized / 24 MWU, 480 000 sigops cost |
-| Subsidy | 50 QTC, halving every 210 000 blocks; 21 000 000 QTC total |
+| Subsidy | 50 QTC, halving every 210 000 blocks; 21 000 000 QTC mined |
+| Treasury allocation | **2 000 000 QTC minted once in block 1** to `qtc1ztrwsedmxswv4q0kuzw5avlw0yxntucaz89vtmvkluds5u4332ntqwq3gct` (project treasury, decided 3 Oct 2026); total supply **23 000 000 QTC** |
 | Outputs | Witness v2 P2MR (`OP_2 <32 bytes>`) and `OP_RETURN` only; reduced-data limits from genesis |
 | Signatures | ML-DSA-44 primary, SLH-DSA-SHAKE-128s backup (NIST FIPS 204 / 205) |
 | Addresses | Bech32m, HRP `qtc` → `qtc1z…` (testnet `tqtc`) |
 | Shielded pool | Closed from genesis (every sunset height is 0); viewing and recovery code retained |
 | P2P / RPC ports | 19755 / 19754 (testnet 29755 / 29754) |
 | DNS seeds | `seed.qtc.gold`, `seed.qtc.exchange` (testnet: `testnet-seed.qtc.gold`, `testnet-seed.qtc.exchange`) |
-| Magic / network | `main`; testnet is `-testnet` (chain `test`), `-regtest` for local development |
+| Magic / network | `main` (v2 message start `51 54 43 21`); testnet is `-testnet` (chain `test`), `-regtest` for local development |
 
-Subsidy schedule: 50 QTC for blocks 0–209 999, 25 QTC to 419 999, 12.5 QTC to 629 999, then halving every
-210 000 blocks.
+Subsidy schedule: 50 QTC for blocks 0–209 999 (block 1 additionally carries the 2 000 000 QTC treasury allocation),
+25 QTC to 419 999, 12.5 QTC to 629 999, then halving every 210 000 blocks.
 
 Testnet uses the same MatMul parameters, floor and spacing as mainnet (genesis
 `efcba50d2de7cb16fd92423df899eba29e750b2271ef0ea64efe8cfeb4382ddf`). Regtest uses n = 64 for fast local mining.

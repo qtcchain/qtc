@@ -94,8 +94,8 @@ logger = logging.getLogger("TestFramework.p2p")
 # The minimum P2P version that this test framework supports
 MIN_P2P_VERSION_SUPPORTED = 60001
 # The P2P version that this test framework implements and sends in its `version` message.
-# QTC currently enforces MIN_PEER_PROTO_VERSION=800001 on regtest/testnet/mainnet.
-P2P_VERSION = 800001
+# QTC v0.2.0: PROTOCOL_VERSION and MIN_PEER_PROTO_VERSION are both 800002 on the v2 network.
+P2P_VERSION = 800002
 # The services that this test framework offers in its `version` message.
 # QTC peers in consensus-validation mode expect NODE_MATMUL_CONSENSUS.
 P2P_SERVICES = NODE_NETWORK | NODE_WITNESS | NODE_MATMUL_CONSENSUS

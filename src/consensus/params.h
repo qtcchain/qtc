@@ -7,6 +7,7 @@
 #define BITCOIN_CONSENSUS_PARAMS_H
 
 #include <consensus/amount.h>
+#include <script/script.h>
 #include <uint256.h>
 
 #include <chrono>
@@ -206,6 +207,19 @@ struct Params {
     // QTC: Bitcoin's monetary policy verbatim -- 50 coins per 10-minute block, halving
     // every 210,000 blocks (~4 years), 21M total.
     CAmount nInitialSubsidy{50 * COIN};
+    /** QTC v2 treasury allocation. At exactly nTreasuryPremineHeight the coinbase must carry one output of
+     *  nTreasuryPremineAmount paying treasuryPremineScript, and that amount is added to the block subsidy at that
+     *  height only (GetBlockSubsidyForBlock). Any other height is unaffected. The default height
+     *  (INT32_MAX) disables the rule. Mainnet v2: height 1, 2 000 000 QTC, the ceremony treasury address —
+     *  disclosed in the README, the release notes and on keys.qtc.gold. */
+    int32_t nTreasuryPremineHeight{std::numeric_limits<int32_t>::max()};
+    CAmount nTreasuryPremineAmount{0};
+    CScript treasuryPremineScript{};
+    bool TreasuryPremineActiveAt(int height) const
+    {
+        return nTreasuryPremineHeight != std::numeric_limits<int32_t>::max() && height == nTreasuryPremineHeight &&
+               nTreasuryPremineAmount > 0 && !treasuryPremineScript.empty();
+    }
     /** Height-gated empty-block economics. At and above this height,
      * consecutive coinbase-only blocks claim a halved subsidy, up to the
      * configured maximum number of halvings. This is deterministic from

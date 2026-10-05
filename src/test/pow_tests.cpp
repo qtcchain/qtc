@@ -30,6 +30,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include <util/strencodings.h>
+
 #include <boost/test/unit_test.hpp>
 #include <matmul/backend_capabilities.h>
 
@@ -1123,7 +1125,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_REGTEST_invalid_asert_override_rejected_at_star
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_genesis_header_fields_frozen)
 {
     const auto params = CreateChainParams(*m_node.args, ChainType::MAIN);
-    assert_qtc_genesis_header_fields(*params, 1790809200U, 0U, "1e011da5", 1U); // nBits == compact(powLimit)
+    assert_qtc_genesis_header_fields(*params, 1791180000U, 0U, "1e011da5", 1U); // nBits == compact(powLimit)
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_genesis_hashes_frozen)
@@ -1131,7 +1133,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_genesis_hashes_frozen)
     const auto params = CreateChainParams(*m_node.args, ChainType::MAIN);
     assert_qtc_genesis_hashes(
         *params,
-        "4040450ec30f1f9a7ef2d12578e1ea66d0838d7d8181b62c066953ca3baf3406",
+        "d5f04a8a320b4e7bb454c7c564ca9cf191f70d7521d2486b62274df776f4eb24",
         "68668615ec36015c9eacfa8a3c3c95b1cb5f78454e8d1aa58e3e94cbad3ade23");
 }
 
@@ -2338,7 +2340,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_qtc_network_identity)
     BOOST_CHECK_EQUAL(msg[0], 0x51);
     BOOST_CHECK_EQUAL(msg[1], 0x54);
     BOOST_CHECK_EQUAL(msg[2], 0x43);
-    BOOST_CHECK_EQUAL(msg[3], 0x01);
+    BOOST_CHECK_EQUAL(msg[3], 0x21); // v2 network (mainnet reset, Oct 2026); the v1 chain used 0x01
     BOOST_CHECK_EQUAL(params->GetDefaultPort(), 19755);
     BOOST_CHECK_EQUAL(params->Bech32HRP(), "qtc");
     BOOST_CHECK_EQUAL(params->Base58Prefix(CChainParams::PUBKEY_ADDRESS).at(0), 58);
@@ -2352,43 +2354,43 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_qtc_network_identity)
 
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_hardening_anchor_consistency)
 {
-    // QTC mainnet launched 2026-09-30 from a fresh genesis. v0.1.3 (security review H3)
-    // adds the first hardening anchor read from the live chain: a checkpoint at height
-    // 300, a minimum chain work equal to the work at that block, and chain-tx statistics
-    // from getchaintxstats at that block. assume-valid stays unset (coinbase-only history,
-    // nothing to skip) and there are no assumeutxo snapshots. This test freezes exactly
-    // that state so every later anchor change is deliberate and reviewed here.
+    // QTC mainnet v2 (v0.2.0, Oct 2026) restarts from a fresh genesis with the treasury
+    // allocation; the v1 chain anchor from v0.1.3 does not apply. This test freezes the
+    // fresh-chain state so every later anchor change is deliberate and reviewed here.
     const auto params = CreateChainParams(*m_node.args, ChainType::MAIN);
     const auto consensus = params->GetConsensus();
 
-    BOOST_CHECK_EQUAL(consensus.nMinimumChainWork.GetHex(),
-                      "00000000000000000000000000000000000000000000000000000001305c4fa5");
+    // Mainnet v2 (Oct 2026) is a fresh chain again: no minimum chain work, genesis-only checkpoints, no tx stats.
+    // Re-pinned deliberately once v2 has history (security review H3).
+    BOOST_CHECK(consensus.nMinimumChainWork.IsNull());
     BOOST_CHECK(consensus.defaultAssumeValid.IsNull());
-    BOOST_CHECK_EQUAL(params->TxData().nTime, 1790934732);
-    BOOST_CHECK_EQUAL(params->TxData().tx_count, 301);
-    BOOST_CHECK_CLOSE(params->TxData().dTxRate, 0.002418800307406059, 1e-9);
+    BOOST_CHECK_EQUAL(params->TxData().nTime, 0);
+    BOOST_CHECK_EQUAL(params->TxData().tx_count, 0);
+    BOOST_CHECK_EQUAL(params->TxData().dTxRate, 0.0);
 
     const auto& checkpoints = params->Checkpoints().mapCheckpoints;
-    BOOST_REQUIRE_EQUAL(checkpoints.size(), 2U);
+    BOOST_REQUIRE_EQUAL(checkpoints.size(), 1U);
     const auto it_0 = checkpoints.find(0);
     BOOST_REQUIRE(it_0 != checkpoints.end());
     BOOST_CHECK_EQUAL(it_0->second.GetHex(), consensus.hashGenesisBlock.GetHex());
     BOOST_CHECK_EQUAL(
         it_0->second.GetHex(),
-        "4040450ec30f1f9a7ef2d12578e1ea66d0838d7d8181b62c066953ca3baf3406");
-    const auto it_300 = checkpoints.find(300);
-    BOOST_REQUIRE(it_300 != checkpoints.end());
-    BOOST_CHECK_EQUAL(
-        it_300->second.GetHex(),
-        "4773201dbff9b0411c0826e72e5c70a4782b7ce79a09177d38de27969f6551d1");
-    // The minimum chain work must never exceed the work of the checkpoint it is derived from
-    // being reachable: it is strictly below the launch chain's work at height 410 (…1ade86d80).
-    BOOST_CHECK(UintToArith256(consensus.nMinimumChainWork) <
-                UintToArith256(uint256{"00000000000000000000000000000000000000000000000000000001ade86d80"}));
+        "d5f04a8a320b4e7bb454c7c564ca9cf191f70d7521d2486b62274df776f4eb24");
 
     BOOST_CHECK(params->GetAvailableSnapshotHeights().empty());
     BOOST_CHECK(!params->AssumeutxoForHeight(55000).has_value());
     BOOST_CHECK(!params->AssumeutxoForHeight(155700).has_value());
+
+    // QTC v2 treasury allocation (owner decision 2026-10-03): 2 000 000 QTC in block 1 to the ceremony treasury
+    // address; total supply 23 000 000. Any change here is a consensus change and must be deliberate.
+    BOOST_CHECK_EQUAL(consensus.nTreasuryPremineHeight, 1);
+    BOOST_CHECK_EQUAL(consensus.nTreasuryPremineAmount, CAmount{2'000'000 * COIN});
+    BOOST_CHECK_EQUAL(HexStr(consensus.treasuryPremineScript),
+                      "522058dd0cb7668399503edc13a9d67dcf21a6be63a23958bdb2dfe3614e563154d6");
+    BOOST_CHECK(consensus.TreasuryPremineActiveAt(1));
+    BOOST_CHECK(!consensus.TreasuryPremineActiveAt(2));
+    // v2 network identity: message start distinct from the v1 chain's 51 54 43 01.
+    BOOST_CHECK_EQUAL(HexStr(params->MessageStart()), "51544321");
 }
 
 BOOST_AUTO_TEST_CASE(HasValidProofOfWork_matmul_phase1_checks)

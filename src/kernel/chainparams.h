@@ -214,6 +214,9 @@ public:
         std::optional<int32_t> matmul_pre_hash_epsilon_bits_upgrade_height{};
         std::optional<uint32_t> matmul_pre_hash_epsilon_bits_upgrade{};
         std::optional<int32_t> matmul_nonce_seed_height{};
+        std::optional<int32_t> treasury_premine_height{};
+        std::optional<CAmount> treasury_premine_amount{};
+        std::optional<CScript> treasury_premine_script{};
         std::optional<int32_t> matmul_parent_mtp_seed_height{};
         std::optional<uint256> matmul_pow_limit{};
         std::optional<int64_t> matmul_max_future_mtp_drift{};
