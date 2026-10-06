@@ -6,9 +6,13 @@ import { Algorithm, ErrorCode } from "./types";
 let nativeAddon: any = null;
 try {
   nativeAddon = require("../build/Release/bitcoinpqc");
-  console.log("Loaded native addon successfully");
 } catch (error) {
-  console.warn("Failed to load native addon:", error);
+  console.warn("Failed to load native addon (falling back to the mock, which is NOT cryptographically valid):", error);
+}
+
+/** True when the compiled native addon is in use; false means the mock fallback (sizes only, no real crypto). */
+export function isNativeAddonLoaded(): boolean {
+  return nativeAddon !== null;
 }
 
 // Define functions from the native library
@@ -30,11 +34,19 @@ export interface BitcoinPqcNative {
     message: Uint8Array
   ): { signature: Uint8Array; resultCode: number };
 
+  bitcoin_pqc_sign_with_randomness(
+    algorithm: number,
+    secretKey: Uint8Array,
+    message: Uint8Array,
+    randomData: Uint8Array,
+    slhdsaFips205?: boolean
+  ): { signature: Uint8Array; resultCode: number };
   bitcoin_pqc_verify(
     algorithm: number,
     publicKey: Uint8Array,
     message: Uint8Array,
-    signature: Uint8Array
+    signature: Uint8Array,
+    slhdsaFips205?: boolean
   ): number;
 }
 
@@ -147,6 +159,18 @@ class MockBitcoinPqcNative implements BitcoinPqcNative {
     return { signature, resultCode: ErrorCode.OK };
   }
 
+  bitcoin_pqc_sign_with_randomness(
+    algorithm: number,
+    secretKey: Uint8Array,
+    message: Uint8Array,
+    randomData: Uint8Array,
+    _slhdsaFips205?: boolean
+  ): { signature: Uint8Array; resultCode: number } {
+    if (randomData.length < 128) {
+      return { signature: new Uint8Array(0), resultCode: ErrorCode.BAD_ARGUMENT };
+    }
+    return this.bitcoin_pqc_sign(algorithm, secretKey, message);
+  }
   bitcoin_pqc_verify(
     algorithm: number,
     publicKey: Uint8Array,

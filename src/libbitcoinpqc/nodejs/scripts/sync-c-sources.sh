@@ -32,10 +32,8 @@ cp -r ../sphincsplus/ref src/c_sources/sphincsplus_ref
 echo "Copying include files..."
 cp -r ../include src/c_sources/
 
-# Update include paths in C source files
+# Update include paths in C source files (perl -pi works on both macOS/BSD and GNU userlands)
 echo "Updating include paths..."
-find src/c_sources -name "*.c" -exec sed -i 's|../../dilithium/ref/|../dilithium_ref/|g' {} \;
-find src/c_sources -name "*.c" -exec sed -i 's|../../sphincsplus/ref/|../sphincsplus_ref/|g' {} \;
-find src/c_sources -name "*.c" -exec sed -i 's|../../include/|../include/|g' {} \;
+find src/c_sources -name "*.c" -exec perl -pi -e 's|\.\./\.\./dilithium/ref/|../dilithium_ref/|g; s|\.\./\.\./sphincsplus/ref/|../sphincsplus_ref/|g; s|\.\./\.\./include/|../include/|g' {} \;
 
 echo "C source files synced successfully!"
