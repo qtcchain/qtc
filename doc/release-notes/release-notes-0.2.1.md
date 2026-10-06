@@ -19,9 +19,9 @@ low-work header chain, which at floor difficulty costs almost nothing to
 produce. v0.2.1 bakes in three values read from the live v2 chain and identical
 on every launch node:
 
-- **Checkpoint at height 300** (`__CHECKPOINT_HASH__`). Forks that diverge
+- **Checkpoint at height 300** (`cee1347257fc44ee335b6e20b55bc616eba7c84535b572e3ca492162609273f7`). Forks that diverge
   below this height are rejected outright.
-- **Minimum chain work** `…__MINWORK_TAIL__` (the chain work at height 300).
+- **Minimum chain work** `…35c79b08` (the chain work at height 300).
   A syncing node ignores peers whose chain carries less work, so a fake chain
   cannot stall or mislead initial block download.
 - **Chain transaction statistics** from `getchaintxstats` at height 300, which

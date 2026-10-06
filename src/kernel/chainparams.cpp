@@ -338,8 +338,10 @@ public:
         // Mainnet anchor refreshed on 2026-07-10 at height 155'700 from a
         // synced canonical node so stale history below the current public
         // release floor is rejected quickly.
-        // Minimum chain work and checkpoints are re-pinned once mainnet v2 has history (security review H3).
-        consensus.nMinimumChainWork = uint256{}; // v2: fresh chain, no accumulated work yet (re-anchor in a later release)
+        // QTC v0.2.1 (H3 on mainnet v2): minimum chain work = work at the first v2 checkpoint (height 300,
+        // 2026-10-06 14:22 UTC). A syncing node ignores any chain with less work than this, so a forged low-work
+        // header chain cannot stall or mislead IBD. Raise with each release.
+        consensus.nMinimumChainWork = uint256{"0000000000000000000000000000000000000000000000000000000135c79b08"};
         // No anchored assume-valid block on a brand-new chain.
         consensus.defaultAssumeValid = uint256{};
 
@@ -408,20 +410,21 @@ public:
         // the fallback when DNS resolution is unavailable.
         vFixedSeeds = std::vector<uint8_t>{std::begin(chainparams_seed_main), std::end(chainparams_seed_main)};
 
-        // New chain: only the genesis checkpoint. Add real checkpoints once QTC
-        // has accumulated history and you want to pin against deep reorgs.
         checkpointData = {
             {
                 {0, consensus.hashGenesisBlock},
+                // QTC v0.2.1 (H3): first post-genesis checkpoint on mainnet v2, 7 blocks deep when
+                // pinned, identical on every launch node. Forks below this height are rejected outright.
+                {300, uint256{"cee1347257fc44ee335b6e20b55bc616eba7c84535b572e3ca492162609273f7"}},
             }
         };
         // No assumeutxo snapshots yet.
         m_assumeutxo_data = {};
-        // No chain-tx statistics yet on the v2 chain.
+        // getchaintxstats 299 <block 300> on mainnet v2 (coinbase-only blocks so far).
         chainTxData = ChainTxData{
-            .nTime = 0,
-            .tx_count = 0,
-            .dTxRate = 0,
+            .nTime = 1791296578,
+            .tx_count = 301,
+            .dTxRate = 0.002647493735445425,
         };
     }
 };
