@@ -161,6 +161,61 @@ Napi::Value SignMessage(const Napi::CallbackInfo& info) {
 }
 
 /**
+ * Sign a message with caller-supplied randomness (hedged signing, as qtcd does), optionally in
+ * SLH-DSA FIPS 205 mode. Arguments: algorithm, secretKey, message, randomData (>= 128 bytes), [slhdsaFips205]
+ */
+Napi::Value SignMessageWithRandomness(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+
+  if (info.Length() < 4 || !info[0].IsNumber() || !info[1].IsTypedArray() || !info[2].IsTypedArray() ||
+      !info[3].IsTypedArray()) {
+    Napi::TypeError::New(env, "Wrong arguments").ThrowAsJavaScriptException();
+    return env.Null();
+  }
+
+  int algorithm = info[0].As<Napi::Number>().Int32Value();
+  Napi::Uint8Array secretKey = info[1].As<Napi::Uint8Array>();
+  Napi::Uint8Array message = info[2].As<Napi::Uint8Array>();
+  Napi::Uint8Array randomData = info[3].As<Napi::Uint8Array>();
+  int slhdsaFips205 = 0;
+  if (info.Length() >= 5 && !info[4].IsUndefined() && !info[4].IsNull()) {
+    slhdsaFips205 = info[4].ToBoolean().Value() ? 1 : 0;
+  }
+
+  if (randomData.ByteLength() < 128) {
+    Napi::Error::New(env, "Random data must be at least 128 bytes").ThrowAsJavaScriptException();
+    return env.Null();
+  }
+
+  bitcoin_pqc_signature_t signature;
+  bitcoin_pqc_error_t result = bitcoin_pqc_sign_with_randomness(
+    static_cast<bitcoin_pqc_algorithm_t>(algorithm),
+    secretKey.Data(),
+    secretKey.ByteLength(),
+    message.Data(),
+    message.ByteLength(),
+    randomData.Data(),
+    randomData.ByteLength(),
+    &signature,
+    slhdsaFips205
+  );
+
+  Napi::Object returnValue = Napi::Object::New(env);
+  if (result != BITCOIN_PQC_OK) {
+    returnValue.Set("resultCode", Napi::Number::New(env, static_cast<double>(result)));
+    returnValue.Set("signature", Napi::Uint8Array::New(env, 0));
+    return returnValue;
+  }
+
+  Napi::Uint8Array signatureData = Napi::Uint8Array::New(env, signature.signature_size);
+  memcpy(signatureData.Data(), signature.signature, signature.signature_size);
+  returnValue.Set("signature", signatureData);
+  returnValue.Set("resultCode", Napi::Number::New(env, 0));
+  bitcoin_pqc_signature_free(&signature);
+  return returnValue;
+}
+
+/**
  * Verify a signature
  */
 Napi::Value VerifySignature(const Napi::CallbackInfo& info) {
@@ -176,6 +231,11 @@ Napi::Value VerifySignature(const Napi::CallbackInfo& info) {
   Napi::Uint8Array publicKey = info[1].As<Napi::Uint8Array>();
   Napi::Uint8Array message = info[2].As<Napi::Uint8Array>();
   Napi::Uint8Array signature = info[3].As<Napi::Uint8Array>();
+  // Optional 5th argument: SLH-DSA FIPS 205 mode (default off, as in qtcd's PQ key defaults).
+  int slhdsaFips205 = 0;
+  if (info.Length() >= 5 && !info[4].IsUndefined() && !info[4].IsNull()) {
+    slhdsaFips205 = info[4].ToBoolean().Value() ? 1 : 0;
+  }
 
   // Verify signature
   bitcoin_pqc_error_t result = bitcoin_pqc_verify(
@@ -185,7 +245,8 @@ Napi::Value VerifySignature(const Napi::CallbackInfo& info) {
     message.Data(),
     message.ByteLength(),
     signature.Data(),
-    signature.ByteLength()
+    signature.ByteLength(),
+    slhdsaFips205
   );
 
   // Return result code
@@ -201,6 +262,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("bitcoin_pqc_signature_size", Napi::Function::New(env, GetSignatureSize));
   exports.Set("bitcoin_pqc_keygen", Napi::Function::New(env, GenerateKeypair));
   exports.Set("bitcoin_pqc_sign", Napi::Function::New(env, SignMessage));
+  exports.Set("bitcoin_pqc_sign_with_randomness", Napi::Function::New(env, SignMessageWithRandomness));
   exports.Set("bitcoin_pqc_verify", Napi::Function::New(env, VerifySignature));
   return exports;
 }
