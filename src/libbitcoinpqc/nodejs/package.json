@@ -1,6 +1,6 @@
 {
   "name": "@jbride/bitcoinpqc",
-  "version": "0.2.9",
+  "version": "0.3.0",
   "description": "NodeJS TypeScript bindings for Bitcoin PQC library",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
