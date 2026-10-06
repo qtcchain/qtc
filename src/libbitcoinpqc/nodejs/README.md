@@ -13,6 +13,10 @@ TypeScript bindings for the [libbitcoinpqc](https://github.com/bitcoin/libbitcoi
 
 ## Installation
 
+The native addon compiles the portable reference SPHINCS+ and Dilithium sources that ship with
+`libbitcoinpqc` (`npm run sync-c-sources` copies them into `src/c_sources`). Node.js 18+ and a C/C++ toolchain
+(Xcode Command Line Tools on macOS, build-essential on Debian/Ubuntu) are required.
+
 ```bash
 npm install bitcoinpqc
 ```
@@ -141,9 +145,16 @@ Generate a key pair for the specified algorithm. The `randomData` must be at lea
 
 Sign a message using the specified secret key. The signature is deterministic based on the message and key.
 
-#### `verify(publicKey: PublicKey, message: Uint8Array, signature: Signature | Uint8Array): void`
+#### `signWithRandomness(secretKey: SecretKey, message: Uint8Array, randomData: Uint8Array, options?: { slhdsaFips205?: boolean }): Signature`
 
-Verify a signature using the specified public key. Throws a `PqcError` if verification fails.
+Hedged signing with caller-supplied randomness (at least 128 bytes), exactly as `qtcd` signs: the same key, message
+and randomness always yield the same signature. `slhdsaFips205` selects SLH-DSA FIPS 205 mode (default `false`,
+matching `qtcd`'s default); it is ignored for ML-DSA.
+
+#### `verify(publicKey: PublicKey, message: Uint8Array, signature: Signature | Uint8Array, options?: { slhdsaFips205?: boolean }): void`
+
+Throws `PqcError` if the signature does not verify. Pass `{ slhdsaFips205: true }` for signatures made in SLH-DSA
+FIPS 205 mode.
 
 ## Algorithm Characteristics
 

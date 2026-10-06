@@ -1,4 +1,5 @@
 import { getLibrary } from "./library";
+export { isNativeAddonLoaded } from "./library";
 import {
   Algorithm,
   ErrorCode,
@@ -132,10 +133,54 @@ export function sign(secretKey: SecretKey, message: Uint8Array): Signature {
  * @returns {void}
  * @throws {PqcError} If verification fails
  */
+export interface VerifyOptions {
+  /** SLH-DSA FIPS 205 mode (default false, matching qtcd's default). Ignored for ML-DSA. */
+  slhdsaFips205?: boolean;
+}
+
+/**
+ * Sign a message with caller-supplied randomness (hedged signing, as qtcd does). The same secret key,
+ * message and randomness always produce the same signature.
+ *
+ * @param secretKey - The secret key to sign with
+ * @param message - The message to sign
+ * @param randomData - At least 128 bytes of randomness
+ * @param options - SLH-DSA FIPS 205 mode
+ */
+export function signWithRandomness(
+  secretKey: SecretKey,
+  message: Uint8Array,
+  randomData: Uint8Array,
+  options: VerifyOptions = {}
+): Signature {
+  if (!(secretKey instanceof SecretKey)) {
+    throw new PqcError(ErrorCode.BAD_ARGUMENT, "Secret key must be a SecretKey instance");
+  }
+  if (!(message instanceof Uint8Array) || !(randomData instanceof Uint8Array)) {
+    throw new PqcError(ErrorCode.BAD_ARGUMENT, "Message and random data must be Uint8Array");
+  }
+  if (randomData.length < 128) {
+    throw new PqcError(ErrorCode.BAD_ARGUMENT, "Random data must be at least 128 bytes");
+  }
+  const lib = getLibrary();
+  const result = lib.bitcoin_pqc_sign_with_randomness(
+    secretKey.algorithm,
+    secretKey.bytes,
+    message,
+    randomData,
+    options.slhdsaFips205 === true
+  );
+  if (result.resultCode !== ErrorCode.OK) {
+    throw new PqcError(result.resultCode);
+  }
+  return new Signature(secretKey.algorithm, result.signature);
+}
+
 export function verify(
   publicKey: PublicKey,
   message: Uint8Array,
-  signature: Signature | Uint8Array
+  signature: Signature | Uint8Array,
+  options: VerifyOptions = {}
 ): void {
   if (!(publicKey instanceof PublicKey)) {
     throw new PqcError(
@@ -162,7 +207,8 @@ export function verify(
     publicKey.algorithm,
     publicKey.bytes,
     message,
-    sigBytes
+    sigBytes,
+    options.slhdsaFips205 === true
   );
 
   if (result !== ErrorCode.OK) {
