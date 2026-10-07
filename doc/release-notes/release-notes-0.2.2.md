@@ -44,6 +44,20 @@ macOS
   requested, and refuses to start when `QTC_MATMUL_REQUIRE_BACKEND=metal` is
   set, instead of silently falling back to CPU mining.
 
+Difficulty health reporting
+---------------------------
+
+- `getdifficultyhealth` (and everything built on it: the explorer's difficulty
+  page, the node exporter) scored QTC's intervals against absolute thresholds
+  inherited from a 90-second predecessor chain (mean 80–110 s, p90 180 s,
+  p99 420 s), so a perfectly healthy 600-second chain reported a low health
+  score and permanent alerts. Thresholds now scale with the configured target
+  spacing and allow for the normal spread of block times under a constant
+  hashrate: mean within ±15 % of the target, p90 up to 2.75× and p99 up to
+  5.5× the target, mean absolute error up to 0.9× the target. ASERT itself is
+  unchanged; its 48-hour half-life still makes the response to new hashpower
+  gradual, which is expected behaviour rather than a fault.
+
 Also in this release
 --------------------
 

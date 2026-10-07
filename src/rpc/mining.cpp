@@ -1017,41 +1017,79 @@ static UniValue RewardDistributionAlerts(const RewardDistributionStats& stats)
     return alerts;
 }
 
-static UniValue DifficultyAlerts(const IntervalHealthStats& stats)
+/**
+ * Interval-health thresholds as multiples of the chain's target spacing. Block
+ * intervals under a constant hashrate are exponential around the target, so a
+ * window of 120 blocks normally shows a mean within about ±15 % of the target,
+ * a p90 near 2.3× and a p99 near 4.6× the target, and a mean absolute error
+ * near 0.74× the target. Alerts and the score only react beyond that normal
+ * variation. (v0.2.2: the previous constants were absolute seconds from a
+ * 90-second predecessor chain and flagged QTC's 600-second blocks as unhealthy.)
+ */
+struct IntervalHealthThresholds {
+    double mean_floor;      // seconds
+    double mean_ceiling;    // seconds
+    double p90_ceiling;     // seconds
+    double p99_ceiling;     // seconds
+    double mae_ceiling;     // seconds
+};
+
+static IntervalHealthThresholds MakeIntervalHealthThresholds(const double target_spacing_s)
+{
+    const double t = target_spacing_s > 0.0 ? target_spacing_s : 1.0;
+    return IntervalHealthThresholds{
+        .mean_floor = 0.85 * t,
+        .mean_ceiling = 1.15 * t,
+        .p90_ceiling = 2.75 * t,
+        .p99_ceiling = 5.5 * t,
+        .mae_ceiling = 0.9 * t,
+    };
+}
+
+static UniValue DifficultyAlerts(const IntervalHealthStats& stats, const double target_spacing_s)
 {
     UniValue alerts(UniValue::VARR);
     if (stats.count == 0) return alerts;
-    if (stats.mean_interval_s < 80.0) {
-        alerts.push_back(strprintf("mean_interval_s=%.2f below target floor 80s", stats.mean_interval_s));
+    const IntervalHealthThresholds th = MakeIntervalHealthThresholds(target_spacing_s);
+    if (stats.mean_interval_s < th.mean_floor) {
+        alerts.push_back(strprintf("mean_interval_s=%.2f below target floor %.0fs (0.85x target %.0fs)", stats.mean_interval_s, th.mean_floor, target_spacing_s));
     }
-    if (stats.mean_interval_s > 110.0) {
-        alerts.push_back(strprintf("mean_interval_s=%.2f above target ceiling 110s", stats.mean_interval_s));
+    if (stats.mean_interval_s > th.mean_ceiling) {
+        alerts.push_back(strprintf("mean_interval_s=%.2f above target ceiling %.0fs (1.15x target %.0fs)", stats.mean_interval_s, th.mean_ceiling, target_spacing_s));
     }
-    if (stats.p90_interval_s > 180.0) {
-        alerts.push_back(strprintf("p90_interval_s=%.2f above 180s", stats.p90_interval_s));
+    if (stats.p90_interval_s > th.p90_ceiling) {
+        alerts.push_back(strprintf("p90_interval_s=%.2f above %.0fs (2.75x target)", stats.p90_interval_s, th.p90_ceiling));
     }
-    if (stats.p99_interval_s > 420.0) {
-        alerts.push_back(strprintf("p99_interval_s=%.2f above 420s", stats.p99_interval_s));
+    if (stats.p99_interval_s > th.p99_ceiling) {
+        alerts.push_back(strprintf("p99_interval_s=%.2f above %.0fs (5.5x target)", stats.p99_interval_s, th.p99_ceiling));
     }
     return alerts;
 }
 
-static int DifficultyHealthScore(const IntervalHealthStats& stats)
+static int DifficultyHealthScore(const IntervalHealthStats& stats, const double target_spacing_s)
 {
     if (stats.count == 0) return 0;
+    const double t = target_spacing_s > 0.0 ? target_spacing_s : 1.0;
+    const IntervalHealthThresholds th = MakeIntervalHealthThresholds(t);
     double score{100.0};
-    if (stats.mean_interval_s < 80.0) {
-        score -= std::min(25.0, (80.0 - stats.mean_interval_s) * 0.8);
-    } else if (stats.mean_interval_s > 110.0) {
-        score -= std::min(25.0, (stats.mean_interval_s - 110.0) * 0.8);
+    // Mean: 0.8 points per percent of target outside the ±15 % band, up to 25.
+    if (stats.mean_interval_s < th.mean_floor) {
+        score -= std::min(25.0, (th.mean_floor - stats.mean_interval_s) / t * 100.0 * 0.8);
+    } else if (stats.mean_interval_s > th.mean_ceiling) {
+        score -= std::min(25.0, (stats.mean_interval_s - th.mean_ceiling) / t * 100.0 * 0.8);
     }
-    if (stats.p90_interval_s > 180.0) {
-        score -= std::min(20.0, (stats.p90_interval_s - 180.0) * 0.15);
+    // Tails: 13.5 points per target-multiple above the p90 ceiling (up to 20), 4.5 per
+    // target-multiple above the p99 ceiling (up to 15).
+    if (stats.p90_interval_s > th.p90_ceiling) {
+        score -= std::min(20.0, (stats.p90_interval_s - th.p90_ceiling) / t * 13.5);
     }
-    if (stats.p99_interval_s > 420.0) {
-        score -= std::min(15.0, (stats.p99_interval_s - 420.0) * 0.05);
+    if (stats.p99_interval_s > th.p99_ceiling) {
+        score -= std::min(15.0, (stats.p99_interval_s - th.p99_ceiling) / t * 4.5);
     }
-    score -= std::min(20.0, stats.mean_abs_error_s * 0.2);
+    // Mean absolute error beyond the exponential expectation: 18 points per target-multiple, up to 20.
+    if (stats.mean_abs_error_s > th.mae_ceiling) {
+        score -= std::min(20.0, (stats.mean_abs_error_s - th.mae_ceiling) / t * 18.0);
+    }
     if (score < 0.0) score = 0.0;
     if (score > 100.0) score = 100.0;
     return static_cast<int>(std::round(score));
@@ -5715,6 +5753,16 @@ static RPCHelpMan getdifficultyhealth()
                             {RPCResult::Type::NUM, "deep_reorg_events", "Deep-reorg warnings or parking events recorded since process start"},
                             {RPCResult::Type::NUM, "rejected_reorgs", "Compatibility counter for deep-reorg warning or parking events since process start"},
                             {RPCResult::Type::NUM, "deepest_rejected_reorg_depth", "Deepest deep-reorg warning or parking event observed since process start"},
+                            {RPCResult::Type::NUM, "hysteresis_depth", "Reorg depth from which a competing branch must also carry the hysteresis work margin before it replaces the active chain"},
+                            {RPCResult::Type::NUM, "hysteresis_work_margin", "Extra chain work (in target-spacing block units) a competing branch needs beyond hysteresis_depth"},
+                            {RPCResult::Type::NUM, "deferred_reorgs", "Reorgs deferred by the hysteresis rule since process start"},
+                            {RPCResult::Type::NUM, "deepest_deferred_reorg_depth", "Deepest reorg deferred by the hysteresis rule since process start"},
+                            {RPCResult::Type::NUM, "last_deferred_reorg_depth", "Depth of the most recently deferred reorg"},
+                            {RPCResult::Type::NUM, "last_deferred_required_work_margin", "Work margin that the most recently deferred branch still lacked"},
+                            {RPCResult::Type::NUM, "last_deferred_tip_height", "Active tip height at the most recent deferral"},
+                            {RPCResult::Type::NUM, "last_deferred_fork_height", "Fork height of the most recently deferred branch"},
+                            {RPCResult::Type::NUM, "last_deferred_candidate_height", "Candidate tip height of the most recently deferred branch"},
+                            {RPCResult::Type::NUM, "last_deferred_unix", "Unix time of the most recent deferral, 0 if none"},
                             {RPCResult::Type::NUM, "last_rejected_reorg_depth", "Depth of the most recent deep-reorg warning or parking event"},
                             {RPCResult::Type::NUM, "last_rejected_max_reorg_depth", "Configured warning or parking threshold in effect for the most recent event"},
                             {RPCResult::Type::NUM, "last_rejected_tip_height", "Active tip height when the most recent event occurred"},
@@ -5867,8 +5915,9 @@ static RPCHelpMan getdifficultyhealth()
     obj.pushKV("reward_distribution", RewardDistributionToUniValue(reward_distribution));
     obj.pushKV("service_challenge_registry", MatMulServiceChallengeRegistryHealthToUniValue(registry_health));
     obj.pushKV("networkhashps", GetNetworkHashPS(window_blocks, -1, active_chain));
-    obj.pushKV("health_score", DifficultyHealthScore(stats));
-    UniValue alerts = DifficultyAlerts(stats);
+    const double target_spacing_s = static_cast<double>(chainman.GetConsensus().nPowTargetSpacing);
+    obj.pushKV("health_score", DifficultyHealthScore(stats, target_spacing_s));
+    UniValue alerts = DifficultyAlerts(stats, target_spacing_s);
     UniValue guard_alerts = ConsensusGuardAlerts(active_chain, chainman.GetConsensus());
     for (size_t index = 0; index < guard_alerts.size(); ++index) {
         alerts.push_back(guard_alerts[index].get_str());
@@ -6147,6 +6196,16 @@ static RPCHelpMan getmatmulchallenge()
                                     {RPCResult::Type::NUM, "deep_reorg_events", "Deep-reorg warnings or parking events recorded since process start"},
                                     {RPCResult::Type::NUM, "rejected_reorgs", "Compatibility counter for deep-reorg warning or parking events since process start"},
                                     {RPCResult::Type::NUM, "deepest_rejected_reorg_depth", "Deepest deep-reorg warning or parking event observed since process start"},
+                            {RPCResult::Type::NUM, "hysteresis_depth", "Reorg depth from which a competing branch must also carry the hysteresis work margin before it replaces the active chain"},
+                            {RPCResult::Type::NUM, "hysteresis_work_margin", "Extra chain work (in target-spacing block units) a competing branch needs beyond hysteresis_depth"},
+                            {RPCResult::Type::NUM, "deferred_reorgs", "Reorgs deferred by the hysteresis rule since process start"},
+                            {RPCResult::Type::NUM, "deepest_deferred_reorg_depth", "Deepest reorg deferred by the hysteresis rule since process start"},
+                            {RPCResult::Type::NUM, "last_deferred_reorg_depth", "Depth of the most recently deferred reorg"},
+                            {RPCResult::Type::NUM, "last_deferred_required_work_margin", "Work margin that the most recently deferred branch still lacked"},
+                            {RPCResult::Type::NUM, "last_deferred_tip_height", "Active tip height at the most recent deferral"},
+                            {RPCResult::Type::NUM, "last_deferred_fork_height", "Fork height of the most recently deferred branch"},
+                            {RPCResult::Type::NUM, "last_deferred_candidate_height", "Candidate tip height of the most recently deferred branch"},
+                            {RPCResult::Type::NUM, "last_deferred_unix", "Unix time of the most recent deferral, 0 if none"},
                                     {RPCResult::Type::NUM, "last_rejected_reorg_depth", "Depth of the most recent deep-reorg warning or parking event"},
                                     {RPCResult::Type::NUM, "last_rejected_max_reorg_depth", "Configured warning or parking threshold in effect for the most recent event"},
                                     {RPCResult::Type::NUM, "last_rejected_tip_height", "Active tip height when the most recent event occurred"},
@@ -6477,6 +6536,16 @@ static RPCHelpMan getmatmulchallengeprofile()
                                     {RPCResult::Type::NUM, "deep_reorg_events", "Deep-reorg warnings or parking events recorded since process start"},
                                     {RPCResult::Type::NUM, "rejected_reorgs", "Compatibility counter for deep-reorg warning or parking events since process start"},
                                     {RPCResult::Type::NUM, "deepest_rejected_reorg_depth", "Deepest deep-reorg warning or parking event observed since process start"},
+                            {RPCResult::Type::NUM, "hysteresis_depth", "Reorg depth from which a competing branch must also carry the hysteresis work margin before it replaces the active chain"},
+                            {RPCResult::Type::NUM, "hysteresis_work_margin", "Extra chain work (in target-spacing block units) a competing branch needs beyond hysteresis_depth"},
+                            {RPCResult::Type::NUM, "deferred_reorgs", "Reorgs deferred by the hysteresis rule since process start"},
+                            {RPCResult::Type::NUM, "deepest_deferred_reorg_depth", "Deepest reorg deferred by the hysteresis rule since process start"},
+                            {RPCResult::Type::NUM, "last_deferred_reorg_depth", "Depth of the most recently deferred reorg"},
+                            {RPCResult::Type::NUM, "last_deferred_required_work_margin", "Work margin that the most recently deferred branch still lacked"},
+                            {RPCResult::Type::NUM, "last_deferred_tip_height", "Active tip height at the most recent deferral"},
+                            {RPCResult::Type::NUM, "last_deferred_fork_height", "Fork height of the most recently deferred branch"},
+                            {RPCResult::Type::NUM, "last_deferred_candidate_height", "Candidate tip height of the most recently deferred branch"},
+                            {RPCResult::Type::NUM, "last_deferred_unix", "Unix time of the most recent deferral, 0 if none"},
                                     {RPCResult::Type::NUM, "last_rejected_reorg_depth", "Depth of the most recent deep-reorg warning or parking event"},
                                     {RPCResult::Type::NUM, "last_rejected_max_reorg_depth", "Configured warning or parking threshold in effect for the most recent event"},
                                     {RPCResult::Type::NUM, "last_rejected_tip_height", "Active tip height when the most recent event occurred"},
