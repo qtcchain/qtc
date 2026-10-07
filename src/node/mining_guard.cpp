@@ -4,6 +4,9 @@
 
 #include <node/mining_guard.h>
 
+#include <chainparams.h>
+#include <util/chaintype.h>
+
 #include <common/args.h>
 #include <logging.h>
 #include <net.h>
@@ -58,11 +61,13 @@ MiningChainGuardOptions GetMiningChainGuardOptions(const NodeContext& node)
 {
     MiningChainGuardOptions options;
 
-    // QTC: off by default on every chain. The public mesh (DefaultMiningPeerMesh)
-    // is only two hosts, below DEFAULT_MINING_CHAIN_GUARD_MIN_PEERS, so a node
-    // with no other reachable peers would report unhealthy; operators with a
-    // larger peer set opt in with -miningchainguard=1.
-    const bool default_enabled = false;
+    // QTC v0.2.2: on by default on mainnet so getmininginfo.chain_guard is
+    // meaningful for a newcomer's mining node out of the box (the first external
+    // miner report showed "disabled" and peer_count 0 while the node mined).
+    // Off by default on test chains and regtest, where a node often has no peers
+    // on purpose. -miningchainguard=0/1 overrides either way.
+    const bool default_enabled =
+        node.chainman != nullptr && node.chainman->GetParams().GetChainType() == ChainType::MAIN;
 
     if (!node.args) {
         options.enabled = default_enabled;
