@@ -378,6 +378,40 @@ static void EnforceMiningTemplateReadiness(
 }
 
 /**
+ * The readiness policy for handing out work, from the -miningmin... and -miningmax... options
+ * with the chain's defaults. Shared by getblocktemplate and the built-in block
+ * generation path so an isolated mainnet node cannot mine a private fork through
+ * generatetoaddress while getblocktemplate would refuse (security review follow-up,
+ * v0.2.2). The same options disable it (-miningminoutboundpeers=0 etc.).
+ */
+static MiningTemplateReadinessPolicy BuildMiningTemplateReadinessPolicy(
+    const ArgsManager& args,
+    const CChainParams& chainparams,
+    const bool is_test_chain)
+{
+    const int64_t min_outbound_peers = std::max<int64_t>(
+        0,
+        args.GetIntArg("-miningminoutboundpeers", DefaultMinOutboundPeersForMiningTemplate(chainparams)));
+    const int64_t min_synced_outbound_peers = std::max<int64_t>(
+        0,
+        args.GetIntArg("-miningminsyncedoutboundpeers", DefaultMinSyncedOutboundPeersForMiningTemplate(chainparams)));
+    const int64_t max_peer_sync_height_lag = std::max<int64_t>(
+        0,
+        args.GetIntArg("-miningmaxpeersyncheightlag", DefaultMaxPeerSyncHeightLagForMiningTemplate(chainparams)));
+    const int64_t max_header_lag = std::max<int64_t>(
+        0,
+        args.GetIntArg("-miningmaxheaderlag", DefaultMaxHeaderLagForMiningTemplate(chainparams)));
+    return MiningTemplateReadinessPolicy{
+        .enforce_connectivity = !is_test_chain || min_outbound_peers > 0 || min_synced_outbound_peers > 0,
+        .min_outbound_peers = min_outbound_peers,
+        .min_synced_outbound_peers = min_synced_outbound_peers,
+        .max_peer_sync_height_lag = max_peer_sync_height_lag,
+        .enforce_header_lag = !is_test_chain || max_header_lag > 0,
+        .max_header_lag = max_header_lag,
+    };
+}
+
+/**
  * Return average network hashes per second based on the last 'lookup' blocks,
  * or from the last difficulty change if 'lookup' is -1.
  * If 'height' is -1, compute the estimate from current chain tip.
@@ -5006,8 +5040,22 @@ static UniValue generateBlocks(ChainstateManager& chainman, Mining& miner, const
     NodeContext* node_context = miner.context();
 
     UniValue blockHashes(UniValue::VARR);
+    // v0.2.2: the built-in generation path (generatetoaddress / generatetodescriptor /
+    // generateblock, used by the supervised mining loop) applies the same mainnet
+    // readiness policy as getblocktemplate before every block, so a node with no
+    // peers, only inbound peers, or a stale tip cannot mine a private fork. Test
+    // chains keep the old behaviour; the -miningmin*/-miningmax* options disable it.
+    const bool enforce_readiness = node_context != nullptr && !miner.isTestChain();
     while (nGenerate > 0 && !chainman.m_interrupt) {
         if (node_context) ObserveMiningChainGuard(*node_context);
+        if (enforce_readiness) {
+            LOCK(cs_main);
+            EnforceMiningTemplateReadiness(
+                chainman,
+                EnsureConnman(*node_context),
+                node_context->peerman.get(),
+                BuildMiningTemplateReadinessPolicy(EnsureArgsman(*node_context), chainman.GetParams(), /*is_test_chain=*/false));
+        }
         std::unique_ptr<BlockTemplate> block_template(miner.createNewBlock({ .coinbase_output_script = coinbase_output_script }));
         CHECK_NONFATAL(block_template);
 
@@ -7932,26 +7980,8 @@ static RPCHelpMan getblocktemplate()
     const CChainParams& chainparams = chainman.GetParams();
     const ArgsManager& args = EnsureArgsman(node);
     const PeerManager* const peerman = node.peerman.get();
-    const int64_t min_outbound_peers = std::max<int64_t>(
-        0,
-        args.GetIntArg("-miningminoutboundpeers", DefaultMinOutboundPeersForMiningTemplate(chainparams)));
-    const int64_t min_synced_outbound_peers = std::max<int64_t>(
-        0,
-        args.GetIntArg("-miningminsyncedoutboundpeers", DefaultMinSyncedOutboundPeersForMiningTemplate(chainparams)));
-    const int64_t max_peer_sync_height_lag = std::max<int64_t>(
-        0,
-        args.GetIntArg("-miningmaxpeersyncheightlag", DefaultMaxPeerSyncHeightLagForMiningTemplate(chainparams)));
-    const int64_t max_header_lag = std::max<int64_t>(
-        0,
-        args.GetIntArg("-miningmaxheaderlag", DefaultMaxHeaderLagForMiningTemplate(chainparams)));
-    const MiningTemplateReadinessPolicy readiness_policy{
-        .enforce_connectivity = !miner.isTestChain() || min_outbound_peers > 0 || min_synced_outbound_peers > 0,
-        .min_outbound_peers = min_outbound_peers,
-        .min_synced_outbound_peers = min_synced_outbound_peers,
-        .max_peer_sync_height_lag = max_peer_sync_height_lag,
-        .enforce_header_lag = !miner.isTestChain() || max_header_lag > 0,
-        .max_header_lag = max_header_lag,
-    };
+    const MiningTemplateReadinessPolicy readiness_policy =
+        BuildMiningTemplateReadinessPolicy(args, chainparams, miner.isTestChain());
 
     EnforceMiningTemplateReadiness(chainman, connman, peerman, readiness_policy);
 
