@@ -132,7 +132,30 @@ Release Process
   requests and issues:
   https://github.com/bitcoin/bitcoin/issues?q=label%3A%22Needs+release+note%22
 
-#### Tagging a release (candidate)
+#### QTC: chain anchor and activation height on every release (mandatory)
+
+Every QTC release, including patch releases, carries a fresh **chain anchor** and an explicit
+**activation height** in its release notes. Owner rule, 8 October 2026.
+
+1. Pick the anchor height: a block at least 24 hours (about 144 blocks) below the tip at the time
+   the release branch is cut, so it cannot be reorganised.
+2. Read the values from a fleet node and patch the release branch with
+   `anchor_v2_h3.sh <height> --apply` (iCloud `QTC/software/`): `checkpointData` entry,
+   `nMinimumChainWork`, `defaultAssumeValid` and `chainTxData` for mainnet v2.
+3. Pin the new checkpoint in `src/test/pow_tests.cpp` (hash, height, and the reachability check
+   against the current tip's chain work), and run `pow_tests`.
+4. State in `doc/release-notes/release-notes-X.Y.Z.md`:
+   - **Anchor:** height, block hash, UTC time of the anchored block.
+   - **Activation height** of any new consensus or policy rule shipped by the release, or
+     "none: no rule change" when there is none. A rule that changes block validity or relay
+     policy must activate at a height at least two weeks (about 2 000 blocks) after the
+     release date so every node operator can upgrade first; the height is announced in the
+     release notes and on qtc.dev/news.
+5. Verify with `-reindex-chainstate -assumevalid=0` on one node before tagging, as above.
+
+A release without an anchor and without an activation statement is not tagged.
+
+### Tagging a release (candidate)
 
 To tag the version (or release candidate) in git, use the `make-tag.py` script from [bitcoin-maintainer-tools](https://github.com/bitcoin-core/bitcoin-maintainer-tools). From the root of the repository run:
 
