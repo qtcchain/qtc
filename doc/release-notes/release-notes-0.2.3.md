@@ -126,7 +126,10 @@ Chain anchor
 ------------
 
 - Generated on fleet node C (mainnet, genesis `d5f04a8a…eb24`) at 2026-10-11
-  23:49 UTC from tip 1825 and applied to `src/kernel/chainparams.cpp`:
+  23:49 UTC from tip 1825; manifest staged on the build box
+  (`/root/mainnet-hardening-0.2.3.json`), **to be applied to
+  `src/kernel/chainparams.cpp` by the owner at tagging time** (the apply
+  script needs the placeholder lines' trailing comments removed first):
   - `defaultAssumeValid` and checkpoint: height **1823**,
     `cfc093e05f14041b85c57e3648c4659b03a9971be78f12f50cc1cff1e0314d20`
   - `nMinimumChainWork`: `0x17dcea32d6`
