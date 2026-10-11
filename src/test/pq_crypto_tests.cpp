@@ -9,6 +9,7 @@
 
 #include <boost/test/unit_test.hpp>
 #include <libbitcoinpqc/bitcoinpqc.h>
+#include <libbitcoinpqc/slh_dsa.h>
 #include <test/data/fips205_slhdsa_kat.h>
 #include <util/strencodings.h>
 #include <algorithm>
@@ -321,6 +322,45 @@ BOOST_AUTO_TEST_CASE(mldsa44_fips205_flag_is_noop)
     BOOST_REQUIRE(key.Sign(MESSAGE_A, sig, /*slhdsa_fips205=*/true));
     BOOST_CHECK(pub.Verify(MESSAGE_A, sig, /*slhdsa_fips205=*/true));
     BOOST_CHECK(pub.Verify(MESSAGE_A, sig, /*slhdsa_fips205=*/false));
+}
+
+// The SLH-DSA wrapper hedges with SHAKE256(sk || m) and, when given, caller entropy. The SPHINCS+
+// sources must draw their optrand from that source and not from the Dilithium shim that also
+// defines randombytes(): without random_data two signatures of the same message are identical,
+// and caller entropy changes them.
+BOOST_AUTO_TEST_CASE(slhdsa128s_raw_sign_uses_wrapper_entropy_source)
+{
+    std::array<unsigned char, 128> keygen_entropy{};
+    for (size_t i = 0; i < keygen_entropy.size(); ++i) keygen_entropy[i] = static_cast<unsigned char>(i * 7 + 3);
+    bitcoin_pqc_keypair_t kp{};
+    BOOST_REQUIRE_EQUAL(bitcoin_pqc_keygen(BITCOIN_PQC_SLH_DSA_SHAKE_128S, &kp, keygen_entropy.data(), keygen_entropy.size()), BITCOIN_PQC_OK);
+    const auto* sk = static_cast<const uint8_t*>(kp.secret_key);
+    const auto* pk = static_cast<const uint8_t*>(kp.public_key);
+    const std::string msg{"qtc-slhdsa-entropy-source"};
+    const auto* m = reinterpret_cast<const uint8_t*>(msg.data());
+
+    for (int fips205 = 0; fips205 <= 1; ++fips205) {
+        std::vector<uint8_t> sig_a(SLH_DSA_SHAKE_128S_SIGNATURE_SIZE), sig_b(SLH_DSA_SHAKE_128S_SIGNATURE_SIZE);
+        size_t len_a{0}, len_b{0};
+        BOOST_REQUIRE_EQUAL(slh_dsa_shake_128s_sign(sig_a.data(), &len_a, m, msg.size(), sk, fips205), 0);
+        BOOST_REQUIRE_EQUAL(slh_dsa_shake_128s_sign(sig_b.data(), &len_b, m, msg.size(), sk, fips205), 0);
+        BOOST_REQUIRE_EQUAL(len_a, SLH_DSA_SHAKE_128S_SIGNATURE_SIZE);
+        BOOST_CHECK(sig_a == sig_b); // deterministic without caller entropy
+        BOOST_CHECK_EQUAL(slh_dsa_shake_128s_verify(sig_a.data(), len_a, m, msg.size(), pk, fips205), 0);
+
+        std::array<unsigned char, 128> entropy_1{}, entropy_2{};
+        entropy_1.fill(0x11);
+        entropy_2.fill(0x22);
+        std::vector<uint8_t> sig_h1(SLH_DSA_SHAKE_128S_SIGNATURE_SIZE), sig_h2(SLH_DSA_SHAKE_128S_SIGNATURE_SIZE);
+        size_t len_h1{0}, len_h2{0};
+        BOOST_REQUIRE_EQUAL(slh_dsa_shake_128s_sign_with_randomness(sig_h1.data(), &len_h1, m, msg.size(), sk, entropy_1.data(), entropy_1.size(), fips205), 0);
+        BOOST_REQUIRE_EQUAL(slh_dsa_shake_128s_sign_with_randomness(sig_h2.data(), &len_h2, m, msg.size(), sk, entropy_2.data(), entropy_2.size(), fips205), 0);
+        BOOST_CHECK(sig_h1 != sig_h2);  // caller entropy reaches the signature
+        BOOST_CHECK(sig_h1 != sig_a);
+        BOOST_CHECK_EQUAL(slh_dsa_shake_128s_verify(sig_h1.data(), len_h1, m, msg.size(), pk, fips205), 0);
+        BOOST_CHECK_EQUAL(slh_dsa_shake_128s_verify(sig_h2.data(), len_h2, m, msg.size(), pk, fips205), 0);
+    }
+    bitcoin_pqc_keypair_free(&kp);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

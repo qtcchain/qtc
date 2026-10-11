@@ -179,6 +179,12 @@ else()
     message(FATAL_ERROR "Unknown SPHINCS+ variant: ${SPHINCSPLUS_VARIANT}")
 endif()
 
+# The SPHINCS+ sources call randombytes(); so does Dilithium, and both shims
+# used to define that one symbol, with link order deciding which the SLH-DSA
+# code got (it got the ML-DSA one). Give the SPHINCS+ sources their own entry
+# point, defined in src/slh_dsa/randombytes_custom.c.
+set_property(SOURCE ${SLH_DSA_SOURCES} APPEND PROPERTY COMPILE_DEFINITIONS "randombytes=slh_dsa_randombytes")
+
 # libbitcoinpqc source files
 set(BITCOINPQC_SOURCES
     src/bitcoinpqc.c
