@@ -1,14 +1,17 @@
 QTC version 0.2.3
 =================
 
-Tag `v0.2.3` (draft; not yet tagged). Wallet performance and RPC update. No
-consensus rule changes: blocks are valid or invalid exactly as before, and
-v0.2.0 through v0.2.3 nodes interoperate. **Activation height: none.**
+Tag `v0.2.3`. Wallet performance, RPC and relay-policy update. No consensus
+rule changes: blocks are valid or invalid exactly as before, and v0.2.0
+through v0.2.3 nodes interoperate. **Activation height: none.** The chain
+anchor (minimum chain work, assume-valid block, checkpoint and transaction
+statistics) is refreshed to the block stated in the "Chain anchor" section.
 
 **Who should upgrade:** everyone who spends from a wallet, in particular
 miners sweeping coinbase outputs and anyone whose wallet descriptor carries an
-SLH-DSA backup leaf (the default `mr(pqhd(...),pk_slh(pqhd(...)))` layout).
-Relays can upgrade when convenient.
+SLH-DSA backup leaf (the default `mr(pqhd(...),pk_slh(pqhd(...)))` layout);
+and every relay that should carry QTC-EVM anchor transactions (see "Relay
+policy", which lands with PR #19).
 
 Verify downloads against the signed `SHA256SUMS` as described in the README.
 
@@ -88,3 +91,41 @@ Chain anchor
 
 *To be filled at tag time per `doc/release-process.md`: refreshed chain
 anchor (height and block hash) and the activation-height statement above.*
+
+Relay policy (PR #19, merge before tagging)
+-------------------------------------------
+
+- **P2MR data-envelope leaves are standard.** A leaf that begins with
+  `OP_0 OP_IF <push> ... <push> OP_ENDIF` is classified by what follows the
+  envelope (CTV-only, checksig, multisig, ...). The body never executes, so
+  consensus already accepted such spends; relays now forward them. The
+  QTC-EVM layer 2 carries its batch data this way: one key-less P2MR output
+  per slice, spent by the anchor transaction whose CTV template the leaf
+  commits to. Relays that do not upgrade still validate these transactions in
+  blocks; they only decline to relay them.
+- `mr()` descriptors with more than one backup leaf render as a flat list
+  (`mr(k,l1,l2,...)`) and the parser accepted only one backup-tree expression,
+  so a wallet that imported a three-leaf tree could not re-parse its own
+  descriptor on load ("Wallet corrupted"). The parser now accepts the flat
+  form. The rendering is unchanged, so descriptor IDs and existing wallets
+  are stable.
+
+Known issues
+------------
+
+- The wallet cannot sign a transaction that mixes one of its HD inputs with an
+  input from an imported fixed-key `mr(<hex>, ...)` descriptor (#20); build
+  such transactions with inputs of one kind only.
+- `fundrawtransaction` occasionally fails with "Fee needed > fee paid" on the
+  new placeholder-quote path (#21); retry, or fund with explicit inputs.
+- #15 (template readiness starves a well-connected miner) is not in this
+  release unless a fix is merged before tagging; node B's configuration
+  workaround remains in force.
+
+Chain anchor
+------------
+
+- FILL AT TAGGING: `nMinimumChainWork`, `defaultAssumeValid` (height, hash),
+  checkpoint and `chainTxData` from the manifest generated on the canonical
+  node (`scripts/update_chain_hardening_manifest.py`, applied with
+  `scripts/apply_chain_hardening_manifest.py`).
