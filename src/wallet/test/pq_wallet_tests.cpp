@@ -619,6 +619,49 @@ BOOST_AUTO_TEST_CASE(p2mr_primary_estimator_covers_actual_weight)
     BOOST_CHECK_LT(estimated.weight - actual_weight, 5000);
 }
 
+// The wallet quotes a P2MR spend from placeholder signatures (no SLH-DSA signing run) and the quote
+// must still be the exact signed size, including the node's sigop pricing, for both the primary
+// (ML-DSA) and the backup-only (SLH-DSA) wallet.
+BOOST_AUTO_TEST_CASE(p2mr_estimator_quotes_the_signed_size_exactly)
+{
+    const auto seed = MakePQSeed(0x51);
+    const std::vector<unsigned char> fixed_mldsa = MakePattern(MLDSA44_PUBKEY_SIZE, 0x61);
+    const std::string backup_receive = AddChecksum("mr(" + HexStr(fixed_mldsa) + ",pk_slh(" + MakeP2MRKeyPathExpr(seed, /*internal=*/false) + "))");
+    const std::string backup_change = AddChecksum("mr(" + HexStr(fixed_mldsa) + ",pk_slh(" + MakeP2MRKeyPathExpr(seed, /*internal=*/true) + "))");
+    const std::vector<std::shared_ptr<CWallet>> wallets{
+        CreateP2MRDescriptorWallet(*this),
+        CreateP2MRDescriptorWalletFromStrings(*this, backup_receive, backup_change),
+    };
+
+    uint8_t n{30};
+    for (const auto& wallet : wallets) {
+        const CTxDestination from_dest = *Assert(wallet->GetNewDestination(OutputType::P2MR, ""));
+        const CTxDestination to_dest = *Assert(wallet->GetNewDestination(OutputType::P2MR, ""));
+        const COutPoint prevout{Txid::FromUint256(uint256{n++}), 0};
+        const CAmount input_value{25 * COIN};
+        Coin prev_coin{CTxOut{input_value, GetScriptForDestination(from_dest)}, /*nHeight=*/1, /*fCoinBase=*/false};
+
+        CMutableTransaction tx;
+        tx.vin.emplace_back(prevout);
+        tx.vout.emplace_back(input_value - 1500, GetScriptForDestination(to_dest));
+
+        const TxSize estimated = CalculateMaximumSignedTxSize(CTransaction{tx}, wallet.get(), std::vector<CTxOut>{prev_coin.out});
+        const int input_size = CalculateMaximumSignedInputSize(prev_coin.out, wallet.get(), /*coin_control=*/nullptr);
+        BOOST_REQUIRE(SignAndCheckP2MRTransaction(wallet, tx, prev_coin));
+        const CTransaction tx_signed{tx};
+
+        CCoinsView dummy;
+        CCoinsViewCache view(&dummy);
+        view.AddCoin(prevout, Coin{prev_coin.out, /*nHeight=*/1, /*fCoinBase=*/false}, /*possible_overwrite=*/true);
+        const int64_t sigops = GetTransactionSigOpCost(tx_signed, view, STANDARD_SCRIPT_VERIFY_FLAGS);
+        const int64_t weight = GetTransactionWeight(tx_signed);
+        BOOST_CHECK_EQUAL(estimated.weight, weight);
+        BOOST_CHECK_EQUAL(estimated.vsize, GetVirtualTransactionSize(weight, sigops, DEFAULT_BYTES_PER_SIGOP));
+        const int64_t input_weight = GetTransactionInputWeight(tx_signed.vin[0]);
+        BOOST_CHECK_EQUAL(input_size, GetVirtualTransactionSize(input_weight, sigops, DEFAULT_BYTES_PER_SIGOP));
+    }
+}
+
 BOOST_AUTO_TEST_CASE(p2mr_transaction_weight_calculation)
 {
     const auto wallet = CreateP2MRDescriptorWallet(*this);

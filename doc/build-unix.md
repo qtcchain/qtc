@@ -64,6 +64,22 @@ If CUDA runtime probing succeeds, the output will report:
 For current CUDA runtime defaults, pool behavior, and optimization notes, see
 `qtc-cuda-matmul-optimization-notes-2026-04-13.md`.
 
+## Optional: AVX2 SLH-DSA backend (x86_64)
+
+`libbitcoinpqc` builds SLH-DSA-SHAKE-128s from the portable SPHINCS+ reference
+code by default (native Apple Silicon builds use the ARMv8.4 SHA3 variant). On
+x86_64 you can opt into the AVX2 variant, which signs several times faster:
+
+```bash
+cmake -B build -DQTC_SLHDSA_AVX2=ON
+```
+
+The resulting binaries require a CPU with AVX2, so the option stays off for the
+portable Guix release builds. The variant is a different implementation of the
+same algorithm: it must produce and verify byte-identical signatures to the
+reference backend (including the FIPS-205 index derivation), which the
+`pq_crypto_tests` unit tests and the SPHINCS+ known-answer vectors check.
+
 ## Tuning the Metal MatMul accelerator (`QTC_MATMUL_*` environment variables)
 
 On Apple Silicon, the MatMul mining / accelerated-solve paths are tuned by

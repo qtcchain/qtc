@@ -11,6 +11,15 @@
 #include "../../sphincsplus/shake-a64/utils.h"
 #include "../../sphincsplus/shake-a64/address.h"
 #include "../../sphincsplus/shake-a64/fips202.h"
+#elif defined(SPHINCSPLUS_VARIANT_SHAKE_AVX2)
+#include "../../sphincsplus/shake-avx2/randombytes.h"
+#include "../../sphincsplus/shake-avx2/api.h"
+#include "../../sphincsplus/shake-avx2/fors.h"
+#include "../../sphincsplus/shake-avx2/hash.h"
+#include "../../sphincsplus/shake-avx2/thash.h"
+#include "../../sphincsplus/shake-avx2/utils.h"
+#include "../../sphincsplus/shake-avx2/address.h"
+#include "../../sphincsplus/shake-avx2/fips202.h"
 #elif defined(SPHINCSPLUS_VARIANT_REF)
 #include "../../sphincsplus/ref/randombytes.h"
 #include "../../sphincsplus/ref/api.h"

@@ -59,8 +59,19 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+option(QTC_SLHDSA_AVX2 "Build SLH-DSA (SPHINCS+) from the shake-avx2 variant. The binary then requires an AVX2 CPU, so it is off for portable release builds." OFF)
+
 set(SPHINCSPLUS_VARIANT "ref")
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+if(QTC_SLHDSA_AVX2)
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+        message(FATAL_ERROR "QTC_SLHDSA_AVX2 needs an x86_64 target (got ${CMAKE_SYSTEM_PROCESSOR})")
+    endif()
+    check_c_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
+    if(NOT COMPILER_SUPPORTS_AVX2)
+        message(FATAL_ERROR "QTC_SLHDSA_AVX2 requested but the C compiler does not accept -mavx2")
+    endif()
+    set(SPHINCSPLUS_VARIANT "shake-avx2")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
     # The optimized assembly path is only considered for native Darwin builds.
     # Linux-hosted Darwin cross-builds still surface unsupported ARMv8.4-A
     # SHA3 mnemonics (e.g. `eor3`, `rax1`, `xar`, `bcax`) in the assembler, so
@@ -146,6 +157,24 @@ elseif(SPHINCSPLUS_VARIANT STREQUAL "shake-a64")
         sphincsplus/shake-a64/f1600x2.s
         PROPERTIES COMPILE_OPTIONS "-march=armv8.4-a+sha3"
     )
+elseif(SPHINCSPLUS_VARIANT STREQUAL "shake-avx2")
+    set(SLH_DSA_SOURCES
+        sphincsplus/shake-avx2/address.c
+        sphincsplus/shake-avx2/fors.c
+        sphincsplus/shake-avx2/hash_shake.c
+        sphincsplus/shake-avx2/hash_shakex4.c
+        sphincsplus/shake-avx2/merkle.c
+        sphincsplus/shake-avx2/sign.c
+        sphincsplus/shake-avx2/thash_shake_simple.c
+        sphincsplus/shake-avx2/thash_shake_simplex4.c
+        sphincsplus/shake-avx2/utils.c
+        sphincsplus/shake-avx2/utilsx4.c
+        sphincsplus/shake-avx2/wots.c
+        sphincsplus/shake-avx2/fips202.c
+        sphincsplus/shake-avx2/fips202x4.c
+        sphincsplus/shake-avx2/keccak4x/KeccakP-1600-times4-SIMD256.c
+    )
+    set_source_files_properties(${SLH_DSA_SOURCES} PROPERTIES COMPILE_OPTIONS "-mavx2")
 else()
     message(FATAL_ERROR "Unknown SPHINCS+ variant: ${SPHINCSPLUS_VARIANT}")
 endif()
@@ -187,6 +216,8 @@ if(SPHINCSPLUS_VARIANT STREQUAL "ref")
     target_compile_definitions(bitcoinpqc PRIVATE SPHINCSPLUS_VARIANT_REF=1)
 elseif(SPHINCSPLUS_VARIANT STREQUAL "shake-a64")
     target_compile_definitions(bitcoinpqc PRIVATE SPHINCSPLUS_VARIANT_SHAKE_A64=1)
+elseif(SPHINCSPLUS_VARIANT STREQUAL "shake-avx2")
+    target_compile_definitions(bitcoinpqc PRIVATE SPHINCSPLUS_VARIANT_SHAKE_AVX2=1)
 endif()
 
 # PQ primitives are extremely compute-heavy; keep this target optimized even in

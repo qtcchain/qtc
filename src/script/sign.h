@@ -73,6 +73,9 @@ extern const BaseSignatureChecker& DUMMY_CHECKER;
 extern const BaseSignatureCreator& DUMMY_SIGNATURE_CREATOR;
 /** A signature creator that just produces 72-byte empty signatures. */
 extern const BaseSignatureCreator& DUMMY_MAXIMUM_SIGNATURE_CREATOR;
+/** Like DUMMY_SIGNATURE_CREATOR, but a post-quantum leaf only gets a placeholder when the provider
+ *  holds its private key, so the P2MR leaf it picks is the one the real signer would pick. */
+extern const BaseSignatureCreator& DUMMY_KEYED_SIGNATURE_CREATOR;
 
 typedef std::pair<CPubKey, std::vector<unsigned char>> SigPair;
 

@@ -19,6 +19,7 @@
 #include <util/translation.h>
 #include <util/vector.h>
 
+#include <algorithm>
 #include <array>
 #include <optional>
 #include <set>
@@ -852,6 +853,48 @@ static int P2MRPriority(PQAlgorithm algo, PQAlgorithm preferred_algo, int prefer
     return algo == preferred_algo ? preferred_priority : non_preferred_priority;
 }
 
+/** How well a leaf matches the preferred signing algorithm: 0 when every signature it needs comes
+ *  from the preferred algorithm, 1 when only some do, 2 otherwise. SignP2MR visits the leaves in this
+ *  order and returns as soon as a rank-0 leaf signs, so a fallback leaf is only ever signed when it is
+ *  needed. That matters because with the reference implementation one SLH-DSA-128s signature costs
+ *  seconds: a wallet whose descriptor carries an SLH-DSA backup leaf must not pay that on every
+ *  ML-DSA spend (the leaf map is keyed by script bytes, which put the 32-byte SLH-DSA key push ahead
+ *  of the OP_PUSHDATA2 ML-DSA key push). */
+static int P2MRLeafPreferenceRank(Span<const unsigned char> script, PQAlgorithm preferred_algo)
+{
+    P2MRLeafInfo info;
+    if (!ExtractP2MRLeafInfo(script, info)) return 2;
+    switch (info.type) {
+    case P2MRLeafType::CHECKSIG:
+    case P2MRLeafType::CLTV_CHECKSIG:
+    case P2MRLeafType::CTV_CHECKSIG:
+        return info.algo == preferred_algo ? 0 : 2;
+    case P2MRLeafType::CSFS_VERIFY_CHECKSIG:
+        return (info.algo == preferred_algo ? 0 : 1) + (info.csfs_algo == preferred_algo ? 0 : 1);
+    case P2MRLeafType::HTLC_TX:
+    case P2MRLeafType::HTLC_SHA256:
+        return info.htlc_algo == preferred_algo ? 0 : 2;
+    case P2MRLeafType::MULTISIG:
+    case P2MRLeafType::CLTV_MULTISIG:
+    case P2MRLeafType::CSV_MULTISIG:
+    case P2MRLeafType::CTV_MULTISIG: {
+        size_t preferred_keys{0};
+        for (const auto& [algo, pubkey] : info.multisig_pubkeys) {
+            if (algo == preferred_algo) ++preferred_keys;
+        }
+        if (preferred_keys == info.multisig_pubkeys.size()) return 0;
+        return preferred_keys >= info.multisig_threshold ? 1 : 2;
+    }
+    case P2MRLeafType::CSFS_ONLY:
+    case P2MRLeafType::CTV_CSFS_ONLY:
+    case P2MRLeafType::HTLC:
+        return info.csfs_algo == preferred_algo ? 1 : 2;
+    case P2MRLeafType::CTV_ONLY:
+        return 2;
+    }
+    return 2;
+}
+
 static bool SignP2MR(const SigningProvider& provider,
                      const BaseSignatureCreator& creator,
                      const WitnessV2P2MR& output,
@@ -887,7 +930,17 @@ static bool SignP2MR(const SigningProvider& provider,
         }
     };
 
-    for (const auto& [script, controls] : sigdata.p2mr_spenddata.scripts) {
+    // Preferred-algorithm leaves first (see P2MRLeafPreferenceRank); byte order within a rank.
+    using LeafEntry = decltype(sigdata.p2mr_spenddata.scripts)::value_type;
+    std::vector<std::pair<int, const LeafEntry*>> leaves;
+    leaves.reserve(sigdata.p2mr_spenddata.scripts.size());
+    for (const auto& entry : sigdata.p2mr_spenddata.scripts) {
+        leaves.emplace_back(P2MRLeafPreferenceRank(entry.first, preferred_algo), &entry);
+    }
+    std::stable_sort(leaves.begin(), leaves.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    for (const auto& ranked_leaf : leaves) {
+        const auto& [script, controls] = *ranked_leaf.second;
         if (controls.empty()) continue;
         if (!sigdata.p2mr_leaf_script.empty() && script != sigdata.p2mr_leaf_script) continue;
 
@@ -927,15 +980,21 @@ static bool SignP2MR(const SigningProvider& provider,
         case P2MRLeafType::CLTV_MULTISIG:
         case P2MRLeafType::CSV_MULTISIG:
         case P2MRLeafType::CTV_MULTISIG: {
-            std::vector<std::vector<unsigned char>> available_sigs;
-            available_sigs.reserve(leaf_info.multisig_pubkeys.size());
+            // Sign with the preferred algorithm's keys first; the fallback algorithm's keys are only
+            // signed (and, below, only selected) when the preferred ones do not reach the threshold.
+            std::vector<std::vector<unsigned char>> available_sigs(leaf_info.multisig_pubkeys.size());
             size_t available_count{0};
-            for (const auto& [algo, pubkey] : leaf_info.multisig_pubkeys) {
-                std::vector<unsigned char> sig;
-                if (CreateP2MRScriptSig(creator, sigdata, provider, sig, pubkey, algo, leaf_hash, SigVersion::P2MR)) {
-                    ++available_count;
+            for (PQAlgorithm algo_preference : GetP2MRAlgoPreferenceOrder(preferred_algo)) {
+                if (available_count >= leaf_info.multisig_threshold) break;
+                for (size_t i = 0; i < leaf_info.multisig_pubkeys.size(); ++i) {
+                    const auto& [algo, pubkey] = leaf_info.multisig_pubkeys[i];
+                    if (algo != algo_preference) continue;
+                    if (CreateP2MRScriptSig(creator, sigdata, provider, available_sigs[i], pubkey, algo, leaf_hash, SigVersion::P2MR)) {
+                        ++available_count;
+                    } else {
+                        available_sigs[i].clear();
+                    }
                 }
-                available_sigs.push_back(std::move(sig));
             }
 
             if (available_count < leaf_info.multisig_threshold) continue;
@@ -1444,6 +1503,7 @@ public:
     DummySignatureChecker() = default;
     bool CheckECDSASignature(const std::vector<unsigned char>& sig, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const override { return sig.size() != 0; }
     bool CheckSchnorrSignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror) const override { return sig.size() != 0; }
+    bool CheckPQSignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, PQAlgorithm algo, uint8_t hash_type, SigVersion sigversion, ScriptExecutionData& execdata, bool slhdsa_fips205) const override { return sig.size() != 0; }
     bool CheckLockTime(const CScriptNum& nLockTime) const override { return true; }
     bool CheckSequence(const CScriptNum& nSequence) const override { return true; }
 };
@@ -1456,8 +1516,12 @@ class DummySignatureCreator final : public BaseSignatureCreator {
 private:
     char m_r_len = 32;
     char m_s_len = 32;
+    //! Only produce a PQ placeholder when the provider holds that key (so the leaf choice matches
+    //! what the real signer would do); otherwise assume every PQ leaf is signable.
+    bool m_require_pq_keys = false;
 public:
-    DummySignatureCreator(char r_len, char s_len) : m_r_len(r_len), m_s_len(s_len) {}
+    DummySignatureCreator(char r_len, char s_len, bool require_pq_keys = false)
+        : m_r_len(r_len), m_s_len(s_len), m_require_pq_keys(require_pq_keys) {}
     const BaseSignatureChecker& Checker() const override { return DUMMY_CHECKER; }
     bool CreateSig(const SigningProvider& provider, std::vector<unsigned char>& vchSig, const CKeyID& keyid, const CScript& scriptCode, SigVersion sigversion) const override
     {
@@ -1479,8 +1543,12 @@ public:
         sig.assign(64, '\000');
         return true;
     }
-    bool CreatePQSig(const SigningProvider&, std::vector<unsigned char>& sig, Span<const unsigned char>, PQAlgorithm algo, const uint256&, SigVersion) const override
+    bool CreatePQSig(const SigningProvider& provider, std::vector<unsigned char>& sig, Span<const unsigned char> pubkey, PQAlgorithm algo, const uint256&, SigVersion) const override
     {
+        if (m_require_pq_keys) {
+            const CPQKey* key = provider.GetPQKey(pubkey);
+            if (!key || !key->IsValid() || key->GetAlgorithm() != algo) return false;
+        }
         const size_t sig_size = GetPQSignatureSize(algo);
         sig.assign(sig_size, '\000');
         return true;
@@ -1491,6 +1559,7 @@ public:
 
 const BaseSignatureCreator& DUMMY_SIGNATURE_CREATOR = DummySignatureCreator(32, 32);
 const BaseSignatureCreator& DUMMY_MAXIMUM_SIGNATURE_CREATOR = DummySignatureCreator(33, 32);
+const BaseSignatureCreator& DUMMY_KEYED_SIGNATURE_CREATOR = DummySignatureCreator(32, 32, /*require_pq_keys=*/true);
 
 namespace {
 

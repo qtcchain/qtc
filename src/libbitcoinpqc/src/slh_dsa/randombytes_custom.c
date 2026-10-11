@@ -8,6 +8,8 @@
 
 #if defined(SPHINCSPLUS_VARIANT_SHAKE_A64)
 #include "../../sphincsplus/shake-a64/randombytes.h"
+#elif defined(SPHINCSPLUS_VARIANT_SHAKE_AVX2)
+#include "../../sphincsplus/shake-avx2/randombytes.h"
 #elif defined(SPHINCSPLUS_VARIANT_REF)
 #include "../../sphincsplus/ref/randombytes.h"
 #else
