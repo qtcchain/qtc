@@ -1953,6 +1953,9 @@ protected:
         };
 
         std::string ret = "mr(";
+        // Backup leaves render as a flat comma list (mr(k,l1,l2,...)); the parser accepts that
+        // form (see the compatibility loop in ParseScript) and wallet descriptor IDs hash this
+        // rendering, so it must stay byte-for-byte stable.
         for (size_t i = 0; i < m_leaf_specs.size(); ++i) {
             if (i) ret += ",";
             const auto& leaf = m_leaf_specs[i];
@@ -3635,6 +3638,14 @@ std::vector<std::unique_ptr<DescriptorImpl>> ParseScript(uint32_t& key_exp_index
             }
             const auto backup_arg = Expr(expr);
             if (!parse_backup_tree(parse_backup_tree, backup_arg, providers, leaf_specs, leaf_exprs)) return {};
+            // ToString renders additional backup leaves as a flat comma list (mr(k,l1,l2,...)),
+            // which is what wallets store; accept it (braces only group, they do not change
+            // the Merkle root, which is over the leaves in order).
+            while (expr.size() && expr[0] == ',') {
+                Const(",", expr);
+                const auto extra = Expr(expr);
+                if (!parse_backup_tree(parse_backup_tree, extra, providers, leaf_specs, leaf_exprs)) return {};
+            }
         }
         if (expr.size()) {
             error = strprintf("mr(): unexpected trailing token '%c'", expr[0]);
