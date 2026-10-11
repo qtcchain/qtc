@@ -125,7 +125,11 @@ Known issues
 Chain anchor
 ------------
 
-- FILL AT TAGGING: `nMinimumChainWork`, `defaultAssumeValid` (height, hash),
-  checkpoint and `chainTxData` from the manifest generated on the canonical
-  node (`scripts/update_chain_hardening_manifest.py`, applied with
-  `scripts/apply_chain_hardening_manifest.py`).
+- Generated on fleet node C (mainnet, genesis `d5f04a8a…eb24`) at 2026-10-11
+  23:49 UTC from tip 1825 and applied to `src/kernel/chainparams.cpp`:
+  - `defaultAssumeValid` and checkpoint: height **1823**,
+    `cfc093e05f14041b85c57e3648c4659b03a9971be78f12f50cc1cff1e0314d20`
+  - `nMinimumChainWork`: `0x17dcea32d6`
+  - `chainTxData`: 1826 transactions at time 1791762389, 0.00315 tx/s
+  Regenerate before tagging if the tag lands much later (the script needs
+  `--allow-low-anchor-height` while the chain is below height 50,000).
