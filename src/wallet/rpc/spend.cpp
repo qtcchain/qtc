@@ -1181,6 +1181,9 @@ static RPCHelpMan bumpfee_helper(std::string method_name)
                              "Cannot be provided if 'original_change_index' is specified.",
                         OutputsDoc(),
                         RPCArgOptions{.skip_type_check = true}},
+                    {"preferred_pq_algo", RPCArg::Type::STR, RPCArg::DefaultHint{"wallet default"},
+                        "Preferred post-quantum algorithm for selecting spend leaves in P2MR scripts. Valid values: \"ml_dsa_44\", \"slh_dsa_128s\".\n"
+                        "Sizes the replacement for that leaf and, for bumpfee, signs with it; for psbtbumpfee pass the same value to walletprocesspsbt."},
                     {"original_change_index", RPCArg::Type::NUM, RPCArg::DefaultHint{"not set, detect change automatically"}, "The 0-based index of the change output on the original transaction. "
                                                                                                                             "The indicated output will be recycled into the new change output on the bumped transaction. "
                                                                                                                             "The remainder after paying the recipients and fees will be sent to the output script of the "
@@ -1238,6 +1241,7 @@ static RPCHelpMan bumpfee_helper(std::string method_name)
                 {"estimate_mode", UniValueType(UniValue::VSTR)},
                 {"outputs", UniValueType()}, // will be checked by AddOutputs()
                 {"original_change_index", UniValueType(UniValue::VNUM)},
+                {"preferred_pq_algo", UniValueType(UniValue::VSTR)},
             },
             true, true);
 
@@ -1264,6 +1268,10 @@ static RPCHelpMan bumpfee_helper(std::string method_name)
 
         if (options.exists("original_change_index")) {
             original_change_index = options["original_change_index"].getInt<uint32_t>();
+        }
+
+        if (options.exists("preferred_pq_algo")) {
+            coin_control.m_preferred_pq_signing_algo = ParsePreferredPQSigningAlgo(options["preferred_pq_algo"]);
         }
     }
 
@@ -1315,7 +1323,7 @@ static RPCHelpMan bumpfee_helper(std::string method_name)
     // For bumpfee, return the new transaction id.
     // For psbtbumpfee, return the base64-encoded unsigned PSBT of the new transaction.
     if (!want_psbt) {
-        if (!feebumper::SignTransaction(*pwallet, mtx)) {
+        if (!feebumper::SignTransaction(*pwallet, mtx, coin_control.m_preferred_pq_signing_algo)) {
             if (pwallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
                 throw JSONRPCError(RPC_WALLET_ERROR, "Transaction incomplete. Try psbtbumpfee instead.");
             }

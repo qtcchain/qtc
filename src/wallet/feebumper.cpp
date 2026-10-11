@@ -328,7 +328,7 @@ Result CreateRateBumpTransaction(CWallet& wallet, const uint256& txid, const CCo
     return Result::OK;
 }
 
-bool SignTransaction(CWallet& wallet, CMutableTransaction& mtx) {
+bool SignTransaction(CWallet& wallet, CMutableTransaction& mtx, std::optional<PQAlgorithm> preferred_pq_signing_algo) {
     LOCK(wallet.cs_wallet);
 
     if (wallet.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
@@ -339,12 +339,12 @@ bool SignTransaction(CWallet& wallet, CMutableTransaction& mtx) {
         // so external signers are not asked to sign more than once.
         bool complete;
         wallet.FillPSBT(psbt_tx, complete, SIGHASH_ALL, false /* sign */, true /* bip32derivs */);
-        auto err{wallet.FillPSBT(psbt_tx, complete, SIGHASH_ALL, true /* sign */, false  /* bip32derivs */)};
+        auto err{wallet.FillPSBT(psbt_tx, complete, SIGHASH_ALL, true /* sign */, false  /* bip32derivs */, /*n_signed=*/nullptr, /*finalize=*/true, preferred_pq_signing_algo)};
         if (err) return false;
         complete = FinalizeAndExtractPSBT(psbt_tx, mtx, wallet.SlhdsaFips205ForNextBlock());
         return complete;
     } else {
-        return wallet.SignTransaction(mtx);
+        return wallet.SignTransaction(mtx, preferred_pq_signing_algo);
     }
 }
 
