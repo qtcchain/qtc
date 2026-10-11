@@ -71,6 +71,18 @@ Build
   which must run on CPUs without AVX2. See `doc/build-unix.md`.
 - `bench_qtc` gains `bench_mldsa_sign` and `bench_slhdsa_sign`.
 
+Also in this release
+--------------------
+
+- **`libbitcoinpqc`: SLH-DSA signing now uses its own entropy source.** The
+  SPHINCS+ sources and the Dilithium shim both defined `randombytes()`, and
+  link order gave SLH-DSA signing the ML-DSA shim, so the SLH-DSA wrapper's
+  seeded hedging was never used and the documented deterministic C API
+  (`random_data = NULL`) was not deterministic. The SPHINCS+ sources now call
+  `slh_dsa_randombytes()`. Wallet signatures are unchanged and still hedged
+  with fresh entropy; only the raw C API without caller entropy becomes
+  deterministic, and a unit test now checks that on every backend.
+
 Chain anchor
 ------------
 
