@@ -97,6 +97,8 @@ std::set<int> InterpretSubtractFeeFromOutputInstructions(const UniValue& sffo_in
     return sffo_set;
 }
 
+static std::optional<PQAlgorithm> ParsePreferredPQSigningAlgo(const UniValue& preferred_pq_algo);
+
 static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const UniValue& options, CMutableTransaction& rawTx)
 {
     if (!options.exists("locktime")) {
@@ -111,7 +113,9 @@ static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const 
     // so external signers are not asked to sign more than once.
     bool complete;
     pwallet->FillPSBT(psbt_tx, complete, SIGHASH_DEFAULT, /*sign=*/false, /*bip32derivs=*/true);
-    const auto err{pwallet->FillPSBT(psbt_tx, complete, SIGHASH_DEFAULT, /*sign=*/true, /*bip32derivs=*/false)};
+    // Sign the P2MR leaf the caller asked for (the fee was quoted for it).
+    const std::optional<PQAlgorithm> preferred_pq_algo{options.exists("preferred_pq_algo") ? ParsePreferredPQSigningAlgo(options["preferred_pq_algo"]) : std::nullopt};
+    const auto err{pwallet->FillPSBT(psbt_tx, complete, SIGHASH_DEFAULT, /*sign=*/true, /*bip32derivs=*/false, /*n_signed=*/nullptr, /*finalize=*/true, preferred_pq_algo)};
     if (err) {
         throw JSONRPCPSBTError(*err);
     }
@@ -1754,6 +1758,8 @@ RPCHelpMan walletprocesspsbt()
                                 RPCArgOptions{.also_positional = true}},
                             {"bip32derivs", RPCArg::Type::BOOL, RPCArg::Default{true}, "Include BIP 32 derivation paths for public keys if we know them", RPCArgOptions{.also_positional = true}},
                             {"finalize", RPCArg::Type::BOOL, RPCArg::Default{true}, "Also finalize inputs if possible", RPCArgOptions{.also_positional = true}},
+                            {"preferred_pq_algo", RPCArg::Type::STR, RPCArg::DefaultHint{"wallet default"},
+                                "Preferred post-quantum algorithm for selecting spend leaves in P2MR scripts. Valid values: \"ml_dsa_44\", \"slh_dsa_128s\"."},
                         },
                     RPCArgOptions{.oneline_description="options"}},
                     {"sighashtype", RPCArg::Type::STR, RPCArg::Default{"DEFAULT"}, "for backwards compatibility", RPCArgOptions{.hidden=true}},
@@ -1792,6 +1798,7 @@ RPCHelpMan walletprocesspsbt()
     bool sign = true;
     bool bip32derivs = true;
     bool finalize = true;
+    std::optional<PQAlgorithm> preferred_pq_algo;
     int nHashType = ParseSighashString(NullUniValue); // Use ParseSighashString default
     if (request.params[1].isBool() || request.params[1].isNull()) {
         // Old style positional parameters
@@ -1808,6 +1815,7 @@ RPCHelpMan walletprocesspsbt()
                 {"bip32derivs", UniValueType(UniValue::VBOOL)},
                 {"finalize", UniValueType(UniValue::VBOOL)},
                 {"sighashtype", UniValueType(UniValue::VSTR)},
+                {"preferred_pq_algo", UniValueType(UniValue::VSTR)},
             },
             true, true);
         if (options.exists("sign")) {
@@ -1822,6 +1830,9 @@ RPCHelpMan walletprocesspsbt()
         if (options.exists("sighashtype")) {
             nHashType = ParseSighashString(options["sighashtype"]);
         }
+        if (options.exists("preferred_pq_algo")) {
+            preferred_pq_algo = ParsePreferredPQSigningAlgo(options["preferred_pq_algo"]);
+        }
         if (request.params.size() > 2) {
             // Same behaviour as too many args passed normally
             throw std::runtime_error(self.ToString());
@@ -1833,7 +1844,7 @@ RPCHelpMan walletprocesspsbt()
 
     if (sign) EnsureWalletIsUnlocked(*pwallet);
 
-    const auto err{wallet.FillPSBT(psbt_tx, complete, nHashType, sign, bip32derivs, nullptr, finalize)};
+    const auto err{wallet.FillPSBT(psbt_tx, complete, nHashType, sign, bip32derivs, nullptr, finalize, preferred_pq_algo)};
     if (err) {
         throw JSONRPCPSBTError(*err);
     }

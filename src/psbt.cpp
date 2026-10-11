@@ -565,7 +565,7 @@ PrecomputedTransactionData PrecomputePSBTData(const PartiallySignedTransaction& 
     return txdata;
 }
 
-bool SignPSBTInput(const SigningProvider& provider, PartiallySignedTransaction& psbt, int index, const PrecomputedTransactionData* txdata, int sighash,  SignatureData* out_sigdata, bool finalize, bool slhdsa_fips205)
+bool SignPSBTInput(const SigningProvider& provider, PartiallySignedTransaction& psbt, int index, const PrecomputedTransactionData* txdata, int sighash,  SignatureData* out_sigdata, bool finalize, bool slhdsa_fips205, std::optional<PQAlgorithm> preferred_pq_signing_algo)
 {
     PSBTInput& input = psbt.inputs.at(index);
     const CMutableTransaction& tx = *psbt.tx;
@@ -577,6 +577,8 @@ bool SignPSBTInput(const SigningProvider& provider, PartiallySignedTransaction& 
     // Fill SignatureData with input info
     SignatureData sigdata;
     input.FillSignatureData(sigdata);
+    // P2MR leaf selection follows the caller's preferred algorithm (ML-DSA when unset).
+    sigdata.preferred_pq_signing_algo = preferred_pq_signing_algo;
 
     // Get UTXO
     bool require_witness_sig = false;

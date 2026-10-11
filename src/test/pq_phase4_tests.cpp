@@ -593,6 +593,58 @@ BOOST_AUTO_TEST_CASE(signp2mr_signs_only_the_preferred_leaf)
     BOOST_CHECK(!ProduceSignature(no_keys, DUMMY_KEYED_SIGNATURE_CREATOR, spk, none));
 }
 
+// SignPSBTInput picks the P2MR leaf the caller prefers, so the PSBT-based RPCs (send,
+// walletprocesspsbt) sign the leaf the fee was quoted for.
+BOOST_AUTO_TEST_CASE(psbt_sign_honours_preferred_pq_algo)
+{
+    CPQKey ml_key;
+    ml_key.MakeNewKey(PQAlgorithm::ML_DSA_44);
+    BOOST_REQUIRE(ml_key.IsValid());
+    CPQKey slh_key;
+    slh_key.MakeNewKey(PQAlgorithm::SLH_DSA_128S);
+    BOOST_REQUIRE(slh_key.IsValid());
+
+    const std::vector<unsigned char> ml_leaf_script = BuildP2MRScript(PQAlgorithm::ML_DSA_44, ml_key.GetPubKey());
+    const std::vector<unsigned char> slh_leaf_script = BuildP2MRScript(PQAlgorithm::SLH_DSA_128S, slh_key.GetPubKey());
+    const uint256 ml_leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION, ml_leaf_script);
+    const uint256 slh_leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION, slh_leaf_script);
+    const uint256 merkle_root = ComputeP2MRMerkleRoot({ml_leaf_hash, slh_leaf_hash});
+
+    const CMutableTransaction tx_credit = BuildCreditingTransaction(BuildP2MROutput(merkle_root), /*nValue=*/5'000);
+    const CMutableTransaction tx_spend = BuildSpendingTransaction(CScript{}, CScriptWitness{}, CTransaction{tx_credit});
+
+    FlatSigningProvider provider;
+    P2MRSpendData spenddata;
+    std::vector<unsigned char> ml_control{P2MR_LEAF_VERSION};
+    ml_control.insert(ml_control.end(), slh_leaf_hash.begin(), slh_leaf_hash.end());
+    spenddata.scripts[ml_leaf_script].insert(ml_control);
+    std::vector<unsigned char> slh_control{P2MR_LEAF_VERSION};
+    slh_control.insert(slh_control.end(), ml_leaf_hash.begin(), ml_leaf_hash.end());
+    spenddata.scripts[slh_leaf_script].insert(slh_control);
+    provider.p2mr_spends[WitnessV2P2MR{merkle_root}] = spenddata;
+    provider.pq_keys[ml_key.GetPubKey()] = ml_key;
+    provider.pq_keys[slh_key.GetPubKey()] = slh_key;
+
+    PartiallySignedTransaction psbt_base{tx_spend};
+    psbt_base.inputs.at(0).witness_utxo = tx_credit.vout.at(0);
+    const PrecomputedTransactionData txdata = PrecomputePSBTData(psbt_base);
+
+    PartiallySignedTransaction psbt_default = psbt_base;
+    BOOST_REQUIRE(SignPSBTInput(provider, psbt_default, /*index=*/0, &txdata, SIGHASH_DEFAULT, nullptr, /*finalize=*/true));
+    const auto& default_stack = psbt_default.inputs.at(0).final_script_witness.stack;
+    BOOST_REQUIRE_EQUAL(default_stack.size(), 3U);
+    BOOST_CHECK(default_stack[1] == ml_leaf_script);
+    BOOST_CHECK_EQUAL(default_stack[0].size(), MLDSA44_SIGNATURE_SIZE);
+
+    PartiallySignedTransaction psbt_slh = psbt_base;
+    BOOST_REQUIRE(SignPSBTInput(provider, psbt_slh, /*index=*/0, &txdata, SIGHASH_DEFAULT, nullptr, /*finalize=*/true,
+                                /*slhdsa_fips205=*/false, PQAlgorithm::SLH_DSA_128S));
+    const auto& slh_stack = psbt_slh.inputs.at(0).final_script_witness.stack;
+    BOOST_REQUIRE_EQUAL(slh_stack.size(), 3U);
+    BOOST_CHECK(slh_stack[1] == slh_leaf_script);
+    BOOST_CHECK_EQUAL(slh_stack[0].size(), SLHDSA128S_SIGNATURE_SIZE);
+}
+
 BOOST_AUTO_TEST_CASE(psbt_multisig_p2mr_partial_combine_finalize)
 {
     CPQKey key1;
