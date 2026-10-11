@@ -1043,6 +1043,9 @@ RPCHelpMan signrawtransactionwithwallet()
             "       \"ALL|ANYONECANPAY\"\n"
             "       \"NONE|ANYONECANPAY\"\n"
             "       \"SINGLE|ANYONECANPAY\""},
+                    {"preferred_pq_algo", RPCArg::Type::STR, RPCArg::DefaultHint{"wallet default"},
+                        "Preferred post-quantum algorithm for selecting spend leaves in P2MR scripts. Valid values: \"ml_dsa_44\", \"slh_dsa_128s\".\n"
+                        "Pass the value given to fundrawtransaction so the signature matches the quoted fee."},
                 },
                 RPCResult{
                     RPCResult::Type::OBJ, "", "",
@@ -1097,12 +1100,13 @@ RPCHelpMan signrawtransactionwithwallet()
     ParsePrevouts(request.params[1], nullptr, coins);
 
     int nHashType = ParseSighashString(request.params[2]);
+    const std::optional<PQAlgorithm> preferred_pq_algo = ParsePreferredPQSigningAlgo(request.params[3]);
 
     // Script verification errors
     std::map<int, bilingual_str> input_errors;
     std::optional<CAmount> inputs_amount_sum;
 
-    bool complete = pwallet->SignTransaction(mtx, coins, nHashType, input_errors, &inputs_amount_sum);
+    bool complete = pwallet->SignTransaction(mtx, coins, nHashType, input_errors, &inputs_amount_sum, preferred_pq_algo);
     UniValue result(UniValue::VOBJ);
     SignTransactionResultToJSON(mtx, complete, coins, input_errors, result, inputs_amount_sum);
     return result;
