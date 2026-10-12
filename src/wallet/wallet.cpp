@@ -3100,11 +3100,13 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
     // keys may only be derivable from another descriptor (a solo descriptor,
     // or the HD descriptor that generated the key). Build a combined provider
     // by merging p2mr_spends from the descriptor that owns each coin's script
-    // with the leaf keys looked up across ALL descriptors. The lookup covers
-    // every leaf key the merged provider lacks, not only the case where it
-    // holds no PQ key at all: a transaction that also spends an HD coin
-    // already contributes that coin's key, which used to skip the lookup and
-    // leave the fixed-key input unsigned (#20).
+    // with the leaf keys looked up across ALL descriptors, and retry with that
+    // combined provider whenever it holds spend data and at least one PQ key.
+    // The retry used to run only when no descriptor had contributed a key at
+    // all: a transaction that also spends an HD coin already carries that
+    // coin's key (possibly the very key the fixed-key leaf needs), so the
+    // combined provider was never tried and the fixed-key input stayed
+    // unsigned (#20).
     {
         FlatSigningProvider merged;
         bool have_p2mr_spends{false};
@@ -3141,7 +3143,6 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
                     }
                 }
             }
-            bool added_keys{false};
             for (const auto& pq_pub : pq_pubkeys_needed) {
                 for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
                     auto* desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man);
@@ -3149,12 +3150,11 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
                     auto pq_keys = desc_spk_man->GetSigningProvider(Span<const unsigned char>{pq_pub});
                     if (pq_keys && !pq_keys->pq_keys.empty()) {
                         merged.Merge(std::move(*pq_keys));
-                        added_keys = true;
                         break;
                     }
                 }
             }
-            if (added_keys) {
+            if (!merged.pq_keys.empty()) {
                 input_errors.clear();
                 if (::SignTransaction(tx, &merged, coins, sighash, input_errors, inputs_amount_sum, preferred_pq_signing_algo, slhdsa_fips205)) {
                     return true;
