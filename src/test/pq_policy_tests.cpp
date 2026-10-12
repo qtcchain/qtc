@@ -574,6 +574,64 @@ BOOST_AUTO_TEST_CASE(p2mr_ctv_only_witness_is_standard)
     BOOST_CHECK(IsWitnessStandard(CTransaction{tx_spend}, coins_cache, "", reason));
 }
 
+namespace {
+// Data envelope prefix: OP_0 OP_IF <push>... OP_ENDIF (never executed; inert data for consensus).
+std::vector<unsigned char> WrapInDataEnvelope(const std::vector<std::vector<unsigned char>>& pushes, const std::vector<unsigned char>& tail)
+{
+    CScript envelope;
+    envelope << OP_0 << OP_IF;
+    for (const auto& p : pushes) envelope << p;
+    envelope << OP_ENDIF;
+    std::vector<unsigned char> script(envelope.begin(), envelope.end());
+    script.insert(script.end(), tail.begin(), tail.end());
+    return script;
+}
+
+bool P2MRLeafSpendIsStandard(const std::vector<unsigned char>& leaf_script, std::string& reason)
+{
+    const uint256 leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION, leaf_script);
+    const uint256 merkle_root = ComputeP2MRMerkleRoot({leaf_hash});
+    const CMutableTransaction tx_credit = BuildCreditingTransaction(BuildP2MROutput(merkle_root), /*nValue=*/50'000);
+    CMutableTransaction tx_spend = BuildSpendingTransaction(CScript{}, CScriptWitness{}, CTransaction{tx_credit});
+    tx_spend.vin.at(0).scriptWitness.stack = {leaf_script, {P2MR_LEAF_VERSION}};
+    CCoinsView coins_view;
+    CCoinsViewCache coins_cache(&coins_view);
+    AddCoins(coins_cache, CTransaction{tx_credit}, /*nHeight=*/0);
+    return IsWitnessStandard(CTransaction{tx_spend}, coins_cache, "", reason);
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(p2mr_data_envelope_ctv_only_witness_is_standard)
+{
+    // The QTC-EVM data carrier: OP_0 OP_IF <idx> <count> <data> OP_ENDIF <hash> OP_CTV, spent key-less.
+    const std::vector<unsigned char> data(9'900, 0xab);
+    const auto leaf_script = WrapInDataEnvelope({{0x00, 0x00}, {0x00, 0x01}, data}, BuildCTVOnlyLeafScript(uint256::ONE));
+    BOOST_REQUIRE_LT(leaf_script.size(), 11'000U);
+    std::string reason;
+    BOOST_CHECK_MESSAGE(P2MRLeafSpendIsStandard(leaf_script, reason), reason);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_data_envelope_with_opcode_body_is_nonstandard)
+{
+    // Only pushes may appear inside the envelope.
+    CScript body;
+    body << OP_0 << OP_IF << std::vector<unsigned char>{0x01} << OP_1 << OP_ENDIF;
+    std::vector<unsigned char> leaf_script(body.begin(), body.end());
+    const auto tail = BuildCTVOnlyLeafScript(uint256::ONE);
+    leaf_script.insert(leaf_script.end(), tail.begin(), tail.end());
+    std::string reason;
+    BOOST_CHECK(!P2MRLeafSpendIsStandard(leaf_script, reason));
+    BOOST_CHECK_EQUAL(reason, "p2mr-leaf-script");
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_data_envelope_without_tail_is_nonstandard)
+{
+    const auto leaf_script = WrapInDataEnvelope({{0x01, 0x02}}, {});
+    std::string reason;
+    BOOST_CHECK(!P2MRLeafSpendIsStandard(leaf_script, reason));
+    BOOST_CHECK_EQUAL(reason, "p2mr-leaf-script");
+}
+
 BOOST_AUTO_TEST_CASE(p2mr_ctv_checksig_mldsa_witness_is_standard)
 {
     CPQKey spend_key;
