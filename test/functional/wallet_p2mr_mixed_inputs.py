@@ -9,6 +9,8 @@ descriptor. The raw signing path must combine the two for every input, in either
 order, and the result must be accepted by the mempool.
 """
 
+from decimal import Decimal
+
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_greater_than
 
@@ -45,10 +47,12 @@ class WalletP2MRMixedInputsTest(BitcoinTestFramework):
         hd = [u for u in w.listunspent() if u["txid"] != fixed_txid and u["amount"] >= 1][0]
         fixed_in = {"txid": fixed_txid, "vout": fixed_vout}
         hd_in = {"txid": hd["txid"], "vout": hd["vout"]}
+        # Spend both coins minus a fee that stays under the mempool's default fee-rate cap.
+        output_amount = Decimal("0.001") + hd["amount"] - Decimal("0.001")
 
         for order_name, inputs in (("fixed-key first", [fixed_in, hd_in]), ("HD first", [hd_in, fixed_in])):
             self.log.info(f"Sign the mixed transaction with the raw path, {order_name}")
-            raw = node.createrawtransaction(inputs, {addr: 0.5})
+            raw = node.createrawtransaction(inputs, {addr: output_amount})
             signed = w.signrawtransactionwithwallet(raw)
             assert_equal(signed.get("errors", []), [])
             assert_equal(signed["complete"], True)
