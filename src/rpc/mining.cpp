@@ -115,7 +115,9 @@ static int64_t DefaultMinSyncedOutboundPeersForMiningTemplate(const CChainParams
 
 static int64_t DefaultMaxPeerSyncHeightLagForMiningTemplate(const CChainParams& params)
 {
-    return params.GetChainType() == ChainType::MAIN ? 1 : 0;
+    // Three blocks of slack: one block was below normal relay jitter at the
+    // mainnet block spacing and starved a well-connected miner (issue #15).
+    return params.GetChainType() == ChainType::MAIN ? 3 : 0;
 }
 
 struct OutboundPeerDiagnostic
@@ -127,11 +129,13 @@ struct OutboundPeerDiagnostic
     int common_height{-1};
     int presync_height{-1};
     int starting_height{-1};
+    int relayed_height{-1};
     int sync_lag{-1};
     int64_t last_block_time{0};
     int64_t last_block_announcement{0};
     bool counts_as_synced_outbound{false};
     bool synced_by_starting_height{false};
+    bool synced_by_relay{false};
 };
 
 struct ChainTipStatusSummary
@@ -172,6 +176,7 @@ struct OutboundPeerDiagnosticsSummary
     size_t manual_outbound_peers{0};
     size_t outbound_peers_missing_sync_height{0};
     size_t outbound_peers_synced_by_starting_height{0};
+    size_t outbound_peers_synced_by_relay{0};
     size_t outbound_peers_beyond_sync_lag{0};
     size_t recent_block_announcing_outbound_peers{0};
     std::vector<OutboundPeerDiagnostic> peers;
@@ -215,6 +220,7 @@ static OutboundPeerDiagnosticsSummary CollectOutboundPeerDiagnostics(
                 diag.sync_height = statestats.nSyncHeight;
                 diag.common_height = statestats.nCommonHeight;
                 diag.presync_height = statestats.presync_height;
+                diag.relayed_height = std::max(statestats.m_best_header_sent_height, statestats.m_best_block_served_height);
                 diag.last_block_announcement =
                     TicksSinceEpoch<std::chrono::seconds>(statestats.m_last_block_announcement);
             }
@@ -224,18 +230,27 @@ static OutboundPeerDiagnosticsSummary CollectOutboundPeerDiagnostics(
             ++summary.recent_block_announcing_outbound_peers;
         }
 
-        const MiningPeerSyncStatus sync_status = ClassifyMiningPeerSync(
-            active_tip_height, max_peer_sync_height_lag, diag.sync_height, diag.starting_height);
+        MiningPeerSyncSignals signals;
+        signals.sync_height = diag.sync_height;
+        signals.relayed_height = diag.relayed_height;
+        signals.starting_height = diag.starting_height;
+        const MiningPeerSyncStatus sync_status =
+            ClassifyMiningPeerSync(active_tip_height, max_peer_sync_height_lag, signals);
         diag.sync_lag = sync_status.sync_lag;
         diag.counts_as_synced_outbound = sync_status.counts_as_synced;
         diag.synced_by_starting_height =
             sync_status.source == MiningPeerHeightSource::STARTING_HEIGHT && sync_status.counts_as_synced;
+        diag.synced_by_relay =
+            sync_status.source == MiningPeerHeightSource::RELAYED && sync_status.counts_as_synced;
 
         if (diag.sync_height < 0) {
             ++summary.outbound_peers_missing_sync_height;
         }
         if (diag.synced_by_starting_height) {
             ++summary.outbound_peers_synced_by_starting_height;
+        }
+        if (diag.synced_by_relay) {
+            ++summary.outbound_peers_synced_by_relay;
         }
         if (diag.counts_as_synced_outbound) {
             ++summary.synced_outbound_peers;
@@ -252,25 +267,66 @@ static OutboundPeerDiagnosticsSummary CollectOutboundPeerDiagnostics(
 MiningPeerSyncStatus ClassifyMiningPeerSync(
     const int active_tip_height,
     const int64_t max_peer_sync_height_lag,
-    const int sync_height,
-    const int starting_height)
+    const MiningPeerSyncSignals& signals)
 {
     MiningPeerSyncStatus status;
-    if (sync_height >= 0) {
-        status.source = MiningPeerHeightSource::SYNC_HEIGHT;
-        status.sync_lag = std::max<int>(0, active_tip_height - sync_height);
-    } else if (starting_height >= 0) {
-        // No header, inv or block from this peer yet (genesis, or a peer that
+    int height{-1};
+    if (signals.sync_height >= 0 || signals.relayed_height >= 0) {
+        // Whichever is higher: what the peer announced to us, or what we
+        // relayed to it. A peer never announces a block back to the node it
+        // got it from, so a miner that usually relays first would otherwise
+        // see every outbound peer as stale (issue #15).
+        if (signals.relayed_height > signals.sync_height) {
+            status.source = MiningPeerHeightSource::RELAYED;
+            height = signals.relayed_height;
+        } else {
+            status.source = MiningPeerHeightSource::SYNC_HEIGHT;
+            height = signals.sync_height;
+        }
+    } else if (signals.starting_height >= 0) {
+        // Nothing exchanged with this peer yet (genesis, or a peer that
         // connected while the network was idle): the handshake height is the
         // only signal we have. It is self-reported, so it is only ever used
-        // while the stronger signal is absent.
+        // while the stronger signals are absent.
         status.source = MiningPeerHeightSource::STARTING_HEIGHT;
-        status.sync_lag = std::max<int>(0, active_tip_height - starting_height);
+        height = signals.starting_height;
     } else {
         return status;
     }
+    status.sync_lag = std::max<int>(0, active_tip_height - height);
     status.counts_as_synced = status.sync_lag <= max_peer_sync_height_lag;
     return status;
+}
+
+namespace {
+Mutex g_mining_readiness_log_mutex;
+//! Message of the refusal currently in force (empty while templates are served).
+std::string g_mining_readiness_last_refusal GUARDED_BY(g_mining_readiness_log_mutex);
+//! Refusals seen since the state last changed.
+uint64_t g_mining_readiness_refusals GUARDED_BY(g_mining_readiness_log_mutex){0};
+} // namespace
+
+/**
+ * Log readiness transitions once, not once per refused getblocktemplate call:
+ * a miner polling every few seconds otherwise fills debug.log with the same
+ * line (issue #15 saw ~30k identical lines in a day).
+ */
+static void LogMiningTemplateReadinessTransition(const std::optional<MiningTemplateRefusal>& refusal)
+{
+    LOCK(g_mining_readiness_log_mutex);
+    const std::string state = refusal ? refusal->message : std::string{};
+    if (state == g_mining_readiness_last_refusal) {
+        if (refusal) ++g_mining_readiness_refusals;
+        return;
+    }
+    if (refusal) {
+        LogWarning("getblocktemplate: refusing work until the node is ready: %s\n", refusal->message);
+    } else {
+        LogInfo("getblocktemplate: serving work again after %u refusals (%s)\n",
+                static_cast<unsigned>(g_mining_readiness_refusals), g_mining_readiness_last_refusal);
+    }
+    g_mining_readiness_last_refusal = state;
+    g_mining_readiness_refusals = refusal ? 1 : 0;
 }
 
 std::optional<MiningTemplateRefusal> CheckMiningTemplateReadiness(
@@ -372,7 +428,9 @@ static void EnforceMiningTemplateReadiness(
             policy.max_peer_sync_height_lag).synced_outbound_peers;
     }
 
-    if (const auto refusal = CheckMiningTemplateReadiness(policy, observation)) {
+    const auto refusal = CheckMiningTemplateReadiness(policy, observation);
+    LogMiningTemplateReadinessTransition(refusal);
+    if (refusal) {
         throw JSONRPCError(refusal->code, refusal->message);
     }
 }
@@ -1178,6 +1236,9 @@ static UniValue BuildPropagationProxyProfile(
         "outbound_peers_synced_by_starting_height",
         static_cast<uint64_t>(outbound_diag.outbound_peers_synced_by_starting_height));
     obj.pushKV(
+        "outbound_peers_synced_by_relay",
+        static_cast<uint64_t>(outbound_diag.outbound_peers_synced_by_relay));
+    obj.pushKV(
         "outbound_peers_beyond_sync_lag",
         static_cast<uint64_t>(outbound_diag.outbound_peers_beyond_sync_lag));
     obj.pushKV(
@@ -1200,11 +1261,13 @@ static UniValue BuildPropagationProxyProfile(
         detail.pushKV("common_height", peer.common_height);
         detail.pushKV("presync_height", peer.presync_height);
         detail.pushKV("starting_height", peer.starting_height);
+        detail.pushKV("relayed_height", peer.relayed_height);
         detail.pushKV("sync_lag", peer.sync_lag);
         detail.pushKV("last_block_time", peer.last_block_time);
         detail.pushKV("last_block_announcement", peer.last_block_announcement);
         detail.pushKV("counts_as_synced_outbound", peer.counts_as_synced_outbound);
         detail.pushKV("synced_by_starting_height", peer.synced_by_starting_height);
+        detail.pushKV("synced_by_relay", peer.synced_by_relay);
         peer_details.push_back(std::move(detail));
     }
     obj.pushKV("outbound_peer_diagnostics", std::move(peer_details));
@@ -5616,6 +5679,7 @@ static RPCHelpMan getdifficultyhealth()
                             {RPCResult::Type::NUM, "manual_outbound_peers", "Outbound peers opened with manual connection policy"},
                             {RPCResult::Type::NUM, "outbound_peers_missing_sync_height", "Outbound peers lacking a reported sync height from net_processing state"},
                             {RPCResult::Type::NUM, "outbound_peers_synced_by_starting_height", "Outbound peers counted as synced from their version-handshake starting height because no header has been exchanged yet (genesis or idle network)"},
+                            {RPCResult::Type::NUM, "outbound_peers_synced_by_relay", "Outbound peers counted as synced because this node relayed its tip to them (a peer never announces a block back to the node it received it from)"},
                             {RPCResult::Type::NUM, "outbound_peers_beyond_sync_lag", "Outbound peers whose reported sync height exceeds the configured lag threshold"},
                             {RPCResult::Type::NUM, "recent_block_announcing_outbound_peers", "Outbound peers that have announced at least one block since this process started"},
                             {RPCResult::Type::NUM, "validated_tip_height", "Current validated tip height"},
@@ -5634,11 +5698,13 @@ static RPCHelpMan getdifficultyhealth()
                                     {RPCResult::Type::NUM, "common_height", "Best last-common-block height reported for the peer, or -1 if unavailable"},
                                     {RPCResult::Type::NUM, "presync_height", "Presync header height reported for the peer, or -1 if unavailable"},
                                     {RPCResult::Type::NUM, "starting_height", "Peer starting height from version handshake"},
-                                    {RPCResult::Type::NUM, "sync_lag", "Local validated tip height minus peer sync height (or starting height when no sync height is known), or -1 if unavailable"},
+                                    {RPCResult::Type::NUM, "relayed_height", "Height of the best header this node announced to the peer or block the peer fetched from it, or -1"},
+                                    {RPCResult::Type::NUM, "sync_lag", "Local validated tip height minus the higher of the peer sync height and relayed height (or the starting height when neither is known), or -1 if unavailable"},
                                     {RPCResult::Type::NUM, "last_block_time", "Unix timestamp of the last block relay observed on the connection"},
                                     {RPCResult::Type::NUM, "last_block_announcement", "Unix timestamp of the last block announcement attributed to the peer"},
                                     {RPCResult::Type::BOOL, "counts_as_synced_outbound", "Whether this peer satisfies the synced-outbound readiness rule"},
                                     {RPCResult::Type::BOOL, "synced_by_starting_height", "Whether the peer counted as synced from its starting height because no sync height is known yet"},
+                                    {RPCResult::Type::BOOL, "synced_by_relay", "Whether the peer counted as synced because this node relayed the tip to it"},
                                 }},
                             }},
                         }},
@@ -6048,6 +6114,7 @@ static RPCHelpMan getmatmulchallenge()
                                     {RPCResult::Type::NUM, "manual_outbound_peers", "Outbound peers opened with manual connection policy"},
                                     {RPCResult::Type::NUM, "outbound_peers_missing_sync_height", "Outbound peers lacking a reported sync height from net_processing state"},
                                     {RPCResult::Type::NUM, "outbound_peers_synced_by_starting_height", "Outbound peers counted as synced from their version-handshake starting height because no header has been exchanged yet (genesis or idle network)"},
+                                    {RPCResult::Type::NUM, "outbound_peers_synced_by_relay", "Outbound peers counted as synced because this node relayed its tip to them (a peer never announces a block back to the node it received it from)"},
                                     {RPCResult::Type::NUM, "outbound_peers_beyond_sync_lag", "Outbound peers whose reported sync height exceeds the configured lag threshold"},
                                     {RPCResult::Type::NUM, "recent_block_announcing_outbound_peers", "Outbound peers that have announced at least one block since this process started"},
                                     {RPCResult::Type::NUM, "validated_tip_height", "Current validated tip height"},
@@ -6066,11 +6133,13 @@ static RPCHelpMan getmatmulchallenge()
                                             {RPCResult::Type::NUM, "common_height", "Best last-common-block height reported for the peer, or -1 if unavailable"},
                                             {RPCResult::Type::NUM, "presync_height", "Presync header height reported for the peer, or -1 if unavailable"},
                                             {RPCResult::Type::NUM, "starting_height", "Peer starting height from version handshake"},
-                                            {RPCResult::Type::NUM, "sync_lag", "Local validated tip height minus peer sync height (or starting height when no sync height is known), or -1 if unavailable"},
+                                            {RPCResult::Type::NUM, "relayed_height", "Height of the best header this node announced to the peer or block the peer fetched from it, or -1"},
+                                            {RPCResult::Type::NUM, "sync_lag", "Local validated tip height minus the higher of the peer sync height and relayed height (or the starting height when neither is known), or -1 if unavailable"},
                                             {RPCResult::Type::NUM, "last_block_time", "Unix timestamp of the last block relay observed on the connection"},
                                             {RPCResult::Type::NUM, "last_block_announcement", "Unix timestamp of the last block announcement attributed to the peer"},
                                             {RPCResult::Type::BOOL, "counts_as_synced_outbound", "Whether this peer satisfies the synced-outbound readiness rule"},
                                             {RPCResult::Type::BOOL, "synced_by_starting_height", "Whether the peer counted as synced from its starting height because no sync height is known yet"},
+                                            {RPCResult::Type::BOOL, "synced_by_relay", "Whether the peer counted as synced because this node relayed the tip to it"},
                                         }},
                                     }},
                                 }},
@@ -6378,6 +6447,7 @@ static RPCHelpMan getmatmulchallengeprofile()
                                     {RPCResult::Type::NUM, "manual_outbound_peers", "Outbound peers opened with manual connection policy"},
                                     {RPCResult::Type::NUM, "outbound_peers_missing_sync_height", "Outbound peers lacking a reported sync height from net_processing state"},
                                     {RPCResult::Type::NUM, "outbound_peers_synced_by_starting_height", "Outbound peers counted as synced from their version-handshake starting height because no header has been exchanged yet (genesis or idle network)"},
+                                    {RPCResult::Type::NUM, "outbound_peers_synced_by_relay", "Outbound peers counted as synced because this node relayed its tip to them (a peer never announces a block back to the node it received it from)"},
                                     {RPCResult::Type::NUM, "outbound_peers_beyond_sync_lag", "Outbound peers whose reported sync height exceeds the configured lag threshold"},
                                     {RPCResult::Type::NUM, "recent_block_announcing_outbound_peers", "Outbound peers that have announced at least one block since this process started"},
                                     {RPCResult::Type::NUM, "validated_tip_height", "Current validated tip height"},
@@ -6396,11 +6466,13 @@ static RPCHelpMan getmatmulchallengeprofile()
                                             {RPCResult::Type::NUM, "common_height", "Best last-common-block height reported for the peer, or -1 if unavailable"},
                                             {RPCResult::Type::NUM, "presync_height", "Presync header height reported for the peer, or -1 if unavailable"},
                                             {RPCResult::Type::NUM, "starting_height", "Peer starting height from version handshake"},
-                                            {RPCResult::Type::NUM, "sync_lag", "Local validated tip height minus peer sync height (or starting height when no sync height is known), or -1 if unavailable"},
+                                            {RPCResult::Type::NUM, "relayed_height", "Height of the best header this node announced to the peer or block the peer fetched from it, or -1"},
+                                            {RPCResult::Type::NUM, "sync_lag", "Local validated tip height minus the higher of the peer sync height and relayed height (or the starting height when neither is known), or -1 if unavailable"},
                                             {RPCResult::Type::NUM, "last_block_time", "Unix timestamp of the last block relay observed on the connection"},
                                             {RPCResult::Type::NUM, "last_block_announcement", "Unix timestamp of the last block announcement attributed to the peer"},
                                             {RPCResult::Type::BOOL, "counts_as_synced_outbound", "Whether this peer satisfies the synced-outbound readiness rule"},
                                             {RPCResult::Type::BOOL, "synced_by_starting_height", "Whether the peer counted as synced from its starting height because no sync height is known yet"},
+                                            {RPCResult::Type::BOOL, "synced_by_relay", "Whether the peer counted as synced because this node relayed the tip to it"},
                                         }},
                                     }},
                                 }},
