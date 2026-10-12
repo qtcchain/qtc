@@ -329,8 +329,30 @@ bool ParsePolicyCSVPrefix(Span<const unsigned char> leaf_script, size_t& consume
     return ParsePolicyTimelockPrefix(leaf_script, OP_CHECKSEQUENCEVERIFY, consumed);
 }
 
+bool StripP2MRDataEnvelope(Span<const unsigned char>& leaf_script)
+{
+    // Data envelope: OP_0 OP_IF <push> ... <push> OP_ENDIF, never executed (OP_IF on an empty
+    // element skips its body), so consensus treats the pushes as inert data. The remainder of
+    // the leaf is classified as usual. Only pushes are allowed inside the body.
+    if (leaf_script.size() < 3 || leaf_script[0] != OP_0 || leaf_script[1] != OP_IF) return false;
+    const CScript script(leaf_script.begin(), leaf_script.end());
+    CScript::const_iterator pc = script.begin() + 2;
+    opcodetype opcode;
+    std::vector<unsigned char> push;
+    while (pc < script.end()) {
+        if (!script.GetOp(pc, opcode, push)) return false;
+        if (opcode == OP_ENDIF) {
+            leaf_script = leaf_script.subspan(pc - script.begin());
+            return !leaf_script.empty();
+        }
+        if (opcode > OP_PUSHDATA4) return false;
+    }
+    return false;
+}
+
 P2MRLeafType ParsePolicyP2MRLeafScript(Span<const unsigned char> leaf_script)
 {
+    StripP2MRDataEnvelope(leaf_script);
     for (const PQAlgorithm algo : GetSupportedPQAlgorithms()) {
         if (IsPolicyChecksigLeaf(leaf_script, algo)) {
             return ChecksigLeafTypeForAlgo(algo);
@@ -902,7 +924,9 @@ bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs,
                 return false;
             }
             const std::vector<unsigned char>& control_block = stack.back();
-            const std::vector<unsigned char>& leaf_script = stack[stack.size() - 2];
+            // The leaf is classified without its optional data envelope (see StripP2MRDataEnvelope).
+            Span<const unsigned char> leaf_script{stack[stack.size() - 2]};
+            StripP2MRDataEnvelope(leaf_script);
             if (control_block.size() < P2MR_CONTROL_BASE_SIZE ||
                 control_block.size() > P2MR_CONTROL_MAX_SIZE ||
                 ((control_block.size() - P2MR_CONTROL_BASE_SIZE) % P2MR_CONTROL_NODE_SIZE) != 0) {

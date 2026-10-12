@@ -1179,6 +1179,39 @@ BOOST_AUTO_TEST_CASE(descriptor_parses_pq_multisig_leaf)
     BOOST_CHECK(scripts[0] == expected_spk);
 }
 
+BOOST_AUTO_TEST_CASE(descriptor_mr_flat_backup_leaves_round_trip)
+{
+    // ToString renders extra backup leaves as a flat list; the parser must accept that form
+    // and it must denote the same tree as the braced form (braces only group).
+    const std::vector<unsigned char> k(MLDSA44_PUBKEY_SIZE, 0x11);
+    const std::vector<unsigned char> f1(MLDSA44_PUBKEY_SIZE, 0x22);
+    const std::vector<unsigned char> f2(MLDSA44_PUBKEY_SIZE, 0x33);
+    const std::string leaves = "multi_pq(2," + HexStr(f1) + "," + HexStr(f2) + "),csv_multi_pq(144,1," + HexStr(f1) + "," + HexStr(f2) + ")";
+    const std::string braced = "mr(" + HexStr(k) + ",{" + leaves + "})";
+    const std::string flat = "mr(" + HexStr(k) + "," + leaves + ")";
+
+    auto expand = [](const std::string& desc, std::string& rendered) {
+        FlatSigningProvider provider;
+        std::string error;
+        auto parsed = Parse(AddChecksum(desc), provider, error, /*require_checksum=*/true);
+        BOOST_REQUIRE_MESSAGE(!parsed.empty(), error);
+        std::vector<CScript> scripts;
+        FlatSigningProvider out;
+        BOOST_REQUIRE(parsed[0]->Expand(/*pos=*/0, DUMMY_SIGNING_PROVIDER, scripts, out));
+        BOOST_REQUIRE_EQUAL(scripts.size(), 1U);
+        rendered = parsed[0]->ToString();
+        return scripts[0];
+    };
+    std::string rendered_braced, rendered_flat, rendered_again;
+    const CScript spk_braced = expand(braced, rendered_braced);
+    const CScript spk_flat = expand(flat, rendered_flat);
+    BOOST_CHECK(spk_braced == spk_flat);
+    BOOST_CHECK_EQUAL(rendered_braced, rendered_flat);
+    // What a wallet stores (the rendering) parses back to the same script.
+    const CScript spk_again = expand(rendered_braced.substr(0, rendered_braced.find('#')), rendered_again);
+    BOOST_CHECK(spk_again == spk_braced);
+}
+
 BOOST_AUTO_TEST_CASE(tr_descriptor_scriptpath_estimation_not_keypath_only)
 {
     FlatSigningProvider provider;
