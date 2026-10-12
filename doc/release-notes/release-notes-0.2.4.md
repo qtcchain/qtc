@@ -1,7 +1,10 @@
-QTC version 0.2.3
+QTC version 0.2.4
 =================
 
-Tag `v0.2.3`. Wallet performance, mining readiness, RPC and relay-policy
+Tag `v0.2.4`. Supersedes `v0.2.3`, which was tagged on 12 October 2026 but
+never published: its testnet soak showed the mining-readiness fix below was
+blind in the very topology it targets (see "Mining readiness"), so no
+binaries were released for it. Wallet performance, mining readiness, RPC and relay-policy
 update. No consensus rule changes: blocks are valid or invalid exactly as before, and v0.2.0
 through v0.2.3 nodes interoperate. **Activation height: none.** The chain
 anchor (minimum chain work, assume-valid block, checkpoint and transaction
@@ -106,8 +109,8 @@ Relay policy (PR #19)
   form. The rendering is unchanged, so descriptor IDs and existing wallets
   are stable.
 
-Mining readiness (#15, PR #23)
-------------------------------
+Mining readiness (#15, PRs #23, #27, #28)
+-----------------------------------------
 
 - **Peers that received the tip from this node now count as synced.** A node
   never announces a block back to the peer it received it from, so the
@@ -121,6 +124,19 @@ Mining readiness (#15, PR #23)
   block the peer fetched). The version-handshake starting height stays a
   fallback only when neither exists, so a lagging peer cannot be talked back
   in through its handshake.
+- **Inv announcements count too (PR #28).** A node announces a block by `inv`
+  rather than headers whenever it cannot prove the peer has the parent header,
+  which is every peer right after a restart and permanently a peer that never
+  announces anything back. The v0.2.3 tag only credited headers announcements
+  and blocks the peer fetched from us, so on the v0.2.3 testnet soak node B
+  still saw its relays as unsynced after relaying a block to them by inv. The
+  best block announced by inv is now tracked as well (`getpeerinfo`
+  `invs_sent`).
+- **Handshake fallback fixed (#26, PR #27).** The readiness diagnostics read
+  the peer's starting height from a field nothing populates, so the
+  version-handshake fallback always saw height 0 (correct only at genesis,
+  where it was written). It now reads the peer state the chain guard already
+  used.
 - **Default `-miningmaxpeersyncheightlag` is 3 on mainnet** (was 1; one block
   was below normal relay jitter). Miners that set
   `miningminsyncedoutboundpeers=1` and `miningmaxpeersyncheightlag=3` as a
