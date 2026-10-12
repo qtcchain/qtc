@@ -16,7 +16,7 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
 
 OLD_VERSION = 800002
-FLOOR_HEIGHT = 5
+BLOCKS_TO_FLOOR = 5  # the floor is placed this many blocks above the chain the framework starts with
 
 
 class OldProtocolPeer(P2PInterface):
@@ -32,21 +32,23 @@ class OldProtocolPeer(P2PInterface):
 class ProtocolFloorTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 1
-        self.extra_args = [[f"-v024floorheight={FLOOR_HEIGHT}", f"-minv024version={P2P_VERSION}"]]
 
     def run_test(self):
         node = self.nodes[0]
+        # The framework starts from a cached chain, so place the floor relative to its height.
+        floor_height = node.getblockcount() + BLOCKS_TO_FLOOR
+        self.restart_node(0, extra_args=[f"-v024floorheight={floor_height}", f"-minv024version={P2P_VERSION}"])
 
         self.log.info("Below the floor height an old-protocol peer connects and stays connected")
         old = node.add_p2p_connection(OldProtocolPeer(OLD_VERSION))
-        self.generate(node, FLOOR_HEIGHT - 2)
+        self.generate(node, BLOCKS_TO_FLOOR - 2)
         old.sync_with_ping()
         assert old.is_connected
         assert_equal(node.getpeerinfo()[0]["version"], OLD_VERSION)
 
         self.log.info("Reaching the floor height closes the already-open old-protocol connection")
         self.generate(node, 2)
-        assert_equal(node.getblockcount(), FLOOR_HEIGHT)
+        assert_equal(node.getblockcount(), floor_height)
         old.wait_for_disconnect()
 
         self.log.info("A new old-protocol peer is refused at the handshake")
