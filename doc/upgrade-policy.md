@@ -36,6 +36,13 @@ Convention from v0.1.4:
 3. Before the floor moves, the release notes state how many peers on the public network would be affected (from the
    `qtc_peer_version` metric on the monitoring host) and the floor moves only in a release, never by configuration.
 
+**Recorded exception (v0.2.4, 12 October 2026):** by owner decision the v0.2.4 release carries a
+height-triggered floor: protocol 800003, enforced from mainnet height 4100 (more than 2 000 blocks after
+the tag) against every peer below it, so that all miners run the mining-readiness and relay-policy fixes
+of that release. `MIN_PEER_PROTO_VERSION` was left at 800002; the height rule lives in
+`src/node/protocol_version.h` (`V024_PROTOCOL_FLOOR_HEIGHT`) and `net_processing.cpp`. Impact measured
+before the decision: all 25 distinct public peers seen by relay C ran v0.2.0 to v0.2.2.
+
 The floor retires *protocols*, not people: anyone can run the current software and keep mining. It is not used to
 exclude participants, and it cannot distinguish releases that share a protocol version.
 

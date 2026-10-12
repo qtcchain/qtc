@@ -6,12 +6,15 @@ update. It supersedes `v0.2.3`, which was tagged on 12 October 2026 but never
 published: its testnet soak showed that the mining-readiness fix was blind in
 the very topology it targets (see "Mining readiness"), so no binaries were
 released for it. No consensus rule changes: blocks are valid or invalid
-exactly as before, and v0.2.0 through v0.2.4 nodes interoperate.
-**Activation height: none.** The chain anchor (minimum chain work,
-assume-valid block, checkpoint and transaction statistics) is refreshed to
-the block stated in the "Chain anchor" section.
+exactly as before. **Activation height: none** (no consensus change).
+**Protocol floor height: 4100 on mainnet** (see "Protocol floor"): from that
+height, nodes on this release disconnect peers that have not upgraded. The
+chain anchor (minimum chain work, assume-valid block, checkpoint and
+transaction statistics) is refreshed to the block stated in the "Chain
+anchor" section.
 
-**Who should upgrade:** everyone who spends from a wallet, in particular
+**Who should upgrade:** everyone, before mainnet height 4100 (about 27
+October 2026); in particular everyone who spends from a wallet, especially
 miners sweeping coinbase outputs and anyone whose wallet descriptor carries an
 SLH-DSA backup leaf (the default `mr(pqhd(...),pk_slh(pqhd(...)))` layout);
 every relay that should carry QTC-EVM anchor transactions (see "Relay
@@ -148,6 +151,27 @@ Mining readiness (#15, PRs #23, #27, #28)
 - `getpeerinfo` gains `headers_sent` and `blocks_served`; the mining
   diagnostics gain `relayed_height`, `synced_by_relay` and
   `outbound_peers_synced_by_relay`.
+
+Protocol floor (forced upgrade at mainnet height 4100)
+-------------------------------------------------------
+
+- The P2P protocol version is **800003**. Once the chain tip reaches height
+  **4100** on mainnet (about 27 October 2026 at the October block spacing,
+  more than 2 000 blocks after this tag), nodes on this release disconnect
+  peers that still speak 800002 or older: new connections are refused at the
+  version handshake and connections opened earlier are closed. A node that
+  has not upgraded by then loses every connection to upgraded nodes, so it
+  stops receiving blocks and its own blocks stop propagating. Block validity
+  is unchanged, so this cannot split the chain; it retires the old software.
+- This is a recorded exception to the peer-floor convention in
+  `doc/upgrade-policy.md` (the floor normally lags one release and never
+  carries a height), taken by the owner on 12 October 2026 so that every miner
+  runs the mining-readiness and relay-policy fixes. Measured impact when the
+  decision was taken: all 25 distinct public peers seen by relay C were on
+  v0.2.0, v0.2.1 or v0.2.2, i.e. every public node must upgrade before the
+  height. `MIN_PEER_PROTO_VERSION` itself stays 800002.
+- Test-only overrides `-minv024version` and `-v024floorheight` exist for the
+  functional test `p2p_protocol_floor.py`; the floor moves only in a release.
 
 Known issues
 ------------
