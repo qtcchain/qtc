@@ -46,6 +46,12 @@ Wallet performance
   placeholders (every provider-based P2MR quote fell to the 20 000 vB
   maximum), and probe inputs with a null prevout looked like a coinbase, for
   which the node counts no witness sigops.
+- **Mixed HD and imported fixed-key inputs sign (#20, PR #30).** A transaction
+  that spends an imported fixed-key `mr(<hex>, ...)` output together with one
+  of the wallet's HD coins left the fixed-key input unsigned on the raw path
+  (`signrawtransactionwithwallet`), although the PSBT path completed it. The
+  cross-descriptor key lookup now covers every leaf key the signer lacks
+  instead of running only when it holds no key at all.
 - Measured on the same regtest node and wallet copy, 2-input spend, against
   the v0.2.2 binary: `fundrawtransaction` 13.3–14.3 s → 0.2–1.2 s,
   `signrawtransactionwithwallet` 3.3–3.9 s → 0.01 s, `send` 15.5–16.4 s →
@@ -176,9 +182,6 @@ Protocol floor (forced upgrade at mainnet height 4100)
 Known issues
 ------------
 
-- The wallet cannot sign a transaction that mixes one of its HD inputs with an
-  input from an imported fixed-key `mr(<hex>, ...)` descriptor (#20); build
-  such transactions with inputs of one kind only.
 - `fundrawtransaction` occasionally fails with "Fee needed > fee paid" on the
   new placeholder-quote path (#21); retry, or fund with explicit inputs.
 
