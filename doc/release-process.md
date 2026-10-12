@@ -77,6 +77,7 @@ Release Process
     - `python3 scripts/release/collect_release_assets.py --output-dir /tmp/qtc-release-bundle --source <guix-output-dir>/x86_64-linux-gnu --source <guix-output-dir>/x86_64-linux-gnu-cuda12 --source <guix-output-dir>/aarch64-linux-gnu --source <guix-output-dir>/arm64-apple-darwin --snapshot /tmp/snapshot.dat --snapshot-manifest /tmp/snapshot.manifest.json --release-tag <tag> --release-name <title> --source-repository qtcchain/qtc --source-commit "$(git rev-parse HEAD)" --sign-with <release-gpg-key>`
     - this step must target a fresh output directory and produces the single directory that should be uploaded to the GitHub release page: binaries, snapshot, manifests, `SHA256SUMS`, and `SHA256SUMS.asc`
     - the collector now fails the staging step if any production-matrix archive is missing, so a successful run implies the generated `qtc-release-manifest.json` contains one `platform_assets` entry for each required production archive
+    - macOS: before Developer ID signing and notarization, compile this tag's `src/metal/*.metal` with the Apple Metal compiler (`xcrun -sdk macosx metal -c`, then `metallib`) and place `matmul_accel_kernels.metallib` and `oracle_accel_kernels.metallib` under `bin/metal/` inside the Guix `-unsigned` archive, so the signed archive and the signed `SHA256SUMS` cover them. The Guix cross-build cannot run the Metal compiler; without these files the node compiles kernels at runtime through the macOS Metal compiler service, which a daemonized process may not reach (v0.2.2).
     - Linux publishes CPU-only and CUDA 12 x86_64 archives by default; see [`doc/linux-release-builds.md`](/doc/linux-release-builds.md) for the hardware and target-host driver matrix. CUDA 13, Windows, and macOS x86_64 archives may be staged as optional artifacts when built and tested.
     - if a `guix.sigs/<version>` directory is available, pass `--attestations-dir <path-to-guix.sigs>/<version>` so the final bundle also publishes signer-qualified attestation assets and records them in `attestation_assets`
   - Publish the bundle to GitHub Releases:
@@ -131,7 +132,30 @@ Release Process
   requests and issues:
   https://github.com/bitcoin/bitcoin/issues?q=label%3A%22Needs+release+note%22
 
-#### Tagging a release (candidate)
+#### QTC: chain anchor and activation height on every release (mandatory)
+
+Every QTC release, including patch releases, carries a fresh **chain anchor** and an explicit
+**activation height** in its release notes. Owner rule, 8 October 2026.
+
+1. Pick the anchor height: a block at least 24 hours (about 144 blocks) below the tip at the time
+   the release branch is cut, so it cannot be reorganised.
+2. Read the values from a fleet node and patch the release branch with
+   `anchor_v2_h3.sh <height> --apply` (iCloud `QTC/software/`): `checkpointData` entry,
+   `nMinimumChainWork`, `defaultAssumeValid` and `chainTxData` for mainnet v2.
+3. Pin the new checkpoint in `src/test/pow_tests.cpp` (hash, height, and the reachability check
+   against the current tip's chain work), and run `pow_tests`.
+4. State in `doc/release-notes/release-notes-X.Y.Z.md`:
+   - **Anchor:** height, block hash, UTC time of the anchored block.
+   - **Activation height** of any new consensus or policy rule shipped by the release, or
+     "none: no rule change" when there is none. A rule that changes block validity or relay
+     policy must activate at a height at least two weeks (about 2 000 blocks) after the
+     release date so every node operator can upgrade first; the height is announced in the
+     release notes and on qtc.dev/news.
+5. Verify with `-reindex-chainstate -assumevalid=0` on one node before tagging, as above.
+
+A release without an anchor and without an activation statement is not tagged.
+
+### Tagging a release (candidate)
 
 To tag the version (or release candidate) in git, use the `make-tag.py` script from [bitcoin-maintainer-tools](https://github.com/bitcoin-core/bitcoin-maintainer-tools). From the root of the repository run:
 

@@ -2360,18 +2360,25 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_hardening_anchor_consistency)
     const auto params = CreateChainParams(*m_node.args, ChainType::MAIN);
     const auto consensus = params->GetConsensus();
 
-    // Mainnet v2 (Oct 2026) is a fresh chain again: no minimum chain work, genesis-only checkpoints, no tx stats.
+    // Mainnet v2 (Oct 2026). v0.2.1 (security review H3) adds the first v2 anchor read from the live chain:
+    // checkpoint at height 300, minimum chain work = work at that block, chain-tx statistics from getchaintxstats.
+    // assume-valid stays unset and there are no assumeutxo snapshots.
     // Re-pinned deliberately once v2 has history (security review H3).
-    BOOST_CHECK(consensus.nMinimumChainWork.IsNull());
+    BOOST_CHECK_EQUAL(consensus.nMinimumChainWork.GetHex(), "0000000000000000000000000000000000000000000000000000000135c79b08");
     BOOST_CHECK(consensus.defaultAssumeValid.IsNull());
-    BOOST_CHECK_EQUAL(params->TxData().nTime, 0);
-    BOOST_CHECK_EQUAL(params->TxData().tx_count, 0);
-    BOOST_CHECK_EQUAL(params->TxData().dTxRate, 0.0);
+    BOOST_CHECK_EQUAL(params->TxData().nTime, 1791296578);
+    BOOST_CHECK_EQUAL(params->TxData().tx_count, 301);
+    BOOST_CHECK_CLOSE(params->TxData().dTxRate, 0.002647493735445425, 1e-9);
 
     const auto& checkpoints = params->Checkpoints().mapCheckpoints;
-    BOOST_REQUIRE_EQUAL(checkpoints.size(), 1U);
+    BOOST_REQUIRE_EQUAL(checkpoints.size(), 2U);
     const auto it_0 = checkpoints.find(0);
     BOOST_REQUIRE(it_0 != checkpoints.end());
+    const auto it_300 = checkpoints.find(300);
+    BOOST_REQUIRE(it_300 != checkpoints.end());
+    BOOST_CHECK_EQUAL(it_300->second.GetHex(), "cee1347257fc44ee335b6e20b55bc616eba7c84535b572e3ca492162609273f7");
+    // The minimum chain work must stay reachable: strictly below the v2 chain's work at height 306.
+    BOOST_CHECK(UintToArith256(consensus.nMinimumChainWork) < UintToArith256(uint256{"000000000000000000000000000000000000000000000000000000013cc37761"}));
     BOOST_CHECK_EQUAL(it_0->second.GetHex(), consensus.hashGenesisBlock.GetHex());
     BOOST_CHECK_EQUAL(
         it_0->second.GetHex(),
