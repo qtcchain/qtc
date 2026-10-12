@@ -220,7 +220,9 @@ static OutboundPeerDiagnosticsSummary CollectOutboundPeerDiagnostics(
                 diag.sync_height = statestats.nSyncHeight;
                 diag.common_height = statestats.nCommonHeight;
                 diag.presync_height = statestats.presync_height;
-                diag.relayed_height = std::max(statestats.m_best_header_sent_height, statestats.m_best_block_served_height);
+                diag.relayed_height = std::max({statestats.m_best_header_sent_height,
+                                                statestats.m_best_inv_sent_height,
+                                                statestats.m_best_block_served_height});
                 diag.last_block_announcement =
                     TicksSinceEpoch<std::chrono::seconds>(statestats.m_last_block_announcement);
             }
