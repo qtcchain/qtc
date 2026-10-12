@@ -224,7 +224,9 @@ static OutboundPeerDiagnosticsSummary CollectOutboundPeerDiagnostics(
                 // filled in by CConnman, so reading it made the handshake fallback
                 // see every peer at height 0 (right only at genesis).
                 diag.starting_height = statestats.m_starting_height;
-                diag.relayed_height = std::max(statestats.m_best_header_sent_height, statestats.m_best_block_served_height);
+                diag.relayed_height = std::max({statestats.m_best_header_sent_height,
+                                                statestats.m_best_inv_sent_height,
+                                                statestats.m_best_block_served_height});
                 diag.last_block_announcement =
                     TicksSinceEpoch<std::chrono::seconds>(statestats.m_last_block_announcement);
             }

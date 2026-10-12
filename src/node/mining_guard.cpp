@@ -330,8 +330,9 @@ MiningChainGuardStatus GetMiningChainGuardStatus(const NodeContext& node)
         // peer that joined while the network was idle) all of these are -1;
         // the handshake starting height is then used so peers sitting at our
         // tip count as consensus instead of as missing.
-        const int relayed_height =
-            std::max(state_stats.m_best_header_sent_height, state_stats.m_best_block_served_height);
+        const int relayed_height = std::max({state_stats.m_best_header_sent_height,
+                                             state_stats.m_best_inv_sent_height,
+                                             state_stats.m_best_block_served_height});
         const int peer_height = ResolveMiningChainGuardPeerHeight(
             state_stats.nSyncHeight, relayed_height, state_stats.nCommonHeight, state_stats.m_starting_height);
         if (peer_height >= 0) {
