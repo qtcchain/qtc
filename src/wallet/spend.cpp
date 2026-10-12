@@ -133,6 +133,10 @@ static int64_t SignedInputPolicySize(const CTxIn& signed_txin, const CTxOut& txo
     return GetVirtualTransactionSize(GetTransactionInputWeight(signed_txin), sigops, DEFAULT_BYTES_PER_SIGOP);
 }
 
+/** Prevout given to a probe input so the probe transaction is not mistaken for a coinbase, whose
+ *  witness sigops the node does not count (the P2MR quote is sigop-bound for SLH-DSA). */
+static const COutPoint PROBE_PREVOUT{Txid::FromUint256(uint256{1}), 0};
+
 static std::optional<CTxIn> DummySignInput(const CTxOut& txout,
                                            const SigningProvider& provider,
                                            const bool use_max_sig)
@@ -146,7 +150,7 @@ static std::optional<CTxIn> DummySignInput(const CTxOut& txout,
         return {};
     }
 
-    CTxIn txin;
+    CTxIn txin{PROBE_PREVOUT};
     UpdateInput(txin, sig_data);
     return txin;
 }
@@ -181,27 +185,93 @@ static bool IsP2MROutput(const CScript& script_pubkey)
     return Solver(script_pubkey, solutions) == TxoutType::WITNESS_V2_P2MR;
 }
 
-static std::optional<CTxIn> WalletSignP2MRInput(const CWallet* wallet, const CTxOut& txout)
+static std::optional<PQAlgorithm> PreferredPQSigningAlgo(const CCoinControl* coin_control)
+{
+    return coin_control ? coin_control->m_preferred_pq_signing_algo : std::nullopt;
+}
+
+/** The keys the wallet holds for one of its own P2MR outputs: the owning descriptor's private
+ *  provider (leaf scripts, control blocks and whichever PQ private keys that descriptor derives). */
+static std::unique_ptr<FlatSigningProvider> GetP2MRKeyedProvider(const CWallet* wallet, const CScript& script_pubkey)
+{
+    for (ScriptPubKeyMan* spk_man : wallet->GetScriptPubKeyMans(script_pubkey)) {
+        auto* desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man);
+        if (!desc_spk_man) continue;
+        if (auto keys = desc_spk_man->GetSigningProvider(script_pubkey, /*include_private=*/true)) return keys;
+    }
+    return nullptr;
+}
+
+/** Placeholder-sign one P2MR input with the keys the wallet actually holds. The leaf is chosen the way
+ *  the real signer chooses it (same preference order, only leaves whose keys are present) and every PQ
+ *  signature has its fixed size, so the witness weighs exactly what the signed one will, but no
+ *  signature is computed: with the reference SLH-DSA implementation a real signing run costs seconds
+ *  per input, and the wallet quotes sizes many times per transaction. */
+static std::optional<CTxIn> WalletPlaceholderSignP2MRInput(const CWallet* wallet, const CTxOut& txout, const CCoinControl* coin_control)
+{
+    const auto provider = GetP2MRKeyedProvider(wallet, txout.scriptPubKey);
+    if (!provider) return {};
+
+    SignatureData sig_data;
+    sig_data.preferred_pq_signing_algo = PreferredPQSigningAlgo(coin_control);
+    if (!ProduceSignature(*provider, DUMMY_KEYED_SIGNATURE_CREATOR, txout.scriptPubKey, sig_data)) return {};
+
+    CTxIn txin{PROBE_PREVOUT};
+    UpdateInput(txin, sig_data);
+    return txin;
+}
+
+/** Real signing run, kept for outputs whose keys live in another descriptor (cross-descriptor P2MR
+ *  multisig), which the per-descriptor placeholder path cannot see. */
+static std::optional<CTxIn> WalletSignP2MRInput(const CWallet* wallet, const CTxOut& txout, const CCoinControl* coin_control)
 {
     CMutableTransaction tx;
-    const COutPoint prevout{Txid::FromUint256(uint256{1}), 0};
-    tx.vin.emplace_back(prevout);
+    tx.vin.emplace_back(PROBE_PREVOUT);
     tx.vout.emplace_back(txout.nValue, txout.scriptPubKey);
 
     std::map<COutPoint, Coin> coins;
-    coins.emplace(prevout, Coin{txout, /*nHeight=*/1, /*fCoinBase=*/false});
+    coins.emplace(PROBE_PREVOUT, Coin{txout, /*nHeight=*/1, /*fCoinBase=*/false});
 
     std::map<int, bilingual_str> input_errors;
-    if (!wallet->SignTransaction(tx, coins, SIGHASH_DEFAULT, input_errors, /*inputs_amount_sum=*/nullptr)) {
+    if (!wallet->SignTransaction(tx, coins, SIGHASH_DEFAULT, input_errors, /*inputs_amount_sum=*/nullptr, PreferredPQSigningAlgo(coin_control))) {
         return {};
     }
     if (!input_errors.empty()) return {};
     return tx.vin[0];
 }
 
+static TxSize SignedP2MRTxSize(const CMutableTransaction& tx_signed, const std::vector<CTxOut>& txouts)
+{
+    const CTransaction signed_tx{tx_signed};
+    const int64_t weight = GetTransactionWeight(signed_tx);
+    const int64_t sigops = SigOpCostForInputs(signed_tx, txouts);
+    return TxSize{GetVirtualTransactionSize(weight, sigops, DEFAULT_BYTES_PER_SIGOP), weight};
+}
+
+/** Exact size of the transaction once signed, from placeholder-signed P2MR inputs (see
+ *  WalletPlaceholderSignP2MRInput). Only when every input is a P2MR output this wallet holds keys for. */
+static std::optional<TxSize> WalletPlaceholderSignP2MRTxSize(const CTransaction& tx,
+                                                             const CWallet* wallet,
+                                                             const std::vector<CTxOut>& txouts,
+                                                             const CCoinControl* coin_control)
+{
+    if (tx.vin.size() != txouts.size()) return {};
+
+    CMutableTransaction tx_signed(tx);
+    for (size_t i = 0; i < txouts.size(); ++i) {
+        if (!IsP2MROutput(txouts[i].scriptPubKey)) return {};
+        const auto txin = WalletPlaceholderSignP2MRInput(wallet, txouts[i], coin_control);
+        if (!txin) return {};
+        tx_signed.vin[i].scriptSig = txin->scriptSig;
+        tx_signed.vin[i].scriptWitness = txin->scriptWitness;
+    }
+    return SignedP2MRTxSize(tx_signed, txouts);
+}
+
 static std::optional<TxSize> WalletSignP2MRTxSize(const CTransaction& tx,
                                                   const CWallet* wallet,
-                                                  const std::vector<CTxOut>& txouts)
+                                                  const std::vector<CTxOut>& txouts,
+                                                  const CCoinControl* coin_control)
 {
     if (tx.vin.size() != txouts.size()) return {};
 
@@ -212,15 +282,11 @@ static std::optional<TxSize> WalletSignP2MRTxSize(const CTransaction& tx,
     }
 
     std::map<int, bilingual_str> input_errors;
-    if (!wallet->SignTransaction(tx_signed, coins, SIGHASH_DEFAULT, input_errors, /*inputs_amount_sum=*/nullptr)) {
+    if (!wallet->SignTransaction(tx_signed, coins, SIGHASH_DEFAULT, input_errors, /*inputs_amount_sum=*/nullptr, PreferredPQSigningAlgo(coin_control))) {
         return {};
     }
     if (!input_errors.empty()) return {};
-
-    const CTransaction signed_tx{tx_signed};
-    const int64_t weight = GetTransactionWeight(signed_tx);
-    const int64_t sigops = SigOpCostForInputs(signed_tx, txouts);
-    return TxSize{GetVirtualTransactionSize(weight, sigops, DEFAULT_BYTES_PER_SIGOP), weight};
+    return SignedP2MRTxSize(tx_signed, txouts);
 }
 
 int CalculateMaximumSignedInputSize(const CTxOut& txout, const COutPoint outpoint, const SigningProvider* provider, bool can_grind_r, const CCoinControl* coin_control)
@@ -248,7 +314,10 @@ int CalculateMaximumSignedInputSize(const CTxOut& txout, const COutPoint outpoin
 int CalculateMaximumSignedInputSize(const CTxOut& txout, const CWallet* wallet, const CCoinControl* coin_control)
 {
     if (IsP2MROutput(txout.scriptPubKey)) {
-        if (const auto txin = WalletSignP2MRInput(wallet, txout)) {
+        if (const auto txin = WalletPlaceholderSignP2MRInput(wallet, txout, coin_control)) {
+            return static_cast<int>(SignedInputPolicySize(*txin, txout));
+        }
+        if (const auto txin = WalletSignP2MRInput(wallet, txout, coin_control)) {
             return static_cast<int>(SignedInputPolicySize(*txin, txout));
         }
     }
@@ -301,7 +370,10 @@ static std::optional<int64_t> GetSignedTxinWeight(const CWallet* wallet, const C
 TxSize CalculateMaximumSignedTxSize(const CTransaction &tx, const CWallet *wallet, const std::vector<CTxOut>& txouts, const CCoinControl* coin_control)
 {
     if (std::any_of(txouts.begin(), txouts.end(), [](const CTxOut& txo) { return IsP2MROutput(txo.scriptPubKey); })) {
-        if (const auto exact_size = WalletSignP2MRTxSize(tx, wallet, txouts)) {
+        if (const auto exact_size = WalletPlaceholderSignP2MRTxSize(tx, wallet, txouts, coin_control)) {
+            return *exact_size;
+        }
+        if (const auto exact_size = WalletSignP2MRTxSize(tx, wallet, txouts, coin_control)) {
             return *exact_size;
         }
     }

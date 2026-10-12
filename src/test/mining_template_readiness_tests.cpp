@@ -29,7 +29,7 @@ MiningTemplateReadinessPolicy MainnetLikePolicy()
     policy.enforce_connectivity = true;
     policy.min_outbound_peers = 2;
     policy.min_synced_outbound_peers = 2;
-    policy.max_peer_sync_height_lag = 1;
+    policy.max_peer_sync_height_lag = 3;
     policy.enforce_header_lag = true;
     policy.max_header_lag = 3;
     return policy;
@@ -244,6 +244,103 @@ BOOST_AUTO_TEST_CASE(peer_with_no_height_signal_is_not_synced)
     BOOST_CHECK(!status.counts_as_synced);
 }
 
+// ---------------------------------------------------------------------------
+// Per-peer sync classification: tip relayed by us (issue #15)
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(relayed_tip_counts_peer_as_synced_when_it_never_announces_back)
+{
+    // The peer received our tip (we announced the header, or it fetched the
+    // block). It never announces that block back, so its sync height is stale.
+    MiningPeerSyncSignals signals;
+    signals.sync_height = 1240;
+    signals.relayed_height = 1251;
+    signals.starting_height = 1100;
+    auto status = ClassifyMiningPeerSync(/*tip=*/1251, /*lag=*/1, signals);
+    BOOST_CHECK(status.source == MiningPeerHeightSource::RELAYED);
+    BOOST_CHECK_EQUAL(status.sync_lag, 0);
+    BOOST_CHECK(status.counts_as_synced);
+
+    // No announcement from the peer at all, only our relay: still counts.
+    signals.sync_height = -1;
+    status = ClassifyMiningPeerSync(1251, 1, signals);
+    BOOST_CHECK(status.source == MiningPeerHeightSource::RELAYED);
+    BOOST_CHECK(status.counts_as_synced);
+
+    // The relayed height respects the lag window like any other signal.
+    signals.relayed_height = 1249;
+    status = ClassifyMiningPeerSync(1251, 1, signals);
+    BOOST_CHECK(status.source == MiningPeerHeightSource::RELAYED);
+    BOOST_CHECK_EQUAL(status.sync_lag, 2);
+    BOOST_CHECK(!status.counts_as_synced);
+    BOOST_CHECK(ClassifyMiningPeerSync(1251, 3, signals).counts_as_synced);
+}
+
+BOOST_AUTO_TEST_CASE(higher_of_announced_and_relayed_height_wins)
+{
+    // A peer ahead of what we relayed to it (it announced a newer header).
+    MiningPeerSyncSignals signals;
+    signals.sync_height = 1251;
+    signals.relayed_height = 1200;
+    auto status = ClassifyMiningPeerSync(1251, 1, signals);
+    BOOST_CHECK(status.source == MiningPeerHeightSource::SYNC_HEIGHT);
+    BOOST_CHECK_EQUAL(status.sync_lag, 0);
+    BOOST_CHECK(status.counts_as_synced);
+
+    // Both known and both stale: the peer is really lagging, and the handshake
+    // height cannot talk it back in.
+    signals.sync_height = 1000;
+    signals.relayed_height = 1100;
+    signals.starting_height = 1251;
+    status = ClassifyMiningPeerSync(1251, 3, signals);
+    BOOST_CHECK(status.source == MiningPeerHeightSource::RELAYED);
+    BOOST_CHECK_EQUAL(status.sync_lag, 151);
+    BOOST_CHECK(!status.counts_as_synced);
+}
+
+BOOST_AUTO_TEST_CASE(best_connected_miner_topology_passes_mainnet_policy)
+{
+    // Issue #15, fleet node B on 8-9 Oct 2026: tip 1251, three outbound
+    // (addnode) peers whose announced heights were 1251 / 1242 / 1244 because
+    // B relayed most blocks to them first. Every one of them received the tip
+    // from B, so all three must count as synced.
+    const auto policy = MainnetLikePolicy();
+    const int tip{1251};
+    const int announced[] = {1251, 1242, 1244};
+    size_t synced_with_relay{0};
+    size_t synced_without_relay{0};
+    for (const int announced_height : announced) {
+        MiningPeerSyncSignals signals;
+        signals.sync_height = announced_height;
+        signals.relayed_height = tip;
+        if (ClassifyMiningPeerSync(tip, policy.max_peer_sync_height_lag, signals).counts_as_synced) {
+            ++synced_with_relay;
+        }
+        if (ClassifyMiningPeerSync(tip, /*lag=*/1, announced_height, /*start=*/-1).counts_as_synced) {
+            ++synced_without_relay;
+        }
+    }
+    BOOST_CHECK_EQUAL(synced_with_relay, 3U);
+    BOOST_CHECK_EQUAL(synced_without_relay, 1U); // the v0.2.2 view that caused the refusals
+
+    MiningTemplateReadinessObservation obs;
+    obs.has_tip = true;
+    obs.tip_height = tip;
+    obs.has_best_header = true;
+    obs.best_header_height = tip;
+    obs.initial_block_download = false;
+    obs.connected_peers = 41;
+    obs.outbound_peers = 3;
+    obs.peerman_available = true;
+    obs.synced_outbound_peers = synced_with_relay;
+    BOOST_CHECK(!CheckMiningTemplateReadiness(policy, obs).has_value());
+
+    obs.synced_outbound_peers = synced_without_relay;
+    const auto refusal = CheckMiningTemplateReadiness(policy, obs);
+    BOOST_REQUIRE(refusal.has_value());
+    BOOST_CHECK(Contains(refusal->message, "has 1 synced outbound peers, requires at least 2"));
+}
+
 BOOST_AUTO_TEST_CASE(genesis_launch_topology_passes_mainnet_policy)
 {
     // The 2026-09-30 launch miner: tip and best header at genesis, three
@@ -348,7 +445,7 @@ BOOST_AUTO_TEST_CASE(too_few_synced_outbound_peers_refuses)
     const auto refusal = CheckMiningTemplateReadiness(MainnetLikePolicy(), obs);
     BOOST_REQUIRE(refusal.has_value());
     BOOST_CHECK_EQUAL(refusal->code, RPC_CLIENT_NOT_CONNECTED);
-    BOOST_CHECK(Contains(refusal->message, "has 1 synced outbound peers, requires at least 2 within 1 blocks of active tip"));
+    BOOST_CHECK(Contains(refusal->message, "has 1 synced outbound peers, requires at least 2 within 3 blocks of active tip"));
     BOOST_CHECK(Contains(refusal->message, "-miningminsyncedoutboundpeers=0"));
 }
 

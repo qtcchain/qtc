@@ -72,11 +72,16 @@ Notes:
   lab mining.
 - `getblocktemplate` also enforces that at least two outbound peers are actually
   near tip on mainnet by default
-  (`-miningminsyncedoutboundpeers=2`, `-miningmaxpeersyncheightlag=1`).
+  (`-miningminsyncedoutboundpeers=2`, `-miningmaxpeersyncheightlag=3`).
   This reduces stale/forked mining when outbound peers are connected but lagging.
-  A peer that has not announced any header yet (at genesis, or one that joined
-  while the network was idle) is judged by its version-handshake starting
-  height instead, so a fresh network at height 0 can start mining.
+  A peer is judged by the higher of the height it announced to the node and the
+  height the node relayed to it (best header sent, or best block the peer
+  fetched), because a peer never announces a block back to the node it received
+  it from; without the relayed signal a well-connected miner that hears of
+  blocks first saw all of its outbound peers as stale (issue #15). A peer with
+  neither signal (at genesis, or one that joined while the network was idle) is
+  judged by its version-handshake starting height instead, so a fresh network
+  at height 0 can start mining.
   Set `-miningminsyncedoutboundpeers=0` only for intentional isolated lab mining.
 - `getblocktemplate` also enforces a validated-tip/header-lag bound on mainnet
   by default (`-miningmaxheaderlag=3`) so miners do not work from templates that

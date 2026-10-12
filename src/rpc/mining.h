@@ -53,9 +53,17 @@ struct MiningTemplateReadinessObservation {
 
 /** Where the height used for the synced-outbound rule came from. */
 enum class MiningPeerHeightSource {
-    NONE,            //!< neither a sync height nor a starting height is known
-    SYNC_HEIGHT,     //!< net_processing best known block (headers were exchanged)
-    STARTING_HEIGHT, //!< version-handshake starting height (no headers exchanged yet)
+    NONE,            //!< no height signal is known for the peer
+    SYNC_HEIGHT,     //!< net_processing best known block (the peer announced it to us)
+    RELAYED,         //!< best header we announced to the peer, or block it fetched from us
+    STARTING_HEIGHT, //!< version-handshake starting height (nothing exchanged yet)
+};
+
+/** Per-peer inputs to ClassifyMiningPeerSync; -1 means "unknown" for each. */
+struct MiningPeerSyncSignals {
+    int sync_height{-1};     //!< net_processing nSyncHeight (peer's announcements to us)
+    int relayed_height{-1};  //!< max of best header we sent and best block the peer fetched
+    int starting_height{-1}; //!< version-handshake starting height
 };
 
 /** Per-peer result of ClassifyMiningPeerSync. */
@@ -68,20 +76,42 @@ struct MiningPeerSyncStatus {
 /**
  * Decide whether one outbound peer counts towards -miningminsyncedoutboundpeers.
  *
- * sync_height is the peer's best known block from net_processing (-1 until the
- * peer has sent us a header, inv or block). At genesis, and for any peer that
- * connected while the network was idle, nothing has been announced yet and the
- * sync height stays -1 even though the peer is exactly at our tip. In that case
- * only, fall back to the starting height the peer reported in its version
- * handshake and count it as synced when it is within the lag window of the
- * active tip. A known sync height always wins over the starting height, so a
- * peer that is really lagging cannot be talked back in via the handshake.
+ * Two strong signals are combined, and the higher one is used (issue #15):
+ *
+ *  - sync_height: the peer's best known block from net_processing (-1 until
+ *    the peer has sent us a header, inv or block). A node never announces a
+ *    block back to the peer it received it from, so for a well-connected
+ *    miner that usually hears of a block first and relays it to its outbound
+ *    peers, this height goes stale while the topology is perfectly healthy.
+ *  - relayed_height: the best header we announced to the peer, or the best
+ *    block it fetched from us. That is direct evidence the peer holds our tip
+ *    (it has the data, even if it has not finished validating it).
+ *
+ * At genesis, and for any peer that connected while the network was idle,
+ * neither signal exists even though the peer is exactly at our tip. In that
+ * case only, fall back to the starting height the peer reported in its version
+ * handshake. A known sync or relayed height always wins over the starting
+ * height, so a peer that is really lagging cannot be talked back in via the
+ * handshake. The peer counts as synced when the chosen height is within
+ * max_peer_sync_height_lag blocks of the active tip.
  */
 MiningPeerSyncStatus ClassifyMiningPeerSync(
     int active_tip_height,
     int64_t max_peer_sync_height_lag,
+    const MiningPeerSyncSignals& signals);
+
+/** Convenience overload without a relayed height (announcement-only view). */
+inline MiningPeerSyncStatus ClassifyMiningPeerSync(
+    int active_tip_height,
+    int64_t max_peer_sync_height_lag,
     int sync_height,
-    int starting_height);
+    int starting_height)
+{
+    MiningPeerSyncSignals signals;
+    signals.sync_height = sync_height;
+    signals.starting_height = starting_height;
+    return ClassifyMiningPeerSync(active_tip_height, max_peer_sync_height_lag, signals);
+}
 
 /** Why a template was refused: an RPCErrorCode and the message reported to the caller. */
 struct MiningTemplateRefusal {

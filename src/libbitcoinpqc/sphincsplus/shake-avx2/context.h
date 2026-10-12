@@ -8,6 +8,13 @@
 typedef struct {
     uint8_t pub_seed[SPX_N];
     uint8_t sk_seed[SPX_N];
+
+    /* QTC: when nonzero, derive FORS indices using the finalized FIPS-205 base_2b
+     * (big-endian / MSB-first) convention instead of the legacy round-3.x SPHINCS+
+     * (little-endian) message_to_indices. Set per call by the SLH-DSA sign/verify
+     * entry points from the caller's fips205 flag. Must match the ref variant so
+     * every backend produces and verifies the same signatures. */
+    uint8_t fips205;
 } spx_ctx;
 
 #endif

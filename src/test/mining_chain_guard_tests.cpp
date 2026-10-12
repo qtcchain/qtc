@@ -261,6 +261,55 @@ BOOST_AUTO_TEST_CASE(peer_height_prefers_sync_then_common_then_starting_height)
     BOOST_CHECK_EQUAL(node::ResolveMiningChainGuardPeerHeight(-1, -1, -1), -1);
 }
 
+BOOST_AUTO_TEST_CASE(peer_height_uses_higher_of_announced_and_relayed)
+{
+    // Issue #15: the height we relayed to the peer counts like an announcement.
+    BOOST_CHECK_EQUAL(node::ResolveMiningChainGuardPeerHeight(/*sync=*/1242, /*relayed=*/1251, /*common=*/1200, /*start=*/5), 1251);
+    BOOST_CHECK_EQUAL(node::ResolveMiningChainGuardPeerHeight(1251, 1242, 1200, 5), 1251);
+    BOOST_CHECK_EQUAL(node::ResolveMiningChainGuardPeerHeight(-1, 1251, 1200, 5), 1251);
+    BOOST_CHECK_EQUAL(node::ResolveMiningChainGuardPeerHeight(-1, -1, 1200, 5), 1200);
+    BOOST_CHECK_EQUAL(node::ResolveMiningChainGuardPeerHeight(-1, -1, -1, 5), 5);
+}
+
+BOOST_AUTO_TEST_CASE(relay_that_serves_its_outbound_peers_first_is_healthy)
+{
+    // A relay with three outbound mesh peers that receive every block from it:
+    // their announced heights stay behind the tip, but the relay sent each of
+    // them the tip header, so the guard must read the mesh as healthy instead
+    // of "insufficient_peer_consensus" / "insufficient_near_tip_peers".
+    node::MiningChainGuardOptions options;
+    options.enabled = true;
+
+    const int tip{1251};
+    const int announced[] = {1242, 1244, 1236};
+    std::vector<node::MiningChainGuardPeerSample> peers;
+    for (const int announced_height : announced) {
+        node::MiningChainGuardPeerSample sample;
+        sample.height = node::ResolveMiningChainGuardPeerHeight(
+            /*sync_height=*/announced_height, /*relayed_height=*/tip, /*common_height=*/announced_height, /*starting_height=*/0);
+        peers.push_back(sample);
+    }
+
+    const auto filtered = node::FilterMiningChainGuardPeerHeights(tip, /*now=*/1000, peers, options);
+    BOOST_CHECK_EQUAL(filtered.size(), 3U);
+    const auto status = node::EvaluateMiningChainGuard(tip, false, true, filtered, options);
+    BOOST_CHECK(status.healthy);
+    BOOST_CHECK_EQUAL(status.reason, "healthy");
+    BOOST_CHECK_EQUAL(status.near_tip_peers, 3);
+    BOOST_CHECK_EQUAL(status.median_peer_tip, tip);
+
+    // The announcement-only view of the same mesh (pre-fix) was unhealthy.
+    std::vector<node::MiningChainGuardPeerSample> stale;
+    for (const int announced_height : announced) {
+        node::MiningChainGuardPeerSample sample;
+        sample.height = node::ResolveMiningChainGuardPeerHeight(announced_height, announced_height, 0);
+        stale.push_back(sample);
+    }
+    const auto stale_status = node::EvaluateMiningChainGuard(
+        tip, false, true, node::FilterMiningChainGuardPeerHeights(tip, 1000, stale, options), options);
+    BOOST_CHECK(!stale_status.healthy);
+}
+
 BOOST_AUTO_TEST_CASE(genesis_peers_with_only_starting_height_form_consensus)
 {
     // Mainnet launch, 2026-09-30: local tip is genesis and three outbound

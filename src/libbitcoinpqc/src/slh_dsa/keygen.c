@@ -11,6 +11,10 @@
 #include "../../sphincsplus/shake-a64/api.h"
 #include "../../sphincsplus/shake-a64/randombytes.h"
 #include "../../sphincsplus/shake-a64/params.h"
+#elif defined(SPHINCSPLUS_VARIANT_SHAKE_AVX2)
+#include "../../sphincsplus/shake-avx2/api.h"
+#include "../../sphincsplus/shake-avx2/randombytes.h"
+#include "../../sphincsplus/shake-avx2/params.h"
 #elif defined(SPHINCSPLUS_VARIANT_REF)
 #include "../../sphincsplus/ref/api.h"
 #include "../../sphincsplus/ref/randombytes.h"

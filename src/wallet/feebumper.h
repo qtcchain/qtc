@@ -6,8 +6,10 @@
 #define BITCOIN_WALLET_FEEBUMPER_H
 
 #include <consensus/consensus.h>
+#include <pqkey.h>
 #include <script/interpreter.h>
 #include <primitives/transaction.h>
+#include <optional>
 
 class uint256;
 enum class FeeEstimateMode;
@@ -60,7 +62,8 @@ Result CreateRateBumpTransaction(CWallet& wallet,
 //! Sign the new transaction,
 //! @return false if the tx couldn't be found or if it was
 //! impossible to create the signature(s)
-bool SignTransaction(CWallet& wallet, CMutableTransaction& mtx);
+//! preferred_pq_signing_algo selects the P2MR leaf (ML-DSA when unset).
+bool SignTransaction(CWallet& wallet, CMutableTransaction& mtx, std::optional<PQAlgorithm> preferred_pq_signing_algo = std::nullopt);
 
 //! Commit the bumpfee transaction.
 //! @return success in case of CWallet::CommitTransaction was successful,

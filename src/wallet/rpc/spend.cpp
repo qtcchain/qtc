@@ -97,6 +97,8 @@ std::set<int> InterpretSubtractFeeFromOutputInstructions(const UniValue& sffo_in
     return sffo_set;
 }
 
+static std::optional<PQAlgorithm> ParsePreferredPQSigningAlgo(const UniValue& preferred_pq_algo);
+
 static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const UniValue& options, CMutableTransaction& rawTx)
 {
     if (!options.exists("locktime")) {
@@ -111,7 +113,9 @@ static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const 
     // so external signers are not asked to sign more than once.
     bool complete;
     pwallet->FillPSBT(psbt_tx, complete, SIGHASH_DEFAULT, /*sign=*/false, /*bip32derivs=*/true);
-    const auto err{pwallet->FillPSBT(psbt_tx, complete, SIGHASH_DEFAULT, /*sign=*/true, /*bip32derivs=*/false)};
+    // Sign the P2MR leaf the caller asked for (the fee was quoted for it).
+    const std::optional<PQAlgorithm> preferred_pq_algo{options.exists("preferred_pq_algo") ? ParsePreferredPQSigningAlgo(options["preferred_pq_algo"]) : std::nullopt};
+    const auto err{pwallet->FillPSBT(psbt_tx, complete, SIGHASH_DEFAULT, /*sign=*/true, /*bip32derivs=*/false, /*n_signed=*/nullptr, /*finalize=*/true, preferred_pq_algo)};
     if (err) {
         throw JSONRPCPSBTError(*err);
     }
@@ -1039,6 +1043,9 @@ RPCHelpMan signrawtransactionwithwallet()
             "       \"ALL|ANYONECANPAY\"\n"
             "       \"NONE|ANYONECANPAY\"\n"
             "       \"SINGLE|ANYONECANPAY\""},
+                    {"preferred_pq_algo", RPCArg::Type::STR, RPCArg::DefaultHint{"wallet default"},
+                        "Preferred post-quantum algorithm for selecting spend leaves in P2MR scripts. Valid values: \"ml_dsa_44\", \"slh_dsa_128s\".\n"
+                        "Pass the value given to fundrawtransaction so the signature matches the quoted fee."},
                 },
                 RPCResult{
                     RPCResult::Type::OBJ, "", "",
@@ -1093,12 +1100,13 @@ RPCHelpMan signrawtransactionwithwallet()
     ParsePrevouts(request.params[1], nullptr, coins);
 
     int nHashType = ParseSighashString(request.params[2]);
+    const std::optional<PQAlgorithm> preferred_pq_algo = ParsePreferredPQSigningAlgo(request.params[3]);
 
     // Script verification errors
     std::map<int, bilingual_str> input_errors;
     std::optional<CAmount> inputs_amount_sum;
 
-    bool complete = pwallet->SignTransaction(mtx, coins, nHashType, input_errors, &inputs_amount_sum);
+    bool complete = pwallet->SignTransaction(mtx, coins, nHashType, input_errors, &inputs_amount_sum, preferred_pq_algo);
     UniValue result(UniValue::VOBJ);
     SignTransactionResultToJSON(mtx, complete, coins, input_errors, result, inputs_amount_sum);
     return result;
@@ -1173,6 +1181,9 @@ static RPCHelpMan bumpfee_helper(std::string method_name)
                              "Cannot be provided if 'original_change_index' is specified.",
                         OutputsDoc(),
                         RPCArgOptions{.skip_type_check = true}},
+                    {"preferred_pq_algo", RPCArg::Type::STR, RPCArg::DefaultHint{"wallet default"},
+                        "Preferred post-quantum algorithm for selecting spend leaves in P2MR scripts. Valid values: \"ml_dsa_44\", \"slh_dsa_128s\".\n"
+                        "Sizes the replacement for that leaf and, for bumpfee, signs with it; for psbtbumpfee pass the same value to walletprocesspsbt."},
                     {"original_change_index", RPCArg::Type::NUM, RPCArg::DefaultHint{"not set, detect change automatically"}, "The 0-based index of the change output on the original transaction. "
                                                                                                                             "The indicated output will be recycled into the new change output on the bumped transaction. "
                                                                                                                             "The remainder after paying the recipients and fees will be sent to the output script of the "
@@ -1230,6 +1241,7 @@ static RPCHelpMan bumpfee_helper(std::string method_name)
                 {"estimate_mode", UniValueType(UniValue::VSTR)},
                 {"outputs", UniValueType()}, // will be checked by AddOutputs()
                 {"original_change_index", UniValueType(UniValue::VNUM)},
+                {"preferred_pq_algo", UniValueType(UniValue::VSTR)},
             },
             true, true);
 
@@ -1256,6 +1268,10 @@ static RPCHelpMan bumpfee_helper(std::string method_name)
 
         if (options.exists("original_change_index")) {
             original_change_index = options["original_change_index"].getInt<uint32_t>();
+        }
+
+        if (options.exists("preferred_pq_algo")) {
+            coin_control.m_preferred_pq_signing_algo = ParsePreferredPQSigningAlgo(options["preferred_pq_algo"]);
         }
     }
 
@@ -1307,7 +1323,7 @@ static RPCHelpMan bumpfee_helper(std::string method_name)
     // For bumpfee, return the new transaction id.
     // For psbtbumpfee, return the base64-encoded unsigned PSBT of the new transaction.
     if (!want_psbt) {
-        if (!feebumper::SignTransaction(*pwallet, mtx)) {
+        if (!feebumper::SignTransaction(*pwallet, mtx, coin_control.m_preferred_pq_signing_algo)) {
             if (pwallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
                 throw JSONRPCError(RPC_WALLET_ERROR, "Transaction incomplete. Try psbtbumpfee instead.");
             }
@@ -1754,6 +1770,8 @@ RPCHelpMan walletprocesspsbt()
                                 RPCArgOptions{.also_positional = true}},
                             {"bip32derivs", RPCArg::Type::BOOL, RPCArg::Default{true}, "Include BIP 32 derivation paths for public keys if we know them", RPCArgOptions{.also_positional = true}},
                             {"finalize", RPCArg::Type::BOOL, RPCArg::Default{true}, "Also finalize inputs if possible", RPCArgOptions{.also_positional = true}},
+                            {"preferred_pq_algo", RPCArg::Type::STR, RPCArg::DefaultHint{"wallet default"},
+                                "Preferred post-quantum algorithm for selecting spend leaves in P2MR scripts. Valid values: \"ml_dsa_44\", \"slh_dsa_128s\"."},
                         },
                     RPCArgOptions{.oneline_description="options"}},
                     {"sighashtype", RPCArg::Type::STR, RPCArg::Default{"DEFAULT"}, "for backwards compatibility", RPCArgOptions{.hidden=true}},
@@ -1792,6 +1810,7 @@ RPCHelpMan walletprocesspsbt()
     bool sign = true;
     bool bip32derivs = true;
     bool finalize = true;
+    std::optional<PQAlgorithm> preferred_pq_algo;
     int nHashType = ParseSighashString(NullUniValue); // Use ParseSighashString default
     if (request.params[1].isBool() || request.params[1].isNull()) {
         // Old style positional parameters
@@ -1808,6 +1827,7 @@ RPCHelpMan walletprocesspsbt()
                 {"bip32derivs", UniValueType(UniValue::VBOOL)},
                 {"finalize", UniValueType(UniValue::VBOOL)},
                 {"sighashtype", UniValueType(UniValue::VSTR)},
+                {"preferred_pq_algo", UniValueType(UniValue::VSTR)},
             },
             true, true);
         if (options.exists("sign")) {
@@ -1822,6 +1842,9 @@ RPCHelpMan walletprocesspsbt()
         if (options.exists("sighashtype")) {
             nHashType = ParseSighashString(options["sighashtype"]);
         }
+        if (options.exists("preferred_pq_algo")) {
+            preferred_pq_algo = ParsePreferredPQSigningAlgo(options["preferred_pq_algo"]);
+        }
         if (request.params.size() > 2) {
             // Same behaviour as too many args passed normally
             throw std::runtime_error(self.ToString());
@@ -1833,7 +1856,7 @@ RPCHelpMan walletprocesspsbt()
 
     if (sign) EnsureWalletIsUnlocked(*pwallet);
 
-    const auto err{wallet.FillPSBT(psbt_tx, complete, nHashType, sign, bip32derivs, nullptr, finalize)};
+    const auto err{wallet.FillPSBT(psbt_tx, complete, nHashType, sign, bip32derivs, nullptr, finalize, preferred_pq_algo)};
     if (err) {
         throw JSONRPCPSBTError(*err);
     }

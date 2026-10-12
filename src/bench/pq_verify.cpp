@@ -80,6 +80,33 @@ void bench_slhdsa_verify(benchmark::Bench& bench)
     });
 }
 
+void bench_mldsa_sign(benchmark::Bench& bench)
+{
+    CPQKey key;
+    key.MakeNewKey(PQAlgorithm::ML_DSA_44);
+    assert(key.IsValid());
+    const uint256 hash = BenchmarkMessageHash();
+    std::vector<unsigned char> sig;
+
+    bench.minEpochIterations(20).run([&] {
+        assert(key.Sign(hash, sig));
+    });
+}
+
+void bench_slhdsa_sign(benchmark::Bench& bench)
+{
+    CPQKey key;
+    key.MakeNewKey(PQAlgorithm::SLH_DSA_128S);
+    assert(key.IsValid());
+    const uint256 hash = BenchmarkMessageHash();
+    std::vector<unsigned char> sig;
+
+    // One SLH-DSA-128s signature takes seconds with the reference implementation.
+    bench.epochs(3).minEpochIterations(1).run([&] {
+        assert(key.Sign(hash, sig));
+    });
+}
+
 void bench_worst_case_p2mr_block(benchmark::Bench& bench)
 {
     CPQKey mldsa_key;
@@ -149,5 +176,7 @@ void bench_worst_case_tapscript_block(benchmark::Bench& bench)
 BENCHMARK(bench_schnorr_verify, benchmark::PriorityLevel::HIGH);
 BENCHMARK(bench_mldsa_verify, benchmark::PriorityLevel::HIGH);
 BENCHMARK(bench_slhdsa_verify, benchmark::PriorityLevel::HIGH);
+BENCHMARK(bench_mldsa_sign, benchmark::PriorityLevel::HIGH);
+BENCHMARK(bench_slhdsa_sign, benchmark::PriorityLevel::HIGH);
 BENCHMARK(bench_worst_case_p2mr_block, benchmark::PriorityLevel::LOW);
 BENCHMARK(bench_worst_case_tapscript_block, benchmark::PriorityLevel::LOW);

@@ -3157,7 +3157,7 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
     return false;
 }
 
-std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbt_tx, bool& complete, int sighash_type, bool sign, bool bip32derivs, size_t * n_signed, bool finalize) const
+std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbt_tx, bool& complete, int sighash_type, bool sign, bool bip32derivs, size_t * n_signed, bool finalize, std::optional<PQAlgorithm> preferred_pq_signing_algo) const
 {
     if (n_signed) {
         *n_signed = 0;
@@ -3197,7 +3197,7 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbt_tx, 
     const PrecomputedTransactionData probe_txdata = PrecomputePSBTData(psbt_tx);
 
     for (ScriptPubKeyMan* spk_man : spk_mans) {
-        const auto error{spk_man->FillPSBT(psbt_tx, probe_txdata, sighash_type, /*sign=*/false, bip32derivs, /*n_signed=*/nullptr, /*finalize=*/false, slhdsa_fips205)};
+        const auto error{spk_man->FillPSBT(psbt_tx, probe_txdata, sighash_type, /*sign=*/false, bip32derivs, /*n_signed=*/nullptr, /*finalize=*/false, slhdsa_fips205, preferred_pq_signing_algo)};
         if (error) {
             return error;
         }
@@ -3226,7 +3226,7 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbt_tx, 
     // serializing expensive signing operations across concurrent RPC calls.
     for (ScriptPubKeyMan* spk_man : spk_mans) {
         int n_signed_this_spkm = 0;
-        const auto error{spk_man->FillPSBT(psbt_tx, txdata, sighash_type, sign, bip32derivs, &n_signed_this_spkm, finalize, slhdsa_fips205)};
+        const auto error{spk_man->FillPSBT(psbt_tx, txdata, sighash_type, sign, bip32derivs, &n_signed_this_spkm, finalize, slhdsa_fips205, preferred_pq_signing_algo)};
         if (error) {
             return error;
         }

@@ -516,6 +516,135 @@ BOOST_AUTO_TEST_CASE(signp2mr_prefers_slhdsa_leaf_when_requested)
     BOOST_CHECK_EQUAL(sigdata.scriptWitness.stack[0].size(), SLHDSA128S_SIGNATURE_SIZE);
 }
 
+// A wallet descriptor carries an ML-DSA leaf and an SLH-DSA backup leaf, and the backup leaf sorts
+// first in the leaf map. Signing must not run SLH-DSA (seconds per signature with the reference
+// implementation) when the preferred ML-DSA leaf can be signed.
+BOOST_AUTO_TEST_CASE(signp2mr_signs_only_the_preferred_leaf)
+{
+    CPQKey ml_key;
+    ml_key.MakeNewKey(PQAlgorithm::ML_DSA_44);
+    BOOST_REQUIRE(ml_key.IsValid());
+    CPQKey slh_key;
+    slh_key.MakeNewKey(PQAlgorithm::SLH_DSA_128S);
+    BOOST_REQUIRE(slh_key.IsValid());
+
+    const std::vector<unsigned char> ml_leaf_script = BuildP2MRScript(PQAlgorithm::ML_DSA_44, ml_key.GetPubKey());
+    const std::vector<unsigned char> slh_leaf_script = BuildP2MRScript(PQAlgorithm::SLH_DSA_128S, slh_key.GetPubKey());
+    BOOST_REQUIRE(slh_leaf_script < ml_leaf_script); // the map visits the backup leaf first
+    const uint256 ml_leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION, ml_leaf_script);
+    const uint256 slh_leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION, slh_leaf_script);
+    const uint256 merkle_root = ComputeP2MRMerkleRoot({ml_leaf_hash, slh_leaf_hash});
+
+    const CMutableTransaction tx_credit = BuildCreditingTransaction(BuildP2MROutput(merkle_root), /*nValue=*/5'000);
+    CMutableTransaction tx_spend = BuildSpendingTransaction(CScript{}, CScriptWitness{}, CTransaction{tx_credit});
+    PrecomputedTransactionData txdata;
+    txdata.Init(tx_spend, {tx_credit.vout.at(0)}, /*force=*/true);
+    const CScript& spk = tx_credit.vout.at(0).scriptPubKey;
+
+    FlatSigningProvider provider;
+    P2MRSpendData spenddata;
+    std::vector<unsigned char> ml_control{P2MR_LEAF_VERSION};
+    ml_control.insert(ml_control.end(), slh_leaf_hash.begin(), slh_leaf_hash.end());
+    spenddata.scripts[ml_leaf_script].insert(ml_control);
+    std::vector<unsigned char> slh_control{P2MR_LEAF_VERSION};
+    slh_control.insert(slh_control.end(), ml_leaf_hash.begin(), ml_leaf_hash.end());
+    spenddata.scripts[slh_leaf_script].insert(slh_control);
+    provider.p2mr_spends[WitnessV2P2MR{merkle_root}] = spenddata;
+    provider.pq_keys[ml_key.GetPubKey()] = ml_key;
+    provider.pq_keys[slh_key.GetPubKey()] = slh_key;
+
+    MutableTransactionSignatureCreator creator(
+        tx_spend, /*input_idx=*/0, tx_credit.vout.at(0).nValue, &txdata, SIGHASH_DEFAULT);
+    SignatureData sigdata;
+    BOOST_REQUIRE(ProduceSignature(provider, creator, spk, sigdata));
+    BOOST_REQUIRE_EQUAL(sigdata.scriptWitness.stack.size(), 3U);
+    BOOST_CHECK(sigdata.scriptWitness.stack[1] == ml_leaf_script);
+    BOOST_CHECK_EQUAL(sigdata.scriptWitness.stack[0].size(), MLDSA44_SIGNATURE_SIZE);
+    // Exactly one signature was produced, and it is the ML-DSA one.
+    BOOST_CHECK_EQUAL(sigdata.p2mr_script_sigs.size(), 1U);
+    BOOST_CHECK_EQUAL(sigdata.p2mr_script_sigs.count({ml_leaf_hash, ml_key.GetPubKey()}), 1U);
+
+    // The placeholder signer picks the same leaf and sizes every witness element like the real one.
+    SignatureData placeholder;
+    BOOST_REQUIRE(ProduceSignature(provider, DUMMY_SIGNATURE_CREATOR, spk, placeholder));
+    BOOST_REQUIRE_EQUAL(placeholder.scriptWitness.stack.size(), sigdata.scriptWitness.stack.size());
+    for (size_t i = 0; i < placeholder.scriptWitness.stack.size(); ++i) {
+        BOOST_CHECK_EQUAL(placeholder.scriptWitness.stack[i].size(), sigdata.scriptWitness.stack[i].size());
+    }
+    BOOST_CHECK(placeholder.scriptWitness.stack[1] == ml_leaf_script);
+
+    // Without the ML-DSA key the keyed placeholder signer falls back to the SLH-DSA leaf, as the
+    // real signer would; the unkeyed one keeps assuming the preferred leaf.
+    FlatSigningProvider slh_only = provider;
+    slh_only.pq_keys.erase(ml_key.GetPubKey());
+    SignatureData keyed;
+    BOOST_REQUIRE(ProduceSignature(slh_only, DUMMY_KEYED_SIGNATURE_CREATOR, spk, keyed));
+    BOOST_REQUIRE_EQUAL(keyed.scriptWitness.stack.size(), 3U);
+    BOOST_CHECK(keyed.scriptWitness.stack[1] == slh_leaf_script);
+    BOOST_CHECK_EQUAL(keyed.scriptWitness.stack[0].size(), SLHDSA128S_SIGNATURE_SIZE);
+    SignatureData unkeyed;
+    BOOST_REQUIRE(ProduceSignature(slh_only, DUMMY_SIGNATURE_CREATOR, spk, unkeyed));
+    BOOST_REQUIRE_EQUAL(unkeyed.scriptWitness.stack.size(), 3U);
+    BOOST_CHECK(unkeyed.scriptWitness.stack[1] == ml_leaf_script);
+    // Without any key at all the keyed signer cannot pick a leaf.
+    FlatSigningProvider no_keys = provider;
+    no_keys.pq_keys.clear();
+    SignatureData none;
+    BOOST_CHECK(!ProduceSignature(no_keys, DUMMY_KEYED_SIGNATURE_CREATOR, spk, none));
+}
+
+// SignPSBTInput picks the P2MR leaf the caller prefers, so the PSBT-based RPCs (send,
+// walletprocesspsbt) sign the leaf the fee was quoted for.
+BOOST_AUTO_TEST_CASE(psbt_sign_honours_preferred_pq_algo)
+{
+    CPQKey ml_key;
+    ml_key.MakeNewKey(PQAlgorithm::ML_DSA_44);
+    BOOST_REQUIRE(ml_key.IsValid());
+    CPQKey slh_key;
+    slh_key.MakeNewKey(PQAlgorithm::SLH_DSA_128S);
+    BOOST_REQUIRE(slh_key.IsValid());
+
+    const std::vector<unsigned char> ml_leaf_script = BuildP2MRScript(PQAlgorithm::ML_DSA_44, ml_key.GetPubKey());
+    const std::vector<unsigned char> slh_leaf_script = BuildP2MRScript(PQAlgorithm::SLH_DSA_128S, slh_key.GetPubKey());
+    const uint256 ml_leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION, ml_leaf_script);
+    const uint256 slh_leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION, slh_leaf_script);
+    const uint256 merkle_root = ComputeP2MRMerkleRoot({ml_leaf_hash, slh_leaf_hash});
+
+    const CMutableTransaction tx_credit = BuildCreditingTransaction(BuildP2MROutput(merkle_root), /*nValue=*/5'000);
+    const CMutableTransaction tx_spend = BuildSpendingTransaction(CScript{}, CScriptWitness{}, CTransaction{tx_credit});
+
+    FlatSigningProvider provider;
+    P2MRSpendData spenddata;
+    std::vector<unsigned char> ml_control{P2MR_LEAF_VERSION};
+    ml_control.insert(ml_control.end(), slh_leaf_hash.begin(), slh_leaf_hash.end());
+    spenddata.scripts[ml_leaf_script].insert(ml_control);
+    std::vector<unsigned char> slh_control{P2MR_LEAF_VERSION};
+    slh_control.insert(slh_control.end(), ml_leaf_hash.begin(), ml_leaf_hash.end());
+    spenddata.scripts[slh_leaf_script].insert(slh_control);
+    provider.p2mr_spends[WitnessV2P2MR{merkle_root}] = spenddata;
+    provider.pq_keys[ml_key.GetPubKey()] = ml_key;
+    provider.pq_keys[slh_key.GetPubKey()] = slh_key;
+
+    PartiallySignedTransaction psbt_base{tx_spend};
+    psbt_base.inputs.at(0).witness_utxo = tx_credit.vout.at(0);
+    const PrecomputedTransactionData txdata = PrecomputePSBTData(psbt_base);
+
+    PartiallySignedTransaction psbt_default = psbt_base;
+    BOOST_REQUIRE(SignPSBTInput(provider, psbt_default, /*index=*/0, &txdata, SIGHASH_DEFAULT, nullptr, /*finalize=*/true));
+    const auto& default_stack = psbt_default.inputs.at(0).final_script_witness.stack;
+    BOOST_REQUIRE_EQUAL(default_stack.size(), 3U);
+    BOOST_CHECK(default_stack[1] == ml_leaf_script);
+    BOOST_CHECK_EQUAL(default_stack[0].size(), MLDSA44_SIGNATURE_SIZE);
+
+    PartiallySignedTransaction psbt_slh = psbt_base;
+    BOOST_REQUIRE(SignPSBTInput(provider, psbt_slh, /*index=*/0, &txdata, SIGHASH_DEFAULT, nullptr, /*finalize=*/true,
+                                /*slhdsa_fips205=*/false, PQAlgorithm::SLH_DSA_128S));
+    const auto& slh_stack = psbt_slh.inputs.at(0).final_script_witness.stack;
+    BOOST_REQUIRE_EQUAL(slh_stack.size(), 3U);
+    BOOST_CHECK(slh_stack[1] == slh_leaf_script);
+    BOOST_CHECK_EQUAL(slh_stack[0].size(), SLHDSA128S_SIGNATURE_SIZE);
+}
+
 BOOST_AUTO_TEST_CASE(psbt_multisig_p2mr_partial_combine_finalize)
 {
     CPQKey key1;

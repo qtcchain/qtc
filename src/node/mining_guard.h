@@ -88,7 +88,19 @@ MiningChainGuardStatus EvaluateMiningChainGuard(
  * "insufficient_peer_consensus" and trigger peer churn. Returns -1 when
  * nothing is known.
  */
-int ResolveMiningChainGuardPeerHeight(int sync_height, int common_height, int starting_height);
+/**
+ * Height a peer contributes to the chain guard: the higher of what it announced
+ * to us (sync_height) and what we relayed to it (relayed_height: best header
+ * we sent or best block it fetched from us), then the last common block, then
+ * the handshake starting height; -1 when none is known. The relayed height is
+ * what lets a node that usually relays first still see its outbound peers as
+ * near tip (issue #15).
+ */
+int ResolveMiningChainGuardPeerHeight(int sync_height, int relayed_height, int common_height, int starting_height);
+inline int ResolveMiningChainGuardPeerHeight(int sync_height, int common_height, int starting_height)
+{
+    return ResolveMiningChainGuardPeerHeight(sync_height, /*relayed_height=*/-1, common_height, starting_height);
+}
 
 std::vector<int> FilterMiningChainGuardPeerHeights(
     int local_tip_height,
