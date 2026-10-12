@@ -1,14 +1,15 @@
 QTC version 0.2.4
 =================
 
-Tag `v0.2.4`. Supersedes `v0.2.3`, which was tagged on 12 October 2026 but
-never published: its testnet soak showed the mining-readiness fix below was
-blind in the very topology it targets (see "Mining readiness"), so no
-binaries were released for it. Wallet performance, mining readiness, RPC and relay-policy
-update. No consensus rule changes: blocks are valid or invalid exactly as before, and v0.2.0
-through v0.2.3 nodes interoperate. **Activation height: none.** The chain
-anchor (minimum chain work, assume-valid block, checkpoint and transaction
-statistics) is refreshed to the block stated in the "Chain anchor" section.
+Tag `v0.2.4`. Wallet performance, mining readiness, RPC and relay-policy
+update. It supersedes `v0.2.3`, which was tagged on 12 October 2026 but never
+published: its testnet soak showed that the mining-readiness fix was blind in
+the very topology it targets (see "Mining readiness"), so no binaries were
+released for it. No consensus rule changes: blocks are valid or invalid
+exactly as before, and v0.2.0 through v0.2.4 nodes interoperate.
+**Activation height: none.** The chain anchor (minimum chain work,
+assume-valid block, checkpoint and transaction statistics) is refreshed to
+the block stated in the "Chain anchor" section.
 
 **Who should upgrade:** everyone who spends from a wallet, in particular
 miners sweeping coinbase outputs and anyone whose wallet descriptor carries an
