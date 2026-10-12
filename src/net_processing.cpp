@@ -577,6 +577,12 @@ struct CNodeState {
     const CBlockIndex* pindexLastCommonBlock{nullptr};
     //! The best header we have sent our peer.
     const CBlockIndex* pindexBestHeaderSent{nullptr};
+    //! The best block our peer fetched from us with getdata (block, compact
+    //! block or merkle block). A node never announces a block back to the
+    //! peer it received it from, so this and pindexBestHeaderSent are the
+    //! only evidence a well-connected miner has that its outbound peers are
+    //! at its tip (issue #15).
+    const CBlockIndex* pindexBestBlockServed{nullptr};
     //! Whether we've started headers synchronization with this peer.
     bool fSyncStarted{false};
     //! Since when we're stalling block download progress (in microseconds), or 0.
@@ -1979,6 +1985,8 @@ bool PeerManagerImpl::GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) c
             return false;
         stats.nSyncHeight = state->pindexBestKnownBlock ? state->pindexBestKnownBlock->nHeight : -1;
         stats.nCommonHeight = state->pindexLastCommonBlock ? state->pindexLastCommonBlock->nHeight : -1;
+        stats.m_best_header_sent_height = state->pindexBestHeaderSent ? state->pindexBestHeaderSent->nHeight : -1;
+        stats.m_best_block_served_height = state->pindexBestBlockServed ? state->pindexBestBlockServed->nHeight : -1;
         for (const QueuedBlock& queue : state->vBlocksInFlight) {
             if (queue.pindex)
                 stats.vHeightInFlight.push_back(queue.pindex->nHeight);
@@ -2963,11 +2971,14 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
         }
         pblock = pblockRead;
     }
+    bool served{false};
     if (pblock) {
         if (inv.IsMsgBlk()) {
             MakeAndPushMessage(pfrom, NetMsgType::BLOCK, TX_NO_WITNESS_WITH_SHIELDED(*pblock));
+            served = true;
         } else if (inv.IsMsgWitnessBlk()) {
             MakeAndPushMessage(pfrom, NetMsgType::BLOCK, TX_WITH_WITNESS(*pblock));
+            served = true;
         } else if (inv.IsMsgFilteredBlk() || inv.IsMsgFilteredWitnessBlk()) {
             bool sendMerkleBlock = false;
             CMerkleBlock merkleBlock;
@@ -2979,6 +2990,7 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
                 }
             }
             if (sendMerkleBlock) {
+                served = true;
                 MakeAndPushMessage(pfrom, NetMsgType::MERKLEBLOCK, merkleBlock);
                 // CMerkleBlock just contains hashes, so also push any transactions in the block the client did not see
                 // This avoids hurting performance by pointlessly requiring a round-trip
@@ -2994,6 +3006,7 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
             // else
             // no response
         } else if (inv.IsMsgCmpctBlk()) {
+            served = true; // every branch below sends the block in some form
             const bool requires_product_payload =
                 m_chainparams.GetConsensus().fMatMulPOW &&
                 m_chainparams.GetConsensus().fMatMulFreivaldsEnabled &&
@@ -3013,6 +3026,20 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
                 }
             } else {
                 MakeAndPushMessage(pfrom, NetMsgType::BLOCK, TX_WITH_WITNESS(*pblock));
+            }
+        }
+    }
+
+    if (served) {
+        // The peer fetched this block from us, so it holds the header and the
+        // block data even though it will never announce the block back to us.
+        // Mining template readiness and the chain guard read this as a sync
+        // signal alongside the peer's own announcements (issue #15).
+        LOCK(cs_main);
+        if (CNodeState* state = State(pfrom.GetId())) {
+            if (state->pindexBestBlockServed == nullptr ||
+                state->pindexBestBlockServed->nHeight < pindex->nHeight) {
+                state->pindexBestBlockServed = pindex;
             }
         }
     }
