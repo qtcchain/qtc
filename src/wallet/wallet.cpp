@@ -3094,11 +3094,17 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
         }
     }
 
-    // Cross-descriptor PQ key merge: for multisig P2MR descriptors, the leaf
-    // scripts and p2mr_spends live in the multisig descriptor's spk_man, but
-    // PQ private keys may only be derivable from separate solo descriptors.
-    // Build a combined provider by merging p2mr_spends from the descriptor
-    // that owns each coin's script with PQ keys from ALL descriptors.
+    // Cross-descriptor PQ key merge: for multisig P2MR descriptors and for
+    // imported fixed-key mr(<hex>, ...) descriptors, the leaf scripts and
+    // p2mr_spends live in the descriptor's own spk_man while the PQ private
+    // keys may only be derivable from another descriptor (a solo descriptor,
+    // or the HD descriptor that generated the key). Build a combined provider
+    // by merging p2mr_spends from the descriptor that owns each coin's script
+    // with the leaf keys looked up across ALL descriptors. The lookup covers
+    // every leaf key the merged provider lacks, not only the case where it
+    // holds no PQ key at all: a transaction that also spends an HD coin
+    // already contributes that coin's key, which used to skip the lookup and
+    // leave the fixed-key input unsigned (#20).
     {
         FlatSigningProvider merged;
         bool have_p2mr_spends{false};
@@ -3114,9 +3120,10 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
                 }
             }
         }
-        if (have_p2mr_spends && merged.pq_keys.empty()) {
+        if (have_p2mr_spends) {
             // Extract PQ pubkeys from the leaf scripts in p2mr_spends, then
-            // look each one up across all descriptors to find matching private keys.
+            // look up each one the merged provider does not already hold
+            // across all descriptors to find matching private keys.
             std::set<std::vector<unsigned char>> pq_pubkeys_needed;
             for (const auto& [output, spenddata] : merged.p2mr_spends) {
                 for (const auto& [leaf_script, controls] : spenddata.scripts) {
@@ -3127,12 +3134,14 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
                     opcodetype opcode;
                     std::vector<unsigned char> push_data;
                     while (script_obj.GetOp(pc, opcode, push_data)) {
-                        if (push_data.size() == MLDSA44_PUBKEY_SIZE || push_data.size() == SLHDSA128S_PUBKEY_SIZE) {
+                        if ((push_data.size() == MLDSA44_PUBKEY_SIZE || push_data.size() == SLHDSA128S_PUBKEY_SIZE) &&
+                            merged.GetPQKey(push_data) == nullptr) {
                             pq_pubkeys_needed.insert(push_data);
                         }
                     }
                 }
             }
+            bool added_keys{false};
             for (const auto& pq_pub : pq_pubkeys_needed) {
                 for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
                     auto* desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man);
@@ -3140,11 +3149,12 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
                     auto pq_keys = desc_spk_man->GetSigningProvider(Span<const unsigned char>{pq_pub});
                     if (pq_keys && !pq_keys->pq_keys.empty()) {
                         merged.Merge(std::move(*pq_keys));
+                        added_keys = true;
                         break;
                     }
                 }
             }
-            if (!merged.pq_keys.empty()) {
+            if (added_keys) {
                 input_errors.clear();
                 if (::SignTransaction(tx, &merged, coins, sighash, input_errors, inputs_amount_sum, preferred_pq_signing_algo, slhdsa_fips205)) {
                     return true;
