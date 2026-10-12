@@ -160,15 +160,16 @@ Known issues
 Chain anchor
 ------------
 
-- Generated on fleet node C (mainnet, genesis `d5f04a8a…eb24`) at 2026-10-11
-  23:49 UTC from tip 1825 and applied to `src/kernel/chainparams.cpp`
-  (manifest kept on the build box as `/root/mainnet-hardening-0.2.3.json`):
-  - `defaultAssumeValid` and checkpoint: height **1823**,
-    `cfc093e05f14041b85c57e3648c4659b03a9971be78f12f50cc1cff1e0314d20`
-  - `nMinimumChainWork`: `0x17dcea32d6`
-  - `chainTxData`: 1826 transactions at time 1791762389, 0.00315 tx/s
-  The v0.2.1 checkpoint at height 300 is kept; `defaultAssumeValid` is set
-  for the first time on mainnet v2. Regenerate before tagging if the tag
+- Generated on fleet node C (mainnet, genesis `d5f04a8a…eb24`) at 2026-10-12
+  08:53 UTC from tip 1897 and applied to `src/kernel/chainparams.cpp`
+  (manifest kept on the build box as `/root/mainnet-hardening-0.2.4.json`):
+  - `defaultAssumeValid` and checkpoint: height **1895**,
+    `bbc9f64eee6ff9f9c69114e892f2e00a7859d3bcb1ea49b7f34c669053792227`
+    (2026-10-12 08:34 UTC)
+  - `nMinimumChainWork`: `0x19e0623e2c`
+  - `chainTxData`: 1898 transactions at time 1791794985, 0.00309 tx/s
+  The v0.2.1 checkpoint at height 300 and the unpublished v0.2.3 anchor at
+  height 1823 are kept as checkpoints. Regenerate before tagging if the tag
   lands much later (the script needs `--allow-low-anchor-height` while the
   chain is below height 50,000; its matcher does not accept the placeholder
   line formats, so the values were applied by hand and pinned in
