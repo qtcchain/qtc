@@ -4386,6 +4386,22 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             }
         }
 
+        // QTC v0.2.4 forced-upgrade floor (doc/upgrade-policy.md section 3, recorded exception):
+        // once the tip has reached the floor height, peers below the v0.2.4 protocol are refused
+        // at the handshake. Connections opened before the floor height are closed from
+        // SendMessages when the height is reached.
+        if (nVersion < m_opts.min_v024_version) {
+            LOCK(cs_main);
+            const CBlockIndex* tip = m_chainman.ActiveChain().Tip();
+            if (tip && tip->nHeight >= m_opts.v024_protocol_floor_height) {
+                LogInfo("Disconnecting peer=%d (protocol %d): below the v0.2.4 protocol floor %d, chain height %d >= floor height %d\n",
+                        pfrom.GetId(), nVersion, m_opts.min_v024_version,
+                        tip->nHeight, m_opts.v024_protocol_floor_height);
+                pfrom.fDisconnect = true;
+                return;
+            }
+        }
+
         if (!vRecv.empty()) {
             // The version message includes information about the sending node which we don't use:
             //   - 8 bytes (service bits)
@@ -7019,6 +7035,18 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
     // Don't send anything until the version handshake is complete
     if (!pto->fSuccessfullyConnected || pto->fDisconnect)
         return true;
+
+    // QTC v0.2.4 forced-upgrade floor for connections that were open before the
+    // floor height was reached (new connections are refused at the handshake).
+    if (pto->nVersion < m_opts.min_v024_version) {
+        const int tip_height{WITH_LOCK(cs_main, return m_chainman.ActiveChain().Height())};
+        if (tip_height >= m_opts.v024_protocol_floor_height) {
+            LogInfo("Disconnecting peer=%d (protocol %d): below the v0.2.4 protocol floor %d at chain height %d\n",
+                    pto->GetId(), pto->nVersion.load(), m_opts.min_v024_version, tip_height);
+            pto->fDisconnect = true;
+            return true;
+        }
+    }
 
     const auto current_time{GetTime<std::chrono::microseconds>()};
 

@@ -1,0 +1,204 @@
+QTC version 0.2.4
+=================
+
+Tag `v0.2.4`. Wallet performance, mining readiness, RPC and relay-policy
+update. It supersedes `v0.2.3`, which was tagged on 12 October 2026 but never
+published: its testnet soak showed that the mining-readiness fix was blind in
+the very topology it targets (see "Mining readiness"), so no binaries were
+released for it. No consensus rule changes: blocks are valid or invalid
+exactly as before. **Activation height: none** (no consensus change).
+**Protocol floor height: 4100 on mainnet** (see "Protocol floor"): from that
+height, nodes on this release disconnect peers that have not upgraded. The
+chain anchor (minimum chain work, assume-valid block, checkpoint and
+transaction statistics) is refreshed to the block stated in the "Chain
+anchor" section.
+
+**Who should upgrade:** everyone, before mainnet height 4100 (about 27
+October 2026); in particular everyone who spends from a wallet, especially
+miners sweeping coinbase outputs and anyone whose wallet descriptor carries an
+SLH-DSA backup leaf (the default `mr(pqhd(...),pk_slh(pqhd(...)))` layout);
+every relay that should carry QTC-EVM anchor transactions (see "Relay
+policy"); and every miner that was refused `getblocktemplate` work with
+"synced outbound peers" while its peers were in fact at the tip (see
+"Mining readiness", issue #15).
+
+Verify downloads against the signed `SHA256SUMS` as described in the README.
+
+Wallet performance
+------------------
+
+- **Spending no longer signs the SLH-DSA backup leaf.** The P2MR signer
+  visited leaves in script-byte order, which put the 32-byte SLH-DSA key push
+  ahead of the ML-DSA key push, so every spend produced a full SLH-DSA-128s
+  signature (about 1.6 s on a 2 GHz x86_64 core with the reference SPHINCS+
+  code) and then discarded it in favour of the ML-DSA leaf. Leaves are now
+  visited preferred-algorithm first and the signer stops as soon as the
+  preferred leaf signs. Multisig leaves sign fallback-algorithm keys only when
+  the preferred keys do not reach the threshold. Which leaf is chosen is
+  unchanged; only the wasted work is gone.
+- **Fee quotes no longer run real signing.** The wallet sized P2MR inputs by
+  signing them for real, several times per transaction (change prototype,
+  each candidate input set, and all of it twice for the avoid-partial-spends
+  retry). Sizes now come from placeholder signatures chosen with the keys the
+  wallet actually holds, so they are still exact, including the node's sigop
+  pricing for SLH-DSA inputs. Two latent defects on the placeholder path were
+  fixed on the way: the dummy signature checker rejected post-quantum
+  placeholders (every provider-based P2MR quote fell to the 20 000 vB
+  maximum), and probe inputs with a null prevout looked like a coinbase, for
+  which the node counts no witness sigops.
+- **Mixed HD and imported fixed-key inputs sign (#20, PR #30).** A transaction
+  that spends an imported fixed-key `mr(<hex>, ...)` output together with one
+  of the wallet's HD coins left the fixed-key input unsigned on the raw path
+  (`signrawtransactionwithwallet`), although the PSBT path completed it. The
+  cross-descriptor key lookup now covers every leaf key the signer lacks
+  instead of running only when it holds no key at all.
+- Measured on the same regtest node and wallet copy, 2-input spend, against
+  the v0.2.2 binary: `fundrawtransaction` 13.3–14.3 s → 0.2–1.2 s,
+  `signrawtransactionwithwallet` 3.3–3.9 s → 0.01 s, `send` 15.5–16.4 s →
+  0.2–0.7 s. `getbalance` and other wallet RPCs no longer queue behind them.
+
+RPC changes
+-----------
+
+- `preferred_pq_algo` (values `ml_dsa_44`, `slh_dsa_128s`) now reaches the
+  signer on every RPC that signs P2MR inputs, so the leaf the fee was quoted
+  for is the leaf that gets signed:
+  - `send` and `sendall` previously quoted for the requested leaf but signed
+    the default ML-DSA leaf through the PSBT path.
+  - `walletprocesspsbt` accepts `preferred_pq_algo` in its options object.
+  - `signrawtransactionwithwallet` gains a fourth optional argument
+    `preferred_pq_algo`; pass the value given to `fundrawtransaction`.
+  - `bumpfee` and `psbtbumpfee` accept `preferred_pq_algo` in their options;
+    the replacement is sized for that leaf and `bumpfee` signs with it.
+    `psbtbumpfee` returns an unsigned PSBT, so pass the same value to
+    `walletprocesspsbt`.
+  Omitting the option keeps the previous behaviour (ML-DSA leaf). The fee
+  estimator now honours the option as well, so a spend that asks for
+  `slh_dsa_128s` is quoted at the SLH-DSA size (sigop-bound, 20 000 vB per
+  input) instead of the ML-DSA size.
+
+Build
+-----
+
+- **Optional AVX2 SLH-DSA backend on x86_64.** `cmake -DQTC_SLHDSA_AVX2=ON`
+  builds `libbitcoinpqc` from the SPHINCS+ `shake-avx2` variant: SLH-DSA-128s
+  signing 1.59 s → 0.40 s and verification 1.56 ms → 0.64 ms on the same
+  core. The variant produces byte-identical signatures to the reference
+  backend in both FIPS-205 modes and each backend verifies the other's
+  signatures. It is off by default and not used for the Guix release binaries,
+  which must run on CPUs without AVX2. See `doc/build-unix.md`.
+- `bench_qtc` gains `bench_mldsa_sign` and `bench_slhdsa_sign`.
+
+Also in this release
+--------------------
+
+- **`libbitcoinpqc`: SLH-DSA signing now uses its own entropy source.** The
+  SPHINCS+ sources and the Dilithium shim both defined `randombytes()`, and
+  link order gave SLH-DSA signing the ML-DSA shim, so the SLH-DSA wrapper's
+  seeded hedging was never used and the documented deterministic C API
+  (`random_data = NULL`) was not deterministic. The SPHINCS+ sources now call
+  `slh_dsa_randombytes()`. Wallet signatures are unchanged and still hedged
+  with fresh entropy; only the raw C API without caller entropy becomes
+  deterministic, and a unit test now checks that on every backend.
+
+Relay policy (PR #19)
+---------------------
+
+- **P2MR data-envelope leaves are standard.** A leaf that begins with
+  `OP_0 OP_IF <push> ... <push> OP_ENDIF` is classified by what follows the
+  envelope (CTV-only, checksig, multisig, ...). The body never executes, so
+  consensus already accepted such spends; relays now forward them. The
+  QTC-EVM layer 2 carries its batch data this way: one key-less P2MR output
+  per slice, spent by the anchor transaction whose CTV template the leaf
+  commits to. Relays that do not upgrade still validate these transactions in
+  blocks; they only decline to relay them.
+- `mr()` descriptors with more than one backup leaf render as a flat list
+  (`mr(k,l1,l2,...)`) and the parser accepted only one backup-tree expression,
+  so a wallet that imported a three-leaf tree could not re-parse its own
+  descriptor on load ("Wallet corrupted"). The parser now accepts the flat
+  form. The rendering is unchanged, so descriptor IDs and existing wallets
+  are stable.
+
+Mining readiness (#15, PRs #23, #27, #28)
+-----------------------------------------
+
+- **Peers that received the tip from this node now count as synced.** A node
+  never announces a block back to the peer it received it from, so the
+  readiness guard (`-miningminsyncedoutboundpeers`) and the chain guard's
+  `near_tip_peers` judged outbound peers by their announced header height
+  only. A well-connected miner that hears of a block first and relays it to
+  its outbound peers saw every one of them as stale: fleet node B was refused
+  template work about 30,000 times in a day on 8-9 October with a healthy
+  mesh. Each peer is now judged by the higher of the height it announced to
+  this node and the height this node relayed to it (best header sent, or best
+  block the peer fetched). The version-handshake starting height stays a
+  fallback only when neither exists, so a lagging peer cannot be talked back
+  in through its handshake.
+- **Inv announcements count too (PR #28).** A node announces a block by `inv`
+  rather than headers whenever it cannot prove the peer has the parent header,
+  which is every peer right after a restart and permanently a peer that never
+  announces anything back. The v0.2.3 tag only credited headers announcements
+  and blocks the peer fetched from us, so on the v0.2.3 testnet soak node B
+  still saw its relays as unsynced after relaying a block to them by inv. The
+  best block announced by inv is now tracked as well (`getpeerinfo`
+  `invs_sent`).
+- **Handshake fallback fixed (#26, PR #27).** The readiness diagnostics read
+  the peer's starting height from a field nothing populates, so the
+  version-handshake fallback always saw height 0 (correct only at genesis,
+  where it was written). It now reads the peer state the chain guard already
+  used.
+- **Default `-miningmaxpeersyncheightlag` is 3 on mainnet** (was 1; one block
+  was below normal relay jitter). Miners that set
+  `miningminsyncedoutboundpeers=1` and `miningmaxpeersyncheightlag=3` as a
+  workaround can remove both lines after upgrading.
+- `getblocktemplate` logs one line when it starts refusing work and one when
+  it serves again (with the refusal count), instead of one line per refused
+  call.
+- `getpeerinfo` gains `headers_sent` and `blocks_served`; the mining
+  diagnostics gain `relayed_height`, `synced_by_relay` and
+  `outbound_peers_synced_by_relay`.
+
+Protocol floor (forced upgrade at mainnet height 4100)
+-------------------------------------------------------
+
+- The P2P protocol version is **800003**. Once the chain tip reaches height
+  **4100** on mainnet (about 27 October 2026 at the October block spacing,
+  more than 2 000 blocks after this tag), nodes on this release disconnect
+  peers that still speak 800002 or older: new connections are refused at the
+  version handshake and connections opened earlier are closed. A node that
+  has not upgraded by then loses every connection to upgraded nodes, so it
+  stops receiving blocks and its own blocks stop propagating. Block validity
+  is unchanged, so this cannot split the chain; it retires the old software.
+- This is a recorded exception to the peer-floor convention in
+  `doc/upgrade-policy.md` (the floor normally lags one release and never
+  carries a height), taken by the owner on 12 October 2026 so that every miner
+  runs the mining-readiness and relay-policy fixes. Measured impact when the
+  decision was taken: all 25 distinct public peers seen by relay C were on
+  v0.2.0, v0.2.1 or v0.2.2, i.e. every public node must upgrade before the
+  height. `MIN_PEER_PROTO_VERSION` itself stays 800002.
+- Test-only overrides `-minv024version` and `-v024floorheight` exist for the
+  functional test `p2p_protocol_floor.py`; the floor moves only in a release.
+
+Known issues
+------------
+
+- `fundrawtransaction` occasionally fails with "Fee needed > fee paid" on the
+  new placeholder-quote path (#21); retry, or fund with explicit inputs.
+
+Chain anchor
+------------
+
+- Generated on fleet node C (mainnet, genesis `d5f04a8a…eb24`) at 2026-10-12
+  08:53 UTC from tip 1897 and applied to `src/kernel/chainparams.cpp`
+  (manifest kept on the build box as `/root/mainnet-hardening-0.2.4.json`):
+  - `defaultAssumeValid` and checkpoint: height **1895**,
+    `bbc9f64eee6ff9f9c69114e892f2e00a7859d3bcb1ea49b7f34c669053792227`
+    (2026-10-12 08:34 UTC)
+  - `nMinimumChainWork`: `0x19e0623e2c`
+  - `chainTxData`: 1898 transactions at time 1791794985, 0.00309 tx/s
+  The v0.2.1 checkpoint at height 300 and the unpublished v0.2.3 anchor at
+  height 1823 are kept as checkpoints. Regenerate before tagging if the tag
+  lands much later (the script needs `--allow-low-anchor-height` while the
+  chain is below height 50,000; its matcher does not accept the placeholder
+  line formats, so the values were applied by hand and pinned in
+  `pow_tests`).

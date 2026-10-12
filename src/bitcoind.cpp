@@ -29,6 +29,9 @@
 #include <util/translation.h>
 
 #include <any>
+#include <cstdlib>
+#include <iostream>
+#include <string>
 #include <functional>
 #include <optional>
 
@@ -201,6 +204,31 @@ static bool AppInit(NodeContext& node)
 
         if (args.GetBoolArg("-daemon", DEFAULT_DAEMON) || args.GetBoolArg("-daemonwait", DEFAULT_DAEMONWAIT)) {
 #if HAVE_DECL_FORK
+#if defined(__APPLE__)
+            // v0.2.2: a daemonized process on macOS can lose access to the Metal
+            // compiler service (MTLCompilerService) that the inline-kernel path
+            // needs; the node then silently mines on the CPU. Releases ship
+            // precompiled libraries in bin/metal/, which do not need the service,
+            // but say so up front rather than only in getmininginfo.
+            {
+                const char* const required_backend = std::getenv("QTC_MATMUL_REQUIRE_BACKEND");
+                const char* const requested_backend = std::getenv("QTC_MATMUL_BACKEND");
+                const bool requires_metal = required_backend != nullptr && std::string{required_backend} == "metal";
+                const bool wants_metal = requested_backend == nullptr || requested_backend[0] == '\0' || std::string{requested_backend} == "metal";
+                if (requires_metal) {
+                    return InitError(Untranslated(
+                        "QTC_MATMUL_REQUIRE_BACKEND=metal cannot be combined with -daemon on macOS: a daemonized "
+                        "process may lose access to the Metal compiler service and fall back to CPU, which strict "
+                        "Metal mining must not do. Run qtcd in the foreground (or under launchd) instead."));
+                }
+                if (wants_metal) {
+                    tfm::format(std::cerr,
+                        "Warning: Metal mining with -daemon on macOS. If bin/metal/*.metallib is missing next to this "
+                        "binary, the daemonized node cannot reach the Metal compiler service and falls back to CPU "
+                        "mining; check getmininginfo for active_backend \"metal\" or run qtcd in the foreground.\n");
+                }
+            }
+#endif
             tfm::format(std::cout, "QTC node starting\n");
 
             // Daemonize

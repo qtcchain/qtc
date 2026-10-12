@@ -120,6 +120,11 @@ public:
         int min_smile_v2_version{MIN_SMILE_V2_PROTOCOL_VERSION};
         //! Chain height at which SMILE v2 protocol version enforcement activates.
         int smile_v2_enforcement_height{SMILE_V2_ENFORCEMENT_HEIGHT};
+        //! QTC v0.2.4 forced-upgrade floor: peers below this protocol version are
+        //! disconnected once the chain tip has reached v024_protocol_floor_height
+        //! (test-only overrides -minv024version / -v024floorheight).
+        int min_v024_version{MIN_V024_PROTOCOL_VERSION};
+        int v024_protocol_floor_height{V024_PROTOCOL_FLOOR_HEIGHT};
     };
 
     static std::unique_ptr<PeerManager> make(CConnman& connman, AddrMan& addrman,

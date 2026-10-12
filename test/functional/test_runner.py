@@ -332,6 +332,7 @@ BASE_SCRIPTS = [
     'p2p_getaddr_caching.py',
     'p2p_getdata.py',
     'p2p_addrfetch.py',
+    'p2p_protocol_floor.py',
     'rpc_net.py --v1transport --descriptors',
     'rpc_net.py --v2transport --descriptors',
     'wallet_keypool.py --legacy-wallet',

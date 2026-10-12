@@ -338,10 +338,12 @@ public:
         // Mainnet anchor refreshed on 2026-07-10 at height 155'700 from a
         // synced canonical node so stale history below the current public
         // release floor is rejected quickly.
-        // Minimum chain work and checkpoints are re-pinned once mainnet v2 has history (security review H3).
-        consensus.nMinimumChainWork = uint256{}; // v2: fresh chain, no accumulated work yet (re-anchor in a later release)
-        // No anchored assume-valid block on a brand-new chain.
-        consensus.defaultAssumeValid = uint256{};
+        // QTC v0.2.4 (H3 on mainnet v2): minimum chain work = work at the v0.2.4 anchor block (height 1895,
+        // 2026-10-12 08:34 UTC, read from fleet node C). A syncing node ignores any chain with less work than
+        // this, so a forged low-work header chain cannot stall or mislead IBD. Raised with each release.
+        consensus.nMinimumChainWork = uint256{"00000000000000000000000000000000000000000000000000000019e0623e2c"};
+        // QTC v0.2.4: assume-valid block on mainnet v2 (height 1895, same block as the newest checkpoint).
+        consensus.defaultAssumeValid = uint256{"bbc9f64eee6ff9f9c69114e892f2e00a7859d3bcb1ea49b7f34c669053792227"};
 
         /**
          * The message start string is designed to be unlikely to occur in normal data.
@@ -408,20 +410,25 @@ public:
         // the fallback when DNS resolution is unavailable.
         vFixedSeeds = std::vector<uint8_t>{std::begin(chainparams_seed_main), std::end(chainparams_seed_main)};
 
-        // New chain: only the genesis checkpoint. Add real checkpoints once QTC
-        // has accumulated history and you want to pin against deep reorgs.
         checkpointData = {
             {
                 {0, consensus.hashGenesisBlock},
+                // QTC v0.2.1 (H3): first post-genesis checkpoint on mainnet v2, 7 blocks deep when
+                // pinned, identical on every launch node. Forks below this height are rejected outright.
+                {300, uint256{"cee1347257fc44ee335b6e20b55bc616eba7c84535b572e3ca492162609273f7"}},
+                // QTC v0.2.3 (H3): anchor at height 1823 (2026-10-11 23:49 UTC), read from fleet node C.
+                {1823, uint256{"cfc093e05f14041b85c57e3648c4659b03a9971be78f12f50cc1cff1e0314d20"}},
+                // QTC v0.2.4 (H3): anchor at height 1895 (2026-10-12 08:34 UTC), read from fleet node C.
+                {1895, uint256{"bbc9f64eee6ff9f9c69114e892f2e00a7859d3bcb1ea49b7f34c669053792227"}},
             }
         };
         // No assumeutxo snapshots yet.
         m_assumeutxo_data = {};
-        // No chain-tx statistics yet on the v2 chain.
+        // getchaintxstats 1896 <block 1897> on mainnet v2 at the v0.2.4 anchor.
         chainTxData = ChainTxData{
-            .nTime = 0,
-            .tx_count = 0,
-            .dTxRate = 0,
+            .nTime = 1791794985,
+            .tx_count = 1898,
+            .dTxRate = 0.003090222769856637,
         };
     }
 };
