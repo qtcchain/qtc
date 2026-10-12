@@ -1,8 +1,8 @@
 QTC version 0.2.3
 =================
 
-Tag `v0.2.3`. Wallet performance, RPC and relay-policy update. No consensus
-rule changes: blocks are valid or invalid exactly as before, and v0.2.0
+Tag `v0.2.3`. Wallet performance, mining readiness, RPC and relay-policy
+update. No consensus rule changes: blocks are valid or invalid exactly as before, and v0.2.0
 through v0.2.3 nodes interoperate. **Activation height: none.** The chain
 anchor (minimum chain work, assume-valid block, checkpoint and transaction
 statistics) is refreshed to the block stated in the "Chain anchor" section.
@@ -10,8 +10,10 @@ statistics) is refreshed to the block stated in the "Chain anchor" section.
 **Who should upgrade:** everyone who spends from a wallet, in particular
 miners sweeping coinbase outputs and anyone whose wallet descriptor carries an
 SLH-DSA backup leaf (the default `mr(pqhd(...),pk_slh(pqhd(...)))` layout);
-and every relay that should carry QTC-EVM anchor transactions (see "Relay
-policy", which lands with PR #19).
+every relay that should carry QTC-EVM anchor transactions (see "Relay
+policy"); and every miner that was refused `getblocktemplate` work with
+"synced outbound peers" while its peers were in fact at the tip (see
+"Mining readiness", issue #15).
 
 Verify downloads against the signed `SHA256SUMS` as described in the README.
 
@@ -86,14 +88,8 @@ Also in this release
   with fresh entropy; only the raw C API without caller entropy becomes
   deterministic, and a unit test now checks that on every backend.
 
-Chain anchor
-------------
-
-*To be filled at tag time per `doc/release-process.md`: refreshed chain
-anchor (height and block hash) and the activation-height statement above.*
-
-Relay policy (PR #19, merge before tagging)
--------------------------------------------
+Relay policy (PR #19)
+---------------------
 
 - **P2MR data-envelope leaves are standard.** A leaf that begins with
   `OP_0 OP_IF <push> ... <push> OP_ENDIF` is classified by what follows the
@@ -110,6 +106,32 @@ Relay policy (PR #19, merge before tagging)
   form. The rendering is unchanged, so descriptor IDs and existing wallets
   are stable.
 
+Mining readiness (#15, PR #23)
+------------------------------
+
+- **Peers that received the tip from this node now count as synced.** A node
+  never announces a block back to the peer it received it from, so the
+  readiness guard (`-miningminsyncedoutboundpeers`) and the chain guard's
+  `near_tip_peers` judged outbound peers by their announced header height
+  only. A well-connected miner that hears of a block first and relays it to
+  its outbound peers saw every one of them as stale: fleet node B was refused
+  template work about 30,000 times in a day on 8-9 October with a healthy
+  mesh. Each peer is now judged by the higher of the height it announced to
+  this node and the height this node relayed to it (best header sent, or best
+  block the peer fetched). The version-handshake starting height stays a
+  fallback only when neither exists, so a lagging peer cannot be talked back
+  in through its handshake.
+- **Default `-miningmaxpeersyncheightlag` is 3 on mainnet** (was 1; one block
+  was below normal relay jitter). Miners that set
+  `miningminsyncedoutboundpeers=1` and `miningmaxpeersyncheightlag=3` as a
+  workaround can remove both lines after upgrading.
+- `getblocktemplate` logs one line when it starts refusing work and one when
+  it serves again (with the refusal count), instead of one line per refused
+  call.
+- `getpeerinfo` gains `headers_sent` and `blocks_served`; the mining
+  diagnostics gain `relayed_height`, `synced_by_relay` and
+  `outbound_peers_synced_by_relay`.
+
 Known issues
 ------------
 
@@ -118,9 +140,6 @@ Known issues
   such transactions with inputs of one kind only.
 - `fundrawtransaction` occasionally fails with "Fee needed > fee paid" on the
   new placeholder-quote path (#21); retry, or fund with explicit inputs.
-- #15 (template readiness starves a well-connected miner) is not in this
-  release unless a fix is merged before tagging; node B's configuration
-  workaround remains in force.
 
 Chain anchor
 ------------
