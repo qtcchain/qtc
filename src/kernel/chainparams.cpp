@@ -338,12 +338,12 @@ public:
         // Mainnet anchor refreshed on 2026-07-10 at height 155'700 from a
         // synced canonical node so stale history below the current public
         // release floor is rejected quickly.
-        // QTC v0.2.3 (H3 on mainnet v2): minimum chain work = work at the v0.2.3 anchor block (height 1823,
-        // 2026-10-11 23:49 UTC, read from fleet node C). A syncing node ignores any chain with less work than
+        // QTC v0.2.4 (H3 on mainnet v2): minimum chain work = work at the v0.2.4 anchor block (height 1895,
+        // 2026-10-12 08:34 UTC, read from fleet node C). A syncing node ignores any chain with less work than
         // this, so a forged low-work header chain cannot stall or mislead IBD. Raised with each release.
-        consensus.nMinimumChainWork = uint256{"00000000000000000000000000000000000000000000000000000017dcea32d6"};
-        // QTC v0.2.3: first assume-valid block on mainnet v2 (height 1823, same block as the checkpoint).
-        consensus.defaultAssumeValid = uint256{"cfc093e05f14041b85c57e3648c4659b03a9971be78f12f50cc1cff1e0314d20"};
+        consensus.nMinimumChainWork = uint256{"00000000000000000000000000000000000000000000000000000019e0623e2c"};
+        // QTC v0.2.4: assume-valid block on mainnet v2 (height 1895, same block as the newest checkpoint).
+        consensus.defaultAssumeValid = uint256{"bbc9f64eee6ff9f9c69114e892f2e00a7859d3bcb1ea49b7f34c669053792227"};
 
         /**
          * The message start string is designed to be unlikely to occur in normal data.
@@ -418,15 +418,17 @@ public:
                 {300, uint256{"cee1347257fc44ee335b6e20b55bc616eba7c84535b572e3ca492162609273f7"}},
                 // QTC v0.2.3 (H3): anchor at height 1823 (2026-10-11 23:49 UTC), read from fleet node C.
                 {1823, uint256{"cfc093e05f14041b85c57e3648c4659b03a9971be78f12f50cc1cff1e0314d20"}},
+                // QTC v0.2.4 (H3): anchor at height 1895 (2026-10-12 08:34 UTC), read from fleet node C.
+                {1895, uint256{"bbc9f64eee6ff9f9c69114e892f2e00a7859d3bcb1ea49b7f34c669053792227"}},
             }
         };
         // No assumeutxo snapshots yet.
         m_assumeutxo_data = {};
-        // getchaintxstats 1824 <block 1825> on mainnet v2 at the v0.2.3 anchor.
+        // getchaintxstats 1896 <block 1897> on mainnet v2 at the v0.2.4 anchor.
         chainTxData = ChainTxData{
-            .nTime = 1791762389,
-            .tx_count = 1826,
-            .dTxRate = 0.003146080594167677,
+            .nTime = 1791794985,
+            .tx_count = 1898,
+            .dTxRate = 0.003090222769856637,
         };
     }
 };

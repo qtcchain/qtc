@@ -1,13 +1,20 @@
-QTC version 0.2.3
+QTC version 0.2.4
 =================
 
-Tag `v0.2.3`. Wallet performance, mining readiness, RPC and relay-policy
-update. No consensus rule changes: blocks are valid or invalid exactly as before, and v0.2.0
-through v0.2.3 nodes interoperate. **Activation height: none.** The chain
-anchor (minimum chain work, assume-valid block, checkpoint and transaction
-statistics) is refreshed to the block stated in the "Chain anchor" section.
+Tag `v0.2.4`. Wallet performance, mining readiness, RPC and relay-policy
+update. It supersedes `v0.2.3`, which was tagged on 12 October 2026 but never
+published: its testnet soak showed that the mining-readiness fix was blind in
+the very topology it targets (see "Mining readiness"), so no binaries were
+released for it. No consensus rule changes: blocks are valid or invalid
+exactly as before. **Activation height: none** (no consensus change).
+**Protocol floor height: 4100 on mainnet** (see "Protocol floor"): from that
+height, nodes on this release disconnect peers that have not upgraded. The
+chain anchor (minimum chain work, assume-valid block, checkpoint and
+transaction statistics) is refreshed to the block stated in the "Chain
+anchor" section.
 
-**Who should upgrade:** everyone who spends from a wallet, in particular
+**Who should upgrade:** everyone, before mainnet height 4100 (about 27
+October 2026); in particular everyone who spends from a wallet, especially
 miners sweeping coinbase outputs and anyone whose wallet descriptor carries an
 SLH-DSA backup leaf (the default `mr(pqhd(...),pk_slh(pqhd(...)))` layout);
 every relay that should carry QTC-EVM anchor transactions (see "Relay
@@ -39,6 +46,12 @@ Wallet performance
   placeholders (every provider-based P2MR quote fell to the 20 000 vB
   maximum), and probe inputs with a null prevout looked like a coinbase, for
   which the node counts no witness sigops.
+- **Mixed HD and imported fixed-key inputs sign (#20, PR #30).** A transaction
+  that spends an imported fixed-key `mr(<hex>, ...)` output together with one
+  of the wallet's HD coins left the fixed-key input unsigned on the raw path
+  (`signrawtransactionwithwallet`), although the PSBT path completed it. The
+  cross-descriptor key lookup now covers every leaf key the signer lacks
+  instead of running only when it holds no key at all.
 - Measured on the same regtest node and wallet copy, 2-input spend, against
   the v0.2.2 binary: `fundrawtransaction` 13.3–14.3 s → 0.2–1.2 s,
   `signrawtransactionwithwallet` 3.3–3.9 s → 0.01 s, `send` 15.5–16.4 s →
@@ -106,8 +119,8 @@ Relay policy (PR #19)
   form. The rendering is unchanged, so descriptor IDs and existing wallets
   are stable.
 
-Mining readiness (#15, PR #23)
-------------------------------
+Mining readiness (#15, PRs #23, #27, #28)
+-----------------------------------------
 
 - **Peers that received the tip from this node now count as synced.** A node
   never announces a block back to the peer it received it from, so the
@@ -121,6 +134,19 @@ Mining readiness (#15, PR #23)
   block the peer fetched). The version-handshake starting height stays a
   fallback only when neither exists, so a lagging peer cannot be talked back
   in through its handshake.
+- **Inv announcements count too (PR #28).** A node announces a block by `inv`
+  rather than headers whenever it cannot prove the peer has the parent header,
+  which is every peer right after a restart and permanently a peer that never
+  announces anything back. The v0.2.3 tag only credited headers announcements
+  and blocks the peer fetched from us, so on the v0.2.3 testnet soak node B
+  still saw its relays as unsynced after relaying a block to them by inv. The
+  best block announced by inv is now tracked as well (`getpeerinfo`
+  `invs_sent`).
+- **Handshake fallback fixed (#26, PR #27).** The readiness diagnostics read
+  the peer's starting height from a field nothing populates, so the
+  version-handshake fallback always saw height 0 (correct only at genesis,
+  where it was written). It now reads the peer state the chain guard already
+  used.
 - **Default `-miningmaxpeersyncheightlag` is 3 on mainnet** (was 1; one block
   was below normal relay jitter). Miners that set
   `miningminsyncedoutboundpeers=1` and `miningmaxpeersyncheightlag=3` as a
@@ -132,27 +158,46 @@ Mining readiness (#15, PR #23)
   diagnostics gain `relayed_height`, `synced_by_relay` and
   `outbound_peers_synced_by_relay`.
 
+Protocol floor (forced upgrade at mainnet height 4100)
+-------------------------------------------------------
+
+- The P2P protocol version is **800003**. Once the chain tip reaches height
+  **4100** on mainnet (about 27 October 2026 at the October block spacing,
+  more than 2 000 blocks after this tag), nodes on this release disconnect
+  peers that still speak 800002 or older: new connections are refused at the
+  version handshake and connections opened earlier are closed. A node that
+  has not upgraded by then loses every connection to upgraded nodes, so it
+  stops receiving blocks and its own blocks stop propagating. Block validity
+  is unchanged, so this cannot split the chain; it retires the old software.
+- This is a recorded exception to the peer-floor convention in
+  `doc/upgrade-policy.md` (the floor normally lags one release and never
+  carries a height), taken by the owner on 12 October 2026 so that every miner
+  runs the mining-readiness and relay-policy fixes. Measured impact when the
+  decision was taken: all 25 distinct public peers seen by relay C were on
+  v0.2.0, v0.2.1 or v0.2.2, i.e. every public node must upgrade before the
+  height. `MIN_PEER_PROTO_VERSION` itself stays 800002.
+- Test-only overrides `-minv024version` and `-v024floorheight` exist for the
+  functional test `p2p_protocol_floor.py`; the floor moves only in a release.
+
 Known issues
 ------------
 
-- The wallet cannot sign a transaction that mixes one of its HD inputs with an
-  input from an imported fixed-key `mr(<hex>, ...)` descriptor (#20); build
-  such transactions with inputs of one kind only.
 - `fundrawtransaction` occasionally fails with "Fee needed > fee paid" on the
   new placeholder-quote path (#21); retry, or fund with explicit inputs.
 
 Chain anchor
 ------------
 
-- Generated on fleet node C (mainnet, genesis `d5f04a8a…eb24`) at 2026-10-11
-  23:49 UTC from tip 1825 and applied to `src/kernel/chainparams.cpp`
-  (manifest kept on the build box as `/root/mainnet-hardening-0.2.3.json`):
-  - `defaultAssumeValid` and checkpoint: height **1823**,
-    `cfc093e05f14041b85c57e3648c4659b03a9971be78f12f50cc1cff1e0314d20`
-  - `nMinimumChainWork`: `0x17dcea32d6`
-  - `chainTxData`: 1826 transactions at time 1791762389, 0.00315 tx/s
-  The v0.2.1 checkpoint at height 300 is kept; `defaultAssumeValid` is set
-  for the first time on mainnet v2. Regenerate before tagging if the tag
+- Generated on fleet node C (mainnet, genesis `d5f04a8a…eb24`) at 2026-10-12
+  08:53 UTC from tip 1897 and applied to `src/kernel/chainparams.cpp`
+  (manifest kept on the build box as `/root/mainnet-hardening-0.2.4.json`):
+  - `defaultAssumeValid` and checkpoint: height **1895**,
+    `bbc9f64eee6ff9f9c69114e892f2e00a7859d3bcb1ea49b7f34c669053792227`
+    (2026-10-12 08:34 UTC)
+  - `nMinimumChainWork`: `0x19e0623e2c`
+  - `chainTxData`: 1898 transactions at time 1791794985, 0.00309 tx/s
+  The v0.2.1 checkpoint at height 300 and the unpublished v0.2.3 anchor at
+  height 1823 are kept as checkpoints. Regenerate before tagging if the tag
   lands much later (the script needs `--allow-low-anchor-height` while the
   chain is below height 50,000; its matcher does not accept the placeholder
   line formats, so the values were applied by hand and pinned in

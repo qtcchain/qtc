@@ -2361,17 +2361,17 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_hardening_anchor_consistency)
     const auto consensus = params->GetConsensus();
 
     // Mainnet v2 (Oct 2026). v0.2.1 (security review H3) added the first v2 anchor (checkpoint 300);
-    // v0.2.3 re-pins it at height 1823 read from fleet node C on 2026-10-11: minimum chain work = work at
-    // that block, assume-valid = that block (first time set on v2), chain-tx statistics from
-    // getchaintxstats over the 1824 blocks below tip 1825. No assumeutxo snapshots.
-    BOOST_CHECK_EQUAL(consensus.nMinimumChainWork.GetHex(), "00000000000000000000000000000000000000000000000000000017dcea32d6");
-    BOOST_CHECK_EQUAL(consensus.defaultAssumeValid.GetHex(), "cfc093e05f14041b85c57e3648c4659b03a9971be78f12f50cc1cff1e0314d20");
-    BOOST_CHECK_EQUAL(params->TxData().nTime, 1791762389);
-    BOOST_CHECK_EQUAL(params->TxData().tx_count, 1826);
-    BOOST_CHECK_CLOSE(params->TxData().dTxRate, 0.003146080594167677, 1e-9);
+    // v0.2.3 re-pinned it at height 1823 (kept as a checkpoint) and v0.2.4 at height 1895, read from fleet
+    // node C on 2026-10-12: minimum chain work = work at that block, assume-valid = that block, chain-tx
+    // statistics from getchaintxstats over the 1896 blocks below tip 1897. No assumeutxo snapshots.
+    BOOST_CHECK_EQUAL(consensus.nMinimumChainWork.GetHex(), "00000000000000000000000000000000000000000000000000000019e0623e2c");
+    BOOST_CHECK_EQUAL(consensus.defaultAssumeValid.GetHex(), "bbc9f64eee6ff9f9c69114e892f2e00a7859d3bcb1ea49b7f34c669053792227");
+    BOOST_CHECK_EQUAL(params->TxData().nTime, 1791794985);
+    BOOST_CHECK_EQUAL(params->TxData().tx_count, 1898);
+    BOOST_CHECK_CLOSE(params->TxData().dTxRate, 0.003090222769856637, 1e-9);
 
     const auto& checkpoints = params->Checkpoints().mapCheckpoints;
-    BOOST_REQUIRE_EQUAL(checkpoints.size(), 3U);
+    BOOST_REQUIRE_EQUAL(checkpoints.size(), 4U);
     const auto it_0 = checkpoints.find(0);
     BOOST_REQUIRE(it_0 != checkpoints.end());
     const auto it_300 = checkpoints.find(300);
@@ -2379,10 +2379,13 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_hardening_anchor_consistency)
     BOOST_CHECK_EQUAL(it_300->second.GetHex(), "cee1347257fc44ee335b6e20b55bc616eba7c84535b572e3ca492162609273f7");
     const auto it_1823 = checkpoints.find(1823);
     BOOST_REQUIRE(it_1823 != checkpoints.end());
-    BOOST_CHECK_EQUAL(it_1823->second.GetHex(), consensus.defaultAssumeValid.GetHex());
-    // The minimum chain work must stay reachable: strictly below the v2 chain's work at height 1825
-    // (0x17eaf4e57f on 2026-10-11, node C).
-    BOOST_CHECK(UintToArith256(consensus.nMinimumChainWork) < UintToArith256(uint256{"00000000000000000000000000000000000000000000000000000017eaf4e57f"}));
+    BOOST_CHECK_EQUAL(it_1823->second.GetHex(), "cfc093e05f14041b85c57e3648c4659b03a9971be78f12f50cc1cff1e0314d20");
+    const auto it_1895 = checkpoints.find(1895);
+    BOOST_REQUIRE(it_1895 != checkpoints.end());
+    BOOST_CHECK_EQUAL(it_1895->second.GetHex(), consensus.defaultAssumeValid.GetHex());
+    // The minimum chain work must stay reachable: strictly below the v2 chain's work at height 1897
+    // (0x19ef068a48 on 2026-10-12, node C).
+    BOOST_CHECK(UintToArith256(consensus.nMinimumChainWork) < UintToArith256(uint256{"00000000000000000000000000000000000000000000000000000019ef068a48"}));
     BOOST_CHECK_EQUAL(it_0->second.GetHex(), consensus.hashGenesisBlock.GetHex());
     BOOST_CHECK_EQUAL(
         it_0->second.GetHex(),

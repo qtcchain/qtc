@@ -583,6 +583,14 @@ struct CNodeState {
     //! only evidence a well-connected miner has that its outbound peers are
     //! at its tip (issue #15).
     const CBlockIndex* pindexBestBlockServed{nullptr};
+    //! The best block we announced to our peer by inv. Block announcements fall
+    //! back to inv whenever we do not know that the peer has the parent header
+    //! (every peer right after our restart, and permanently for a peer that
+    //! never announces anything back to us), and an inv updates neither
+    //! pindexBestHeaderSent nor pindexBestBlockServed (the peer may fetch the
+    //! block from someone else). Without this the relayed-height signal of
+    //! issue #15 was blind in exactly the topology it was added for.
+    const CBlockIndex* pindexBestBlockInved{nullptr};
     //! Whether we've started headers synchronization with this peer.
     bool fSyncStarted{false};
     //! Since when we're stalling block download progress (in microseconds), or 0.
@@ -1987,6 +1995,7 @@ bool PeerManagerImpl::GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) c
         stats.nCommonHeight = state->pindexLastCommonBlock ? state->pindexLastCommonBlock->nHeight : -1;
         stats.m_best_header_sent_height = state->pindexBestHeaderSent ? state->pindexBestHeaderSent->nHeight : -1;
         stats.m_best_block_served_height = state->pindexBestBlockServed ? state->pindexBestBlockServed->nHeight : -1;
+        stats.m_best_inv_sent_height = state->pindexBestBlockInved ? state->pindexBestBlockInved->nHeight : -1;
         for (const QueuedBlock& queue : state->vBlocksInFlight) {
             if (queue.pindex)
                 stats.vHeightInFlight.push_back(queue.pindex->nHeight);
@@ -4372,6 +4381,22 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                 LogPrintf("Disconnecting peer=%d (version %d) - below minimum for SMILE v2 (%d), chain height %d > enforcement height %d\n",
                           pfrom.GetId(), nVersion, m_opts.min_smile_v2_version,
                           tip->nHeight, m_opts.smile_v2_enforcement_height);
+                pfrom.fDisconnect = true;
+                return;
+            }
+        }
+
+        // QTC v0.2.4 forced-upgrade floor (doc/upgrade-policy.md section 3, recorded exception):
+        // once the tip has reached the floor height, peers below the v0.2.4 protocol are refused
+        // at the handshake. Connections opened before the floor height are closed from
+        // SendMessages when the height is reached.
+        if (nVersion < m_opts.min_v024_version) {
+            LOCK(cs_main);
+            const CBlockIndex* tip = m_chainman.ActiveChain().Tip();
+            if (tip && tip->nHeight >= m_opts.v024_protocol_floor_height) {
+                LogInfo("Disconnecting peer=%d (protocol %d): below the v0.2.4 protocol floor %d, chain height %d >= floor height %d\n",
+                        pfrom.GetId(), nVersion, m_opts.min_v024_version,
+                        tip->nHeight, m_opts.v024_protocol_floor_height);
                 pfrom.fDisconnect = true;
                 return;
             }
@@ -7011,6 +7036,18 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
     if (!pto->fSuccessfullyConnected || pto->fDisconnect)
         return true;
 
+    // QTC v0.2.4 forced-upgrade floor for connections that were open before the
+    // floor height was reached (new connections are refused at the handshake).
+    if (pto->nVersion < m_opts.min_v024_version) {
+        const int tip_height{WITH_LOCK(cs_main, return m_chainman.ActiveChain().Height())};
+        if (tip_height >= m_opts.v024_protocol_floor_height) {
+            LogInfo("Disconnecting peer=%d (protocol %d): below the v0.2.4 protocol floor %d at chain height %d\n",
+                    pto->GetId(), pto->nVersion.load(), m_opts.min_v024_version, tip_height);
+            pto->fDisconnect = true;
+            return true;
+        }
+    }
+
     const auto current_time{GetTime<std::chrono::microseconds>()};
 
     if (pto->IsAddrFetchConn() && current_time - pto->m_connected > 10 * AVG_ADDRESS_BROADCAST_INTERVAL) {
@@ -7229,6 +7266,10 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                     // If the peer's chain has this block, don't inv it back.
                     if (!PeerHasHeader(&state, pindex)) {
                         peer->m_blocks_for_inv_relay.push_back(hashToAnnounce);
+                        if (state.pindexBestBlockInved == nullptr ||
+                            state.pindexBestBlockInved->nHeight < pindex->nHeight) {
+                            state.pindexBestBlockInved = pindex;
+                        }
                         LogDebug(BCLog::NET, "%s: sending inv peer=%d hash=%s\n", __func__,
                             pto->GetId(), hashToAnnounce.ToString());
                     }

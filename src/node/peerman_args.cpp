@@ -32,6 +32,14 @@ void ApplyArgsManOptions(const ArgsManager& argsman, PeerManager::Options& optio
     if (auto value{argsman.GetIntArg("-minsmilev2version")}) {
         options.min_smile_v2_version = int(std::clamp<int64_t>(*value, 0, std::numeric_limits<int>::max()));
     }
+
+    if (auto value{argsman.GetIntArg("-minv024version")}) {
+        options.min_v024_version = int(std::clamp<int64_t>(*value, 0, std::numeric_limits<int>::max()));
+    }
+
+    if (auto value{argsman.GetIntArg("-v024floorheight")}) {
+        options.v024_protocol_floor_height = int(std::clamp<int64_t>(*value, 0, std::numeric_limits<int>::max()));
+    }
 }
 
 } // namespace node
