@@ -126,13 +126,15 @@ Chain anchor
 ------------
 
 - Generated on fleet node C (mainnet, genesis `d5f04a8a…eb24`) at 2026-10-11
-  23:49 UTC from tip 1825; manifest staged on the build box
-  (`/root/mainnet-hardening-0.2.3.json`), **to be applied to
-  `src/kernel/chainparams.cpp` by the owner at tagging time** (the apply
-  script needs the placeholder lines' trailing comments removed first):
+  23:49 UTC from tip 1825 and applied to `src/kernel/chainparams.cpp`
+  (manifest kept on the build box as `/root/mainnet-hardening-0.2.3.json`):
   - `defaultAssumeValid` and checkpoint: height **1823**,
     `cfc093e05f14041b85c57e3648c4659b03a9971be78f12f50cc1cff1e0314d20`
   - `nMinimumChainWork`: `0x17dcea32d6`
   - `chainTxData`: 1826 transactions at time 1791762389, 0.00315 tx/s
-  Regenerate before tagging if the tag lands much later (the script needs
-  `--allow-low-anchor-height` while the chain is below height 50,000).
+  The v0.2.1 checkpoint at height 300 is kept; `defaultAssumeValid` is set
+  for the first time on mainnet v2. Regenerate before tagging if the tag
+  lands much later (the script needs `--allow-low-anchor-height` while the
+  chain is below height 50,000; its matcher does not accept the placeholder
+  line formats, so the values were applied by hand and pinned in
+  `pow_tests`).
