@@ -62,7 +62,7 @@ enum class MiningPeerHeightSource {
 /** Per-peer inputs to ClassifyMiningPeerSync; -1 means "unknown" for each. */
 struct MiningPeerSyncSignals {
     int sync_height{-1};     //!< net_processing nSyncHeight (peer's announcements to us)
-    int relayed_height{-1};  //!< max of best header we sent and best block the peer fetched
+    int relayed_height{-1};  //!< max of best header or inv we sent and best block the peer fetched
     int starting_height{-1}; //!< version-handshake starting height
 };
 
@@ -83,9 +83,10 @@ struct MiningPeerSyncStatus {
  *    block back to the peer it received it from, so for a well-connected
  *    miner that usually hears of a block first and relays it to its outbound
  *    peers, this height goes stale while the topology is perfectly healthy.
- *  - relayed_height: the best header we announced to the peer, or the best
- *    block it fetched from us. That is direct evidence the peer holds our tip
- *    (it has the data, even if it has not finished validating it).
+ *  - relayed_height: the best block we announced to the peer (by headers or,
+ *    when we cannot prove it has the parent, by inv), or the best block it
+ *    fetched from us. That is direct evidence the peer knows our tip and
+ *    either holds it or is fetching it.
  *
  * At genesis, and for any peer that connected while the network was idle,
  * neither signal exists even though the peer is exactly at our tip. In that

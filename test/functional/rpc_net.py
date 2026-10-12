@@ -182,6 +182,7 @@ class NetTest(BitcoinTestFramework):
                 "permissions": ['bloomfilter'],
                 "forced_inbound": False,
                 "headers_sent": -1,
+                "invs_sent": -1,
                 "presynced_headers": -1,
                 "relaytxes": False,
                 "services": "0000000000000000",

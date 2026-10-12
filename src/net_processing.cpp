@@ -583,6 +583,14 @@ struct CNodeState {
     //! only evidence a well-connected miner has that its outbound peers are
     //! at its tip (issue #15).
     const CBlockIndex* pindexBestBlockServed{nullptr};
+    //! The best block we announced to our peer by inv. Block announcements fall
+    //! back to inv whenever we do not know that the peer has the parent header
+    //! (every peer right after our restart, and permanently for a peer that
+    //! never announces anything back to us), and an inv updates neither
+    //! pindexBestHeaderSent nor pindexBestBlockServed (the peer may fetch the
+    //! block from someone else). Without this the relayed-height signal of
+    //! issue #15 was blind in exactly the topology it was added for.
+    const CBlockIndex* pindexBestBlockInved{nullptr};
     //! Whether we've started headers synchronization with this peer.
     bool fSyncStarted{false};
     //! Since when we're stalling block download progress (in microseconds), or 0.
@@ -1987,6 +1995,7 @@ bool PeerManagerImpl::GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) c
         stats.nCommonHeight = state->pindexLastCommonBlock ? state->pindexLastCommonBlock->nHeight : -1;
         stats.m_best_header_sent_height = state->pindexBestHeaderSent ? state->pindexBestHeaderSent->nHeight : -1;
         stats.m_best_block_served_height = state->pindexBestBlockServed ? state->pindexBestBlockServed->nHeight : -1;
+        stats.m_best_inv_sent_height = state->pindexBestBlockInved ? state->pindexBestBlockInved->nHeight : -1;
         for (const QueuedBlock& queue : state->vBlocksInFlight) {
             if (queue.pindex)
                 stats.vHeightInFlight.push_back(queue.pindex->nHeight);
@@ -7229,6 +7238,10 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                     // If the peer's chain has this block, don't inv it back.
                     if (!PeerHasHeader(&state, pindex)) {
                         peer->m_blocks_for_inv_relay.push_back(hashToAnnounce);
+                        if (state.pindexBestBlockInved == nullptr ||
+                            state.pindexBestBlockInved->nHeight < pindex->nHeight) {
+                            state.pindexBestBlockInved = pindex;
+                        }
                         LogDebug(BCLog::NET, "%s: sending inv peer=%d hash=%s\n", __func__,
                             pto->GetId(), hashToAnnounce.ToString());
                     }
