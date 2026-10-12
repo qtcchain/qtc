@@ -63,6 +63,10 @@ struct CNodeStateStats {
     int nSyncHeight = -1;
     int nCommonHeight = -1;
     int m_starting_height = -1;
+    //! Height of the best header we have announced to this peer, or -1.
+    int m_best_header_sent_height{-1};
+    //! Height of the best block this peer fetched from us (getdata), or -1.
+    int m_best_block_served_height{-1};
     std::chrono::microseconds m_ping_wait;
     std::vector<int> vHeightInFlight;
     bool m_relay_txs;

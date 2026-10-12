@@ -222,6 +222,8 @@ static RPCHelpMan getpeerinfo()
                     {RPCResult::Type::NUM, "presynced_headers", "The current height of header pre-synchronization with this peer, or -1 if no low-work sync is in progress"},
                     {RPCResult::Type::NUM, "synced_headers", "The last header we have in common with this peer"},
                     {RPCResult::Type::NUM, "synced_blocks", "The last block we have in common with this peer"},
+                    {RPCResult::Type::NUM, "headers_sent", "The height of the best header we have announced to this peer, or -1"},
+                    {RPCResult::Type::NUM, "blocks_served", "The height of the best block this peer has fetched from us, or -1"},
                     {RPCResult::Type::ARR, "inflight", "",
                     {
                         {RPCResult::Type::NUM, "n", "The heights of blocks we're currently asking from this peer"},
@@ -337,6 +339,8 @@ static RPCHelpMan getpeerinfo()
         obj.pushKV("presynced_headers", statestats.presync_height);
         obj.pushKV("synced_headers", statestats.nSyncHeight);
         obj.pushKV("synced_blocks", statestats.nCommonHeight);
+        obj.pushKV("headers_sent", statestats.m_best_header_sent_height);
+        obj.pushKV("blocks_served", statestats.m_best_block_served_height);
         UniValue heights(UniValue::VARR);
         for (const int height : statestats.vHeightInFlight) {
             heights.push_back(height);

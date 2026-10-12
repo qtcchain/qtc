@@ -217,9 +217,10 @@ MiningChainGuardStatus EvaluateMiningChainGuard(
     return status;
 }
 
-int ResolveMiningChainGuardPeerHeight(const int sync_height, const int common_height, const int starting_height)
+int ResolveMiningChainGuardPeerHeight(const int sync_height, const int relayed_height, const int common_height, const int starting_height)
 {
-    if (sync_height >= 0) return sync_height;
+    const int exchanged_height = std::max(sync_height, relayed_height);
+    if (exchanged_height >= 0) return exchanged_height;
     if (common_height >= 0) return common_height;
     if (starting_height >= 0) return starting_height;
     return -1;
@@ -317,12 +318,17 @@ MiningChainGuardStatus GetMiningChainGuardStatus(const NodeContext& node)
         // outbound peers (above) is what bounds spoofing here; treat the median
         // as a hint for the mining guard, not as validated chain state.
         //
-        // Before any header has been exchanged (genesis, or a peer that joined
-        // while the network was idle) both heights are -1; the handshake
-        // starting height is then used so peers sitting at our tip count as
-        // consensus instead of as missing (see ResolveMiningChainGuardPeerHeight).
+        // A peer never announces a block back to the node it received it from,
+        // so nSyncHeight goes stale for every peer we relay to first; the best
+        // header we sent and the best block the peer fetched from us fill that
+        // gap (issue #15). Before anything has been exchanged (genesis, or a
+        // peer that joined while the network was idle) all of these are -1;
+        // the handshake starting height is then used so peers sitting at our
+        // tip count as consensus instead of as missing.
+        const int relayed_height =
+            std::max(state_stats.m_best_header_sent_height, state_stats.m_best_block_served_height);
         const int peer_height = ResolveMiningChainGuardPeerHeight(
-            state_stats.nSyncHeight, state_stats.nCommonHeight, state_stats.m_starting_height);
+            state_stats.nSyncHeight, relayed_height, state_stats.nCommonHeight, state_stats.m_starting_height);
         if (peer_height >= 0) {
             MiningChainGuardPeerSample sample;
             sample.height = peer_height;
