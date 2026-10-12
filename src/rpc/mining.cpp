@@ -207,7 +207,6 @@ static OutboundPeerDiagnosticsSummary CollectOutboundPeerDiagnostics(
         diag.addr = OutboundPeerAddrLabel(stats);
         diag.connection_type = ConnectionTypeAsString(stats.m_conn_type);
         diag.manual = stats.m_conn_type == ConnectionType::MANUAL;
-        diag.starting_height = stats.m_starting_height;
         diag.last_block_time = stats.m_last_block_time.count();
 
         if (diag.manual) {
@@ -220,6 +219,11 @@ static OutboundPeerDiagnosticsSummary CollectOutboundPeerDiagnostics(
                 diag.sync_height = statestats.nSyncHeight;
                 diag.common_height = statestats.nCommonHeight;
                 diag.presync_height = statestats.presync_height;
+                // The version-handshake starting height lives in net_processing's
+                // Peer (CNodeStateStats); CNodeStats::m_starting_height is never
+                // filled in by CConnman, so reading it made the handshake fallback
+                // see every peer at height 0 (right only at genesis).
+                diag.starting_height = statestats.m_starting_height;
                 diag.relayed_height = std::max({statestats.m_best_header_sent_height,
                                                 statestats.m_best_inv_sent_height,
                                                 statestats.m_best_block_served_height});
