@@ -141,6 +141,11 @@ public:
     //! Get block hash. Height must be valid or this function will abort.
     virtual uint256 getBlockHash(int height) = 0;
 
+    //! Get the maximum block time of the active chain up to its tip (the tip's
+    //! chain_time_max), or nullopt when no chainstate or no tip is available.
+    //! Safe to call from a wallet that is not attached to a running node.
+    virtual std::optional<int64_t> getTipMaxTime() = 0;
+
     //! Check that the block is available on disk (i.e. has not been
     //! pruned), and contains transactions.
     virtual bool haveBlockOnDisk(int height) = 0;

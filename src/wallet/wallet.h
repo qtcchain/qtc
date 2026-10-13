@@ -1112,6 +1112,13 @@ public:
     /* Returns the time of the first created key or, in case of an import, it could be the time of the first received transaction */
     int64_t GetBirthTime() const { return m_birth_time; }
 
+    /** The wall-clock time, clamped to the chain tip's maximum block time when a chain is attached.
+     * Used as the creation time of new descriptors: a wallet cannot have received anything in a block
+     * older than the tip it was created on, and on a chain whose timestamps trail real time (after a
+     * stall, templates are clamped to MTP+12h) a wall-clock birth time would make blockConnected()
+     * skip every new block until a manual rescan (#31). */
+    int64_t ChainClampedTime() const;
+
     /**
      * Blocks until the wallet state is up-to-date to /at least/ the current
      * chain at the time this function is entered
