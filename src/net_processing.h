@@ -125,6 +125,9 @@ public:
         //! (test-only overrides -minv024version / -v024floorheight).
         int min_v024_version{MIN_V024_PROTOCOL_VERSION};
         int v024_protocol_floor_height{V024_PROTOCOL_FLOOR_HEIGHT};
+        //! v0.2.5 floor, same mechanism (test-only overrides -minv025version / -v025floorheight).
+        int min_v025_version{MIN_V025_PROTOCOL_VERSION};
+        int v025_protocol_floor_height{V025_PROTOCOL_FLOOR_HEIGHT};
     };
 
     static std::unique_ptr<PeerManager> make(CConnman& connman, AddrMan& addrman,

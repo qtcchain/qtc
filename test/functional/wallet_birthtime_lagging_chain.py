@@ -69,7 +69,8 @@ class WalletBirthtimeLaggingChainTest(BitcoinTestFramework):
         desc = node.getdescriptorinfo(f"mr({pubkey})")["descriptor"]
         assert_equal(watch.importdescriptors([{"desc": desc, "timestamp": int(time.time())}])[0]["success"], True)
         assert_greater_than_or_equal(watch.getwalletinfo()["birthtime"], tip_time + 3600)
-        self.generatetoaddress(miner, 2, addr)
+        watch_addr = node.deriveaddresses(desc)[0]  # the single-leaf mr(<key>) tree, not the HD two-leaf address
+        self.generatetoaddress(miner, 2, watch_addr)
         assert_equal(watch.getwalletinfo()["txcount"], 2)
         assert_equal(watch.getbalances()["mine"]["immature"], 100)
 
