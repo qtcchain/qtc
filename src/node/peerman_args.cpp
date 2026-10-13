@@ -40,6 +40,14 @@ void ApplyArgsManOptions(const ArgsManager& argsman, PeerManager::Options& optio
     if (auto value{argsman.GetIntArg("-v024floorheight")}) {
         options.v024_protocol_floor_height = int(std::clamp<int64_t>(*value, 0, std::numeric_limits<int>::max()));
     }
+
+    if (auto value{argsman.GetIntArg("-minv025version")}) {
+        options.min_v025_version = int(std::clamp<int64_t>(*value, 0, std::numeric_limits<int>::max()));
+    }
+
+    if (auto value{argsman.GetIntArg("-v025floorheight")}) {
+        options.v025_protocol_floor_height = int(std::clamp<int64_t>(*value, 0, std::numeric_limits<int>::max()));
+    }
 }
 
 } // namespace node

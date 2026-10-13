@@ -10,9 +10,10 @@
  */
 
 // QTC v0.2.4: 800003 (forced-upgrade floor at mainnet height 4100, see V024_PROTOCOL_FLOOR_HEIGHT).
+// QTC v0.2.5: 800004 (forced-upgrade floor at mainnet height 6000, see V025_PROTOCOL_FLOOR_HEIGHT).
 // 800002 = v0.2.0 to v0.2.3; 800001 = v0.1.0 to v0.1.3 (v1 chain). The protocol version advances only when a
 // release changes P2P behaviour; the peer floor below follows doc/upgrade-policy.md.
-static const int PROTOCOL_VERSION = 800003;
+static const int PROTOCOL_VERSION = 800004;
 
 //! initial proto version, to be increased after version/verack negotiation
 static const int INIT_PROTO_VERSION = 209;
@@ -41,6 +42,16 @@ static const int MIN_V024_PROTOCOL_VERSION = 800003;
 //! more than 2 000 blocks after the v0.2.4 tag (tip 1898 on 12 October). The same height applies on test
 //! networks. Test-only override: -v024floorheight.
 static const int V024_PROTOCOL_FLOOR_HEIGHT = 4100;
+
+//! QTC v0.2.5 forced-upgrade floor (owner decision, 13 October 2026; recorded exception to
+//! doc/upgrade-policy.md section 3): once the chain tip has reached V025_PROTOCOL_FLOOR_HEIGHT, peers
+//! below this protocol version are disconnected the same way. The floors stack: the version required at
+//! a height is the highest floor whose height has been reached.
+static const int MIN_V025_PROTOCOL_VERSION = 800004;
+
+//! Mainnet height of the v0.2.5 floor: 6000, about 27 days after the v0.2.5 tag at the October 2026
+//! block spacing (tip 2075 on 13 October). Test-only override: -v025floorheight.
+static const int V025_PROTOCOL_FLOOR_HEIGHT = 6000;
 
 //! BIP 0031, pong message, is enabled for all versions AFTER this one
 static const int BIP0031_VERSION = 60000;
