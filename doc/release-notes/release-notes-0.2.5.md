@@ -1,4 +1,4 @@
-# QTC v0.2.5 (release candidate 5: testnet roll, 13 October 2026)
+# QTC v0.2.5 (release candidate 6: testnet roll, 13 October 2026)
 
 Testnet consensus parameter change and a wallet fix. **Mainnet consensus is unchanged**: mainnet blocks are valid or invalid exactly as before, and v0.2.0 through v0.2.5 interoperate on mainnet.
 
