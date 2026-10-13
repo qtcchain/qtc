@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The QTC developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Test the QTC v0.2.4 forced-upgrade protocol floor.
+"""Test the QTC forced-upgrade protocol floors (v0.2.4 at 4100, v0.2.5 at 6000 on mainnet).
 
 Once the chain tip reaches the floor height, peers below the v0.2.4 protocol
 version are disconnected: connections that were already open are closed from
@@ -60,6 +60,23 @@ class ProtocolFloorTest(BitcoinTestFramework):
         current = node.add_p2p_connection(P2PInterface())
         current.sync_with_ping()
         assert current.is_connected
+        assert_equal(node.getpeerinfo()[0]["version"], P2P_VERSION)
+
+        self.log.info("The v0.2.5 floor stacks on top: a v0.2.4-protocol peer is cut off at its own height")
+        node.disconnect_p2ps()
+        floor_height = node.getblockcount() + BLOCKS_TO_FLOOR
+        self.restart_node(0, extra_args=[f"-v025floorheight={floor_height}", f"-minv025version={P2P_VERSION}"])
+        v024_peer = node.add_p2p_connection(OldProtocolPeer(P2P_VERSION - 1))
+        self.generate(node, BLOCKS_TO_FLOOR - 1)
+        v024_peer.sync_with_ping()
+        assert v024_peer.is_connected
+        self.generate(node, 1)
+        assert_equal(node.getblockcount(), floor_height)
+        v024_peer.wait_for_disconnect()
+        refused = node.add_p2p_connection(OldProtocolPeer(P2P_VERSION - 1), wait_for_verack=False)
+        refused.wait_for_disconnect()
+        current = node.add_p2p_connection(P2PInterface())
+        current.sync_with_ping()
         assert_equal(node.getpeerinfo()[0]["version"], P2P_VERSION)
 
 

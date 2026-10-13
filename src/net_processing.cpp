@@ -970,6 +970,16 @@ private:
 
     const Options m_opts;
 
+    //! Protocol version a peer must speak once the chain tip is at tip_height: the highest forced-upgrade
+    //! floor whose height has been reached (0 below every floor). doc/upgrade-policy.md section 3.
+    int RequiredPeerProtocolVersionAt(int tip_height) const
+    {
+        int required{0};
+        if (tip_height >= m_opts.v024_protocol_floor_height) required = std::max(required, m_opts.min_v024_version);
+        if (tip_height >= m_opts.v025_protocol_floor_height) required = std::max(required, m_opts.min_v025_version);
+        return required;
+    }
+
     bool RejectIncomingTxs(const CNode& peer) const;
 
     /** Whether we've completed initial sync yet, for determining when to turn
@@ -4386,17 +4396,16 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             }
         }
 
-        // QTC v0.2.4 forced-upgrade floor (doc/upgrade-policy.md section 3, recorded exception):
-        // once the tip has reached the floor height, peers below the v0.2.4 protocol are refused
-        // at the handshake. Connections opened before the floor height are closed from
-        // SendMessages when the height is reached.
-        if (nVersion < m_opts.min_v024_version) {
-            LOCK(cs_main);
-            const CBlockIndex* tip = m_chainman.ActiveChain().Tip();
-            if (tip && tip->nHeight >= m_opts.v024_protocol_floor_height) {
-                LogInfo("Disconnecting peer=%d (protocol %d): below the v0.2.4 protocol floor %d, chain height %d >= floor height %d\n",
-                        pfrom.GetId(), nVersion, m_opts.min_v024_version,
-                        tip->nHeight, m_opts.v024_protocol_floor_height);
+        // QTC forced-upgrade floors (doc/upgrade-policy.md section 3, recorded exceptions for v0.2.4 and
+        // v0.2.5): once the tip has reached a floor height, peers below that floor's protocol are refused
+        // at the handshake. Connections opened before the floor height are closed from SendMessages when
+        // the height is reached.
+        if (nVersion < std::max(m_opts.min_v024_version, m_opts.min_v025_version)) {
+            const int tip_height{WITH_LOCK(cs_main, return m_chainman.ActiveChain().Height())};
+            const int required{RequiredPeerProtocolVersionAt(tip_height)};
+            if (nVersion < required) {
+                LogInfo("Disconnecting peer=%d (protocol %d): below the protocol floor %d in force at chain height %d\n",
+                        pfrom.GetId(), nVersion, required, tip_height);
                 pfrom.fDisconnect = true;
                 return;
             }
@@ -7036,13 +7045,14 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
     if (!pto->fSuccessfullyConnected || pto->fDisconnect)
         return true;
 
-    // QTC v0.2.4 forced-upgrade floor for connections that were open before the
-    // floor height was reached (new connections are refused at the handshake).
-    if (pto->nVersion < m_opts.min_v024_version) {
+    // QTC forced-upgrade floors for connections that were open before a floor height was
+    // reached (new connections are refused at the handshake).
+    if (pto->nVersion < std::max(m_opts.min_v024_version, m_opts.min_v025_version)) {
         const int tip_height{WITH_LOCK(cs_main, return m_chainman.ActiveChain().Height())};
-        if (tip_height >= m_opts.v024_protocol_floor_height) {
-            LogInfo("Disconnecting peer=%d (protocol %d): below the v0.2.4 protocol floor %d at chain height %d\n",
-                    pto->GetId(), pto->nVersion.load(), m_opts.min_v024_version, tip_height);
+        const int required{RequiredPeerProtocolVersionAt(tip_height)};
+        if (pto->nVersion < required) {
+            LogInfo("Disconnecting peer=%d (protocol %d): below the protocol floor %d in force at chain height %d\n",
+                    pto->GetId(), pto->nVersion.load(), required, tip_height);
             pto->fDisconnect = true;
             return true;
         }
