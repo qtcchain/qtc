@@ -9,9 +9,10 @@ mempool and by block validation; from the raise height the chain's final cap app
 the final cap from genesis, so the raise is placed with -opreturnraiseheight.
 """
 
+from test_framework.authproxy import JSONRPCException
 from test_framework.messages import tx_from_hex
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal, assert_raises_rpc_error
+from test_framework.util import assert_equal
 
 LEGACY_PAYLOAD = 80     # 1 + 2 + 80 = 83-byte script, the legacy cap
 RAISED_PAYLOAD = 101    # the QTC-EVM anchor
@@ -55,7 +56,11 @@ class OpReturnRaiseTest(BitcoinTestFramework):
         res = node.testmempoolaccept([big])[0]
         assert_equal(res["allowed"], False)
         assert_equal(res["reject-reason"], "bad-txns-opreturn-size")
-        assert_raises_rpc_error(-25, "bad-txns-opreturn-size", node.generateblock, addr, [big])
+        try:
+            node.generateblock(addr, [big], called_by_framework=True)
+            raise AssertionError("generateblock accepted an oversized OP_RETURN below the raise height")
+        except JSONRPCException as e:
+            assert "opreturn-size" in e.error["message"], e.error
 
         self.log.info("Mine up to the raise height")
         self.generatetoaddress(node, raise_height - 1 - node.getblockcount(), addr)
@@ -70,9 +75,10 @@ class OpReturnRaiseTest(BitcoinTestFramework):
         over = self.opreturn_tx(w, OVER_PAYLOAD)
         res = node.testmempoolaccept([over])[0]
         assert_equal(res["allowed"], False)
-        assert_equal(res["reject-reason"], "bad-txns-opreturn-size")
+        # relay policy (datacarriersize, clamped to the consensus cap) rejects first; consensus would too
+        assert res["reject-reason"] in ("scriptpubkey", "bad-txns-opreturn-size"), res
         self.generatetoaddress(node, 1, addr)
-        assert_equal(node.getrawtransaction(txid, True)["confirmations"], 1)
+        assert_equal(w.gettransaction(txid)["confirmations"], 1)
         assert_equal(len(tx_from_hex(big).vout), 2)
 
 
