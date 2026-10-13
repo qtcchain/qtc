@@ -694,11 +694,12 @@ public:
 
     bool IsHDEnabled() const override;
 
-    //! Setup descriptors based on the given CExtkey
-    bool SetupDescriptorGeneration(WalletBatch& batch, const CExtKey& master_key, OutputType addr_type, bool internal);
+    //! Setup descriptors based on the given CExtkey. creation_time overrides the descriptor's
+    //! wall-clock creation time (0 = now); the wallet passes a time clamped to the chain tip (#31).
+    bool SetupDescriptorGeneration(WalletBatch& batch, const CExtKey& master_key, OutputType addr_type, bool internal, int64_t creation_time = 0);
 
-    //! Setup descriptors from a PQ master seed (no ECDSA key involved)
-    bool SetupPQDescriptorGeneration(WalletBatch& batch, Span<const unsigned char> pq_seed, bool internal);
+    //! Setup descriptors from a PQ master seed (no ECDSA key involved); creation_time as above
+    bool SetupPQDescriptorGeneration(WalletBatch& batch, Span<const unsigned char> pq_seed, bool internal, int64_t creation_time = 0);
 
     bool HavePrivateKeys() const override;
     bool HasPrivKey(const CKeyID& keyid) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);

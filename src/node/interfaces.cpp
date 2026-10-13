@@ -557,6 +557,14 @@ public:
         const int height{WITH_LOCK(::cs_main, return chainman().ActiveChain().Height())};
         return height >= 0 ? std::optional{height} : std::nullopt;
     }
+    std::optional<int64_t> getTipMaxTime() override
+    {
+        if (!m_node.chainman) return std::nullopt;
+        LOCK(::cs_main);
+        const CBlockIndex* tip{chainman().ActiveChain().Tip()};
+        if (!tip) return std::nullopt;
+        return tip->GetBlockTimeMax();
+    }
     uint256 getBlockHash(int height) override
     {
         LOCK(::cs_main);
