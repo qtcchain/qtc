@@ -1,4 +1,4 @@
-# QTC v0.2.5 (release candidate 6: testnet roll, 13 October 2026)
+# QTC v0.2.5 (13 October 2026)
 
 Testnet consensus parameter change and a wallet fix. **Mainnet consensus is unchanged**: mainnet blocks are valid or invalid exactly as before, and v0.2.0 through v0.2.5 interoperate on mainnet.
 
@@ -28,7 +28,13 @@ Workaround on older versions: `rescanblockchain <height before the first expecte
 
 ## Chain anchor
 
-The mainnet chain anchor is unchanged in this release candidate (height 1895, `bbc9f64e…`); the final v0.2.5 tag refreshes it per `doc/release-process.md` before the mainnet roll.
+Refreshed per the release rule, from fleet node C at 2026-10-13 12:38 UTC (tip 2104):
+
+- Assume-valid block and checkpoint: height **2102**, `8644a35d137fd993670d6c1dc1205cfed15155182d13b0b20f7b50e849a26b6a` (2026-10-13 12:09 UTC)
+- Minimum chain work: `0x201a1324e7`
+- Chain transaction statistics: 2105 transactions at 1791895083
+
+The checkpoints at heights 300, 1823 and 1895 are kept. A fresh node validates the whole chain from genesis with assume-valid disabled against this anchor on the build box before publication.
 
 ## Known issues
 
