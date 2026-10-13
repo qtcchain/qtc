@@ -166,6 +166,7 @@ BASE_SCRIPTS = [
     'rpc_pq_wallet.py',
     'wallet_p2mr_mixed_inputs.py',
     'wallet_birthtime_lagging_chain.py',
+    'feature_opreturn_raise.py',
     'wallet_shielded_encrypted_persistence.py',
     'wallet_shielded_restart_persistence.py',
     'wallet_shielded_reorg_recovery.py',

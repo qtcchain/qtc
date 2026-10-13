@@ -132,6 +132,12 @@ struct Params {
     bool fReducedDataLimits{false};
     bool fEnforceP2MROnlyOutputs{false};
     unsigned int nMaxOpReturnBytes{83};
+    /** QTC: OP_RETURN cap in force below nOpReturnRaiseHeight; nMaxOpReturnBytes applies from that height.
+     *  Testnet3 raised its cap to mainnet's 1,004 bytes at height 2290 (QTC-EVM testnet, 13 October 2026);
+     *  mainnet and regtest carry the final cap from genesis (raise height 0). */
+    unsigned int nMaxOpReturnBytesLegacy{83};
+    int nOpReturnRaiseHeight{0};
+    unsigned int MaxOpReturnBytesAt(int height) const { return height >= nOpReturnRaiseHeight ? nMaxOpReturnBytes : nMaxOpReturnBytesLegacy; }
     unsigned int nMaxTxoutScriptPubKeyBytes{34};
 
     // MatMul PoW parameters.

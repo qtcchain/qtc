@@ -62,12 +62,13 @@ bool IsP2MROutputScript(const CScript& script_pub_key)
 }
 
 [[nodiscard]] bool PassesReducedDataOutputLimits(const CTransaction& tx,
-                                                 const Consensus::Params& consensus)
+                                                 const Consensus::Params& consensus,
+                                                 std::optional<int> height = std::nullopt)
 {
     // The assembler applies the consensus rule itself rather than a mirrored copy: a drifted copy once left
     // anchor-creating transactions unminable while consensus admitted them (testnet burn-in, 2026-09-26).
     BlockValidationState state;
-    return CheckReducedDataOutputLimits(tx, state, consensus);
+    return CheckReducedDataOutputLimits(tx, state, consensus, height);
 }
 
 [[nodiscard]] std::vector<uint256> CollectReferencedShieldedNettingManifests(const CTransaction& tx)
@@ -367,14 +368,14 @@ bool IsNearLimit(TCurrent current, TLimit limit, TDelta delta)
     return current_u > (limit_u - delta_u);
 }
 
-bool CoinbaseOutputScriptSatisfiesReducedDataLimits(const Consensus::Params& consensus_params, const CScript& script_pub_key)
+bool CoinbaseOutputScriptSatisfiesReducedDataLimits(const Consensus::Params& consensus_params, const CScript& script_pub_key, std::optional<int> height = std::nullopt)
 {
     // Consensus only enforces output types when reduced-data limits are enabled.
     if (!(consensus_params.fReducedDataLimits && consensus_params.fEnforceP2MROnlyOutputs)) return true;
 
     if (!script_pub_key.empty() && script_pub_key[0] == OP_RETURN) {
         // Match consensus semantics: allow OP_RETURN, but enforce the size limit.
-        return script_pub_key.size() <= consensus_params.nMaxOpReturnBytes;
+        return script_pub_key.size() <= (height ? consensus_params.MaxOpReturnBytesAt(*height) : consensus_params.nMaxOpReturnBytes);
     }
 
     return IsP2MROutputScript(script_pub_key);
@@ -1112,7 +1113,7 @@ std::shared_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     pblocktemplate->nTemplatePolicyCandidateEvaluations = nBlockTemplatePolicyCandidateEvaluations;
 
     // Create coinbase transaction.
-    if (!CoinbaseOutputScriptSatisfiesReducedDataLimits(chainparams.GetConsensus(), m_options.coinbase_output_script)) {
+    if (!CoinbaseOutputScriptSatisfiesReducedDataLimits(chainparams.GetConsensus(), m_options.coinbase_output_script, nHeight)) {
         throw std::runtime_error("CreateNewBlock(): coinbase output must be witness v2 P2MR (32-byte program) or OP_RETURN under reduced-data limits");
     }
     CMutableTransaction coinbaseTx;
@@ -1447,7 +1448,7 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool& mempool,
         if (!CheckTransaction(it->GetTx(), tx_state)) {
             return false;
         }
-        if (!PassesReducedDataOutputLimits(it->GetTx(), chainparams.GetConsensus())) {
+        if (!PassesReducedDataOutputLimits(it->GetTx(), chainparams.GetConsensus(), nHeight)) {
             return false;
         }
         for (const auto& txin : it->GetTx().vin) {

@@ -5124,13 +5124,13 @@ static bool IsP2MROutputScript(const CScript& script_pub_key)
     return witness_version == 2 && witness_program.size() == 32;
 }
 
-static void CheckCoinbaseOutputScriptOrThrow(const Consensus::Params& consensus, const CScript& coinbase_output_script)
+static void CheckCoinbaseOutputScriptOrThrow(const Consensus::Params& consensus, const CScript& coinbase_output_script, int next_height)
 {
     if (!(consensus.fReducedDataLimits && consensus.fEnforceP2MROnlyOutputs)) return;
 
     const bool is_op_return{!coinbase_output_script.empty() && coinbase_output_script[0] == OP_RETURN};
     if (is_op_return) {
-        if (coinbase_output_script.size() > consensus.nMaxOpReturnBytes) {
+        if (coinbase_output_script.size() > consensus.MaxOpReturnBytesAt(next_height)) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Coinbase OP_RETURN output script exceeds reduced-data size limit");
         }
         return;
@@ -5143,7 +5143,7 @@ static void CheckCoinbaseOutputScriptOrThrow(const Consensus::Params& consensus,
 
 static UniValue generateBlocks(ChainstateManager& chainman, Mining& miner, const CScript& coinbase_output_script, int nGenerate, uint64_t nMaxTries)
 {
-    CheckCoinbaseOutputScriptOrThrow(chainman.GetParams().GetConsensus(), coinbase_output_script);
+    CheckCoinbaseOutputScriptOrThrow(chainman.GetParams().GetConsensus(), coinbase_output_script, WITH_LOCK(cs_main, return chainman.ActiveChain().Height() + 1));
     NodeContext* node_context = miner.context();
 
     UniValue blockHashes(UniValue::VARR);
@@ -5372,7 +5372,7 @@ static RPCHelpMan generateblock()
     CBlock block;
 
     ChainstateManager& chainman = EnsureChainman(node);
-    CheckCoinbaseOutputScriptOrThrow(chainman.GetParams().GetConsensus(), coinbase_output_script);
+    CheckCoinbaseOutputScriptOrThrow(chainman.GetParams().GetConsensus(), coinbase_output_script, WITH_LOCK(cs_main, return chainman.ActiveChain().Height() + 1));
     // Whether TestBlockValidity is deferred until GenerateBlock has solved the block.
     bool skip_pow_template_check{false};
     {
