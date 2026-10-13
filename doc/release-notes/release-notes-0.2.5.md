@@ -1,12 +1,12 @@
-# QTC v0.2.5 (release candidate 2: testnet roll, 13 October 2026)
+# QTC v0.2.5 (release candidate 3: testnet roll, 13 October 2026)
 
 Testnet consensus parameter change and a wallet fix. **Mainnet consensus is unchanged**: mainnet blocks are valid or invalid exactly as before, and v0.2.0 through v0.2.5 interoperate on mainnet.
 
-**Activation heights: testnet3 2290 (OP_RETURN cap, consensus); mainnet 6000 (protocol floor, network rule only).**
+**Activation heights: testnet3 2290 (OP_RETURN cap, consensus); mainnet 3000 (protocol floor, network rule only).**
 
-## Protocol floor (forced upgrade at mainnet height 6000)
+## Protocol floor (forced upgrade at mainnet height 3000)
 
-The protocol version is **800004**. Until mainnet height 6000 the network accepts peers on 800002 and 800003 as before (the v0.2.4 floor at height 4100 still retires 800002 from that height). From height **6000**, about 27 days after the tag at the October 2026 block spacing, a v0.2.5 node disconnects peers that speak less than 800004, at the handshake and on open connections: nodes still on v0.2.4 or earlier keep validating blocks but lose their connections to upgraded nodes. Block validity is unchanged. The one-off exception to the upgrade policy is recorded in `doc/upgrade-policy.md` next to the v0.2.4 one; test-only overrides `-minv025version` / `-v025floorheight`.
+The protocol version is **800004**. Until mainnet height 3000 the network accepts peers on 800002 and 800003 as before. From height **3000**, about 6 days after the tag at the October 2026 block spacing (which makes the v0.2.4 floor at 4100 redundant: 800002 and 800003 are retired together at 3000), a v0.2.5 node disconnects peers that speak less than 800004, at the handshake and on open connections: nodes still on v0.2.4 or earlier keep validating blocks but lose their connections to upgraded nodes. Block validity is unchanged. The one-off exception to the upgrade policy is recorded in `doc/upgrade-policy.md` next to the v0.2.4 one; test-only overrides `-minv025version` / `-v025floorheight`.
 
 ## Testnet3: OP_RETURN cap raised to mainnet's 1,004 bytes at height 2290
 
