@@ -10,7 +10,7 @@
  */
 
 // QTC v0.2.4: 800003 (forced-upgrade floor at mainnet height 4100, see V024_PROTOCOL_FLOOR_HEIGHT).
-// QTC v0.2.5: 800004 (forced-upgrade floor at mainnet height 6000, see V025_PROTOCOL_FLOOR_HEIGHT).
+// QTC v0.2.5: 800004 (forced-upgrade floor at mainnet height 3000, see V025_PROTOCOL_FLOOR_HEIGHT).
 // 800002 = v0.2.0 to v0.2.3; 800001 = v0.1.0 to v0.1.3 (v1 chain). The protocol version advances only when a
 // release changes P2P behaviour; the peer floor below follows doc/upgrade-policy.md.
 static const int PROTOCOL_VERSION = 800004;
@@ -49,9 +49,10 @@ static const int V024_PROTOCOL_FLOOR_HEIGHT = 4100;
 //! a height is the highest floor whose height has been reached.
 static const int MIN_V025_PROTOCOL_VERSION = 800004;
 
-//! Mainnet height of the v0.2.5 floor: 6000, about 27 days after the v0.2.5 tag at the October 2026
-//! block spacing (tip 2075 on 13 October). Test-only override: -v025floorheight.
-static const int V025_PROTOCOL_FLOOR_HEIGHT = 6000;
+//! Mainnet height of the v0.2.5 floor: 3000, about 6 days after the v0.2.5 tag at the October 2026
+//! block spacing (tip 2075 on 13 October; owner decision). Being below the v0.2.4 floor height, it
+//! retires 800002 and 800003 together. Test-only override: -v025floorheight.
+static const int V025_PROTOCOL_FLOOR_HEIGHT = 3000;
 
 //! BIP 0031, pong message, is enabled for all versions AFTER this one
 static const int BIP0031_VERSION = 60000;
