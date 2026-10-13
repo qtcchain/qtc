@@ -463,6 +463,11 @@ public:
         consensus.fKAWPOW = false;
         consensus.fSkipKAWPOWValidation = false;
         consensus.fReducedDataLimits = true;
+        // Raised from the legacy 83 bytes to mainnet's 1,004 at height 2290 so the testnet mirrors mainnet's data
+        // limits (the QTC-EVM anchor needs 101 bytes; approved 2026-10-13). Blocks below 2290 keep the 83-byte cap.
+        consensus.nMaxOpReturnBytes = 1'004;
+        consensus.nMaxOpReturnBytesLegacy = 83;
+        consensus.nOpReturnRaiseHeight = 2290;
         consensus.fEnforceP2MROnlyOutputs = true;
         consensus.nKAWPOWHeight = std::numeric_limits<int>::max();
         consensus.fMatMulPOW = true;
@@ -1060,6 +1065,8 @@ public:
         consensus.fSkipKAWPOWValidation = !opts.matmul_strict;
         consensus.fReducedDataLimits = true;
         consensus.nMaxOpReturnBytes = 1'004; // mirror mainnet so tests exercise the launch value
+        consensus.nMaxOpReturnBytesLegacy = 83;
+        consensus.nOpReturnRaiseHeight = opts.opreturn_raise_height.value_or(0); // -opreturnraiseheight: exercise the testnet3 raise in tests
         consensus.fEnforceP2MROnlyOutputs = false;
         consensus.nKAWPOWHeight = std::numeric_limits<int>::max();
         consensus.fMatMulPOW = true;

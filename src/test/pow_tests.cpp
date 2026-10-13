@@ -840,7 +840,11 @@ BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_matmul_activation)
     BOOST_CHECK(consensus.enforce_BIP94);
     BOOST_CHECK_EQUAL(consensus.nKAWPOWHeight, std::numeric_limits<int>::max());
     BOOST_CHECK(consensus.fReducedDataLimits);
-    BOOST_CHECK_EQUAL(consensus.nMaxOpReturnBytes, 83U);
+    BOOST_CHECK_EQUAL(consensus.nMaxOpReturnBytes, 1'004U);       // mainnet's cap, in force from height 2290
+    BOOST_CHECK_EQUAL(consensus.nMaxOpReturnBytesLegacy, 83U);
+    BOOST_CHECK_EQUAL(consensus.nOpReturnRaiseHeight, 2290);
+    BOOST_CHECK_EQUAL(consensus.MaxOpReturnBytesAt(2289), 83U);
+    BOOST_CHECK_EQUAL(consensus.MaxOpReturnBytesAt(2290), 1'004U);
     BOOST_CHECK_EQUAL(consensus.nMaxTxoutScriptPubKeyBytes, 34U);
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacing, 600);
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacingFastMs, 250);

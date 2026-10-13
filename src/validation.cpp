@@ -4232,6 +4232,18 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
             return true;
         };
 
+    {
+        // Reduced-data output limits at the height the transaction would be mined at: policy already clamps
+        // relay to the chain's final OP_RETURN cap, but below nOpReturnRaiseHeight the legacy cap is consensus.
+        const Consensus::Params& consensus = m_active_chainstate.m_chainman.GetConsensus();
+        if (consensus.fReducedDataLimits) {
+            BlockValidationState limits_state;
+            if (!CheckReducedDataOutputLimits(tx, limits_state, consensus, m_active_chainstate.m_chain.Height() + 1)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, limits_state.GetRejectReason(), limits_state.GetDebugMessage());
+            }
+        }
+    }
+
     if (tx.HasShieldedBundle()) {
         const Consensus::Params& consensus = m_active_chainstate.m_chainman.GetConsensus();
         const int next_block_height = m_active_chainstate.m_chain.Height() + 1;
@@ -9756,9 +9768,13 @@ static bool CheckWitnessMalleation(const CBlock& block, bool expect_witness_comm
     return true;
 }
 
-bool CheckReducedDataOutputLimits(const CTransaction& tx, BlockValidationState& state, const Consensus::Params& consensus_params)
+bool CheckReducedDataOutputLimits(const CTransaction& tx, BlockValidationState& state, const Consensus::Params& consensus_params,
+                                  std::optional<int> height)
 {
     if (!consensus_params.fReducedDataLimits) return true;
+    // Without a height the final cap applies (context-free CheckBlock); with one, the cap in force at that
+    // height (the legacy cap below nOpReturnRaiseHeight).
+    const unsigned int max_opreturn_bytes{height ? consensus_params.MaxOpReturnBytesAt(*height) : consensus_params.nMaxOpReturnBytes};
 
     // QTC: besides P2MR, the 4-byte pay-to-anchor output (OP_1 <0x4e73>, BIP 431 / ephemeral
     // dust fee bumping) is admitted. It is keyless, carries no data, and is spendable by anyone
@@ -9776,9 +9792,9 @@ bool CheckReducedDataOutputLimits(const CTransaction& tx, BlockValidationState& 
         const bool is_op_return{script_size > 0 && txout.scriptPubKey[0] == OP_RETURN};
 
         if (is_op_return) {
-            if (script_size > consensus_params.nMaxOpReturnBytes) {
+            if (script_size > max_opreturn_bytes) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-opreturn-size",
-                                     strprintf("opreturn output script size %u exceeds max %u", static_cast<unsigned>(script_size), consensus_params.nMaxOpReturnBytes));
+                                     strprintf("opreturn output script size %u exceeds max %u", static_cast<unsigned>(script_size), max_opreturn_bytes));
             }
             continue;
         }
@@ -10204,6 +10220,14 @@ static bool ContextualCheckBlock(const CBlock& block,
         : nHeight;
     const bool is_ibd = chainman.IsInitialBlockDownload();
     const Consensus::Params& consensusParams = chainman.GetConsensus();
+
+    // Height-dependent OP_RETURN cap: CheckBlock enforced the final cap context-free; below the raise height
+    // the legacy cap applies.
+    if (consensusParams.fReducedDataLimits && nHeight < consensusParams.nOpReturnRaiseHeight) {
+        for (const auto& tx : block.vtx) {
+            if (!CheckReducedDataOutputLimits(*tx, state, consensusParams, nHeight)) return false;
+        }
+    }
 
     if (fCheckPOW && consensusParams.fMatMulPOW) {
         const bool has_v2_payload = HasMatMulV2Payload(block);
