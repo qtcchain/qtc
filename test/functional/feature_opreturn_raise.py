@@ -45,6 +45,7 @@ class OpReturnRaiseTest(BitcoinTestFramework):
         raise_height = node.getblockcount() + 3
         self.log.info(f"Raise height {raise_height}; restarting with -opreturnraiseheight")
         self.restart_node(0, extra_args=[f"-opreturnraiseheight={raise_height}"])
+        node.loadwallet("w")
         w = node.get_wallet_rpc("w")
 
         self.log.info("Below the raise height: the legacy 83-byte cap is consensus")
