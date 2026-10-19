@@ -1,6 +1,9 @@
 # QTC Agent Wallet Specification — wallets, spending and QTC buy/sell for AI agents
 
-Status: draft specification, 2026-09-24. Written against `qtc-main` at `7971d8e5`.
+Status: draft specification, revision 2, 2026-10-19 (first draft 2026-09-24). Written against
+`main` at `0ce4f64` (release v0.2.4; mainnet v2 live since 2026-10-05, protocol floor at mainnet
+height 4100). Revision 2 corrects the Tier 2 descriptor, the block-spacing constant, witness-size
+and fee estimates, the fee and price sources, and the RPC allowlist; see §14.
 Companions: [`../doc/qtc-key-management-guide.md`](../doc/qtc-key-management-guide.md) §7
 (rules for AI systems), [`../doc/qtc-block-explorer-spec.md`](../doc/qtc-block-explorer-spec.md)
 §7 (public JSON API and broadcast gateway), [`wqtc-bridge-architecture.md`](wqtc-bridge-architecture.md)
@@ -26,7 +29,8 @@ It specifies:
 - the **test plan** on regtest and the rollout order.
 
 Out of scope: a custodial exchange, an on-chain order book (QTC has none), the shielded pool
-(sunset from genesis on mainnet), and legal or tax treatment of agent-executed trades.
+(sunset height 0 on mainnet v2; testnet keeps it until height 125 000, which regtest and testnet
+tests must not rely on), and legal or tax treatment of agent-executed trades.
 
 ### 1.1 Design principles
 
@@ -82,12 +86,21 @@ Owners pick one tier per agent wallet. Both use descriptor wallets with P2MR add
 Receive and change descriptor:
 
 ```
-mr(<agent_mldsa>,{
-  multi_pq(2,<agent_mldsa>,<policy_mldsa>),        # normal spend: agent + policy co-signer
-  csv_multi_pq(<cooldown>,1,<owner_mldsa>),         # owner recovery after cooldown
-  ctv_multi_pq(<sweep_template>,1,<agent_mldsa>)    # optional: pre-committed sweep-to-owner
-})
+mr(multi_pq(2,<agent_mldsa>,<policy_mldsa>),        # PRIMARY LEAF: normal spend, agent + policy co-signer
+   {csv_multi_pq(<cooldown>,1,<owner_mldsa>),        # backup leaf: owner recovery after cooldown
+    ctv_multi_pq(<sweep_template>,1,<agent_mldsa>)}) # optional backup leaf: pre-committed sweep-to-owner
 ```
+
+**Why the 2-of-2 is the first argument.** QTC's `mr(primary, {backup tree})` has no Taproot-style
+internal key and no key-path spend: a P2MR output can only be spent by revealing a leaf script and
+its control block (`src/script/interpreter.cpp`, witness v2 branch), and the first argument of
+`mr()` is itself a spendable *primary leaf*; a bare key there becomes a single-signature
+`CHECKSIG` leaf (`src/script/descriptor.cpp`, `mr()` parser). The first draft of this spec wrote
+`mr(<agent_mldsa>,{...})`, which would have given the agent key a unilateral spend path and made
+the co-signer decorative. Rule: **no live key is ever the bare first argument of an agent or swap
+descriptor.** The AWS validates every descriptor it imports or accepts from a counterparty by
+parsing it with `getdescriptorinfo` and rejecting any primary leaf other than the intended
+multisig, HTLC or unspendable key.
 
 - `agent_mldsa` is held by the agent wallet in the AWS. `policy_mldsa` is held by a
   **separate policy co-signer process** (same host in a different user, or a separate host)
@@ -107,11 +120,11 @@ mr(<agent_mldsa>,{
 |---|---|---|
 | AWS compromise can drain | yes, up to cap | no, needs policy co-signer too |
 | Owner recovery without AWS | via backup archive | via CSV leaf on chain |
-| Per-spend witness size | ~3.8 KB | ~6.2 KB (two ML-DSA sigs + leaf + control) |
+| Per-spend witness size | ~3.8 KB (one 2,420-byte ML-DSA signature, one 1,312-byte key, leaf, control) | ~7.5 KB (two signatures and both keys in the leaf script, plus control); the multisig spec quotes ~8.8 KB for 2-of-3 |
 | Setup | one command | key ceremony for three keys |
 
-Fees are charged on full serialized size (QTC has no witness discount), so Tier 2 spends
-cost roughly 60 % more in fees. The policy engine's fee ceiling accounts for this.
+Fees are charged on full serialized size (QTC has no witness discount), so a Tier 2 spend costs
+roughly twice a Tier 1 spend at the same fee rate. The policy engine's fee ceiling accounts for this.
 
 ---
 
@@ -148,8 +161,12 @@ agent request ─► policy evaluation ─► PSBT build ─► (approval) ─�
    integers in atoms (1 QTC = 10^8 atoms); the AWS never accepts floats.
 2. **Policy evaluation** (§6) returns `allow`, `needs_approval`, or `deny` with a reason code.
 3. **PSBT build.** `walletcreatefundedpsbt` with `changeAddress` from the same descriptor,
-   `lockUnspent=true`, `fee_rate` from the explorer `/fees` endpoint clamped by policy, and an
-   anti-fee-sniping locktime. The AWS records the PSBT hash.
+   `lockUnspent=true`, an anti-fee-sniping locktime, and a `fee_rate` chosen in this order:
+   the local node's `estimatesmartfee`; else the explorer `/fees` endpoint; else the policy's
+   `min_fee_rate_atoms_per_byte` floor, which must not be below the node's `minrelaytxfee`
+   (`getmempoolinfo`). Both estimators return no value while fee history is empty, as on mainnet
+   today, so the floor is the normal case. The result is clamped by
+   `max_fee_rate_atoms_per_byte`. The AWS records the PSBT hash.
 4. **Approval** if required: the owner receives the decoded PSBT (destination, amount, fee)
    through the configured channel and approves by PSBT hash. Approval expires after
    `approval_ttl_seconds`; an expired approval requires a fresh build.
@@ -184,6 +201,7 @@ loaded by the AWS at start. Example:
     "per_day_tx_count": 40,
     "max_balance_atoms": 100000000000,
     "max_fee_rate_atoms_per_byte": 20,
+    "min_fee_rate_atoms_per_byte": 1,
     "min_confirmations_to_spend": 1
   },
   "destinations": {
@@ -203,7 +221,7 @@ loaded by the AWS at start. Example:
     "max_open_swaps": 3,
     "min_refund_lock_blocks": 40,
     "max_refund_lock_blocks": 400,
-    "reference_price_sources": ["desk-a", "desk-b", "explorer-vwap"],
+    "reference_price_sources": ["desk-a", "desk-b"],
     "max_price_deviation_bps": 200
   },
   "time_windows": [{"days": "mon-fri", "utc": "12:00-22:00"}],
@@ -248,7 +266,9 @@ evaluations must agree for a Tier 2 spend.
 
 QTC has no on-chain exchange. This spec defines three venues; the policy names which an agent
 may use. Prices are quoted as `counter_asset_atoms per QTC`; the counter asset on the EVM leg
-is any ERC-20 (typically a USD stablecoin or wQTC).
+is any ERC-20 (typically a USD stablecoin or wQTC). The default EVM leg is **QTC-EVM**, the
+QTC-anchored layer 2 (testnet chain id 20821; mainnet release planned 31 October 2026), with
+other EVM chains allowed per policy by chain id.
 
 ### 7.1 Venue A — Trustless HTLC atomic swap (default)
 
@@ -264,6 +284,15 @@ mr(<internal>,{htlc(<hash160>,<claimer_mldsa>),refund(<locktime>,<sender_mldsa>)
 
 Hashlock is `RIPEMD160(SHA256(preimage))` on both chains; both are EVM precompiles.
 
+`<internal>` is **not** a key-path key (see §3): it is the primary leaf of the tree, and a live key
+there could spend the HTLC output unilaterally before the timeout. The AWS always sets it to the
+published **unspendable ML-DSA-44 key** `QTC_UNSPENDABLE_MLDSA44` (an ML-DSA public key whose
+`t1` component is derived by hashing a fixed public string, so that no secret key of the required
+norm exists under the MLWE assumption; the exact derivation and the hex value belong in the
+key-management guide), and it refuses any counterparty descriptor whose primary leaf is anything
+else. The reference SDK's `HtlcLeg.internal_pubkey` docstring calls this "the key-path internal
+key"; that wording is wrong and the SDK example must pass the unspendable key.
+
 **Sell QTC for a token** (agent is the QTC sender):
 
 1. Agent obtains a counterparty offer (§7.2) containing the counterparty's ML-DSA claim key,
@@ -272,8 +301,12 @@ Hashlock is `RIPEMD160(SHA256(preimage))` on both chains; both are EVM precompil
    address with `getdescriptorinfo` and `deriveaddresses`, imports it watch-only, and funds it
    through the spend pipeline (§5) with `refund_locktime = tip + L_qtc`.
 3. Counterparty locks the token in the EVM HTLC with the same hashlock and
-   `L_evm < L_qtc` in wall-clock terms (the AWS computes the mapping from QTC's 90 s target
-   spacing and rejects offers where the counterparty's timeout would not expire first).
+   `L_evm < L_qtc` in wall-clock terms. The AWS converts QTC block locks to time using the
+   chain's target spacing read from the node (`getdifficultyhealth.target_spacing_s`), which is
+   **600 s on mainnet, testnet and testnet4** and 90 s only on regtest; it never hard-codes the
+   constant. Because ASERT lets real intervals run well under target when hashpower is rising,
+   the AWS applies a safety factor (default 0.5× target per block) when computing the earliest
+   possible QTC expiry, and rejects offers where the counterparty's timeout would not expire first.
 4. AWS verifies the EVM lock on chain (amount, token, hashlock, recipient, timeout), then
    claims it, revealing the preimage.
 5. Counterparty claims the QTC leg with the preimage. If they never lock, the AWS refunds
@@ -321,9 +354,12 @@ and redeem lifecycle and the unaudited status of the reference contracts.
 
 ### 7.4 Price references and slippage
 
-The AWS computes a reference price as the median of the configured sources: desk quotes,
-and an explorer-derived VWAP if a market-data endpoint exists. A quote deviating more than
-`max_price_deviation_bps` from the reference is denied. Slippage is bounded per swap by
+The AWS computes a reference price as the median of the configured desk quotes. No
+trade-based VWAP exists today: the explorer publishes no price, and the figure on qtc.markets is
+a published **asking-price rule** (a US$10 launch price adjusted daily for network work), not an
+observed market price, so it **must not** be used as a reference source. With fewer than two
+independent desk quotes the reference is undefined and every trade is `needs_approval`. A quote
+deviating more than `max_price_deviation_bps` from the reference is denied. Slippage is bounded per swap by
 `max_slippage_bps` relative to the accepted quote; because HTLC swaps are fixed-price, this
 only matters for Venue C DEX trades, where the AWS sets the DEX router's minimum-out.
 
@@ -383,7 +419,8 @@ Node `rpcwhitelist` for the AWS user (everything else denied):
 createwallet, loadwallet, unloadwallet, encryptwallet, walletpassphrase, walletlock,
 getnewaddress, getbalances, listunspent, listtransactions, gettransaction,
 walletcreatefundedpsbt, walletprocesspsbt, finalizepsbt, decodepsbt, analyzepsbt,
-testmempoolaccept, sendrawtransaction, estimatesmartfee, getblockchaininfo, getblockcount,
+testmempoolaccept, sendrawtransaction, estimatesmartfee, getmempoolinfo, getblockchaininfo,
+getblockcount, getnetworkinfo, getdifficultyhealth, getrawtransaction, gettxout,
 getdescriptorinfo, deriveaddresses, importdescriptors, createwalletdescriptor, lockunspent,
 z_verifywalletintegrity, backupwalletbundlearchive
 ```
@@ -412,7 +449,9 @@ No `dumpprivkey`-class, `exportwalletbundle`, `exportpqkey` with private data, o
 6. **Audit log** is append-only, hashed in a chain, and records request, policy decision,
    PSBT hash, txid, and outcome. It is exportable for the owner and contains no secrets.
 7. **Node hygiene:** loopback RPC, cookie auth, `rpcwhitelist`, `disablewallet=0` only on the
-   AWS node, `txindex=1` if the AWS needs `getrawtransaction` for counterparties.
+   AWS node, `txindex=1` so `getrawtransaction` can verify counterparty funding. Before trusting
+   a local broadcast the AWS checks `getnetworkinfo.connections` is above zero and the node is
+   not in initial block download.
 8. **Backups** are taken after wallet creation and after any descriptor change, verified with
    `z_verifywalletintegrity` first, and restore-tested on regtest before mainnet use.
 9. **Counterparty verification** for swaps happens against the local node, with the explorer
@@ -432,6 +471,10 @@ Regtest, driven by the functional test framework:
 | `agent_wallet_lifecycle` | create, fund, balance, send within limits, backup archive restores on a second node with equal balance |
 | `agent_policy_limits` | per-tx, per-day, count, fee-rate, time-window and destination denials each return the right code; daily counter survives restart |
 | `agent_tier2_cosign` | Tier 2 spend fails without policy co-signer; succeeds with it; owner CSV leaf sweeps after cooldown; CTV sweep leaf cannot send anywhere but the template |
+| `agent_tier2_primary_leaf` | the agent key alone cannot spend a Tier 2 output (no single-signature leaf exists); a descriptor with a bare live key as first argument is rejected by the AWS validator |
+| `agent_htlc_descriptor_guard` | an HTLC descriptor whose primary leaf is a live key is rejected; with the unspendable key, only the hashlock and refund leaves can spend |
+| `agent_fee_floor` | with empty fee history the build uses the policy floor, never below `minrelaytxfee`, and never above the ceiling |
+| `agent_timeout_mapping` | timeout ordering uses the node's target spacing with the safety factor; a 90 s regtest constant leaking into a 600 s network is caught |
 | `agent_swap_sell_qtc` | full HTLC sell against an EVM devnet (Anvil) HTLC; preimage extracted; counterparty no-show refunds after locktime |
 | `agent_swap_buy_qtc` | mirror; timeout ordering violation is rejected before funding |
 | `agent_swap_restart` | AWS killed mid-swap resumes from persisted state without double-funding |
@@ -455,7 +498,9 @@ rotation, one forced freeze and owner unfreeze, one Tier 2 owner recovery.
 | 5 | Venue C (bridge) enabled behind policy flag | audited bridge contracts; federation live |
 
 Mainnet enablement for any agent waits for Phase 3, so no agent ever holds more than the
-Tier 1 cap without script-enforced limits.
+Tier 1 cap without script-enforced limits. Any node-side change this work needs (none is
+expected: every descriptor form above exists today) follows the release rule in
+`doc/release-process.md`: a fresh chain anchor and a stated activation height in every release.
 
 ---
 
@@ -466,5 +511,16 @@ Tier 1 cap without script-enforced limits.
 2. Which desk operates first, and whether QTC provides a reference RFQ desk implementation.
 3. Whether to expose `wallet:psbt` at all in v1, or defer external-signer agents.
 4. Approval channel defaults: webhook, email, or a signed message via the explorer.
-5. Whether `market.reference_price` needs an on-chain or explorer VWAP source before mainnet
-   enablement, or desk medians suffice.
+5. Whether `market.reference_price` needs a trade-based VWAP source before mainnet enablement,
+   or desk medians suffice. (The qtc.markets asking price is not a candidate; see §7.4.)
+6. Who publishes `QTC_UNSPENDABLE_MLDSA44` and its derivation (§7.1), and whether the node
+   should expose it through `getdescriptorinfo` so wallets can validate it without a copy.
+
+---
+
+## 14. Change log
+
+| Date | Change |
+|---|---|
+| 2026-09-24 | First draft against `qtc-main` 7971d8e5. |
+| 2026-10-19 | Revision 2 after review against `main` 0ce4f64: Tier 2 descriptor corrected (2-of-2 as the primary leaf; `mr()` has no key path); HTLC primary leaf must be the unspendable key; block spacing 600 s read from the node with a safety factor; witness sizes ~3.8 KB / ~7.5 KB and fees roughly double; fee source order with a policy floor; price reference limited to desk quotes, qtc.markets excluded; RPC allowlist completed; QTC-EVM named as the default EVM leg; shielded-pool heights per network; five tests added. |
