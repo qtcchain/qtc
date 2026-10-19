@@ -26,10 +26,13 @@ End-to-end swap flow (QTC leg of a trustless QTC<->EVM atomic swap)::
     secret = new_preimage()                      # 32-byte swap secret (keep private until claim)
     h160   = qtc_hash160_hex(secret)             # == RIPEMD160(SHA256(secret)); use on BOTH chains
 
-    leg = HtlcLeg(internal_pubkey=internal_pk, claimer_pubkey=recipient_pk,
+    # internal_pk is the tree's PRIMARY LEAF, not a Taproot key path (QTC P2MR has none): a live key
+    # here could spend the lock alone, so it must be a provably unspendable ML-DSA key, never the
+    # funder's or the claimer's key (docs/qtc-agent-wallet-spec.md §7.1).
+    leg = HtlcLeg(internal_pubkey=unspendable_pk, claimer_pubkey=recipient_pk,
                   sender_pubkey=funder_pk, preimage_hash160_hex=h160,
                   refund_locktime=qtc_refund_height)   # QTC timeout STRICTLY > EVM timeout
-    desc = add_checksum(rpc, leg.descriptor())   # mr(internal,{htlc(h160,claimer),refund(lt,sender)})
+    desc = add_checksum(rpc, leg.descriptor())   # mr(unspendable,{htlc(h160,claimer),refund(lt,sender)})
     addr = swap_address(rpc, desc)               # the single P2MR lock address
     import_watch(rpc_wallet, desc)               # so the wallet indexes deposits to it
     # ... funder pays `addr`; counterparty opens the EVM leg under the SAME hashlock h160 ...
@@ -74,14 +77,27 @@ def qtc_hash160_hex(preimage: bytes) -> str:
 @dataclass
 class HtlcLeg:
     """Parameters of the QTC HTLC leg of a swap."""
-    internal_pubkey: str   # ML-DSA hex (or pk_slh(<slh hex>)) — the key-path internal key
+    internal_pubkey: str   # ML-DSA hex (or pk_slh(<slh hex>)) — the PRIMARY LEAF of the mr() tree.
+                           # QTC's mr() has no key path: its first argument is a spendable single-signature
+                           # leaf, so this MUST be a provably unspendable key. Never the funder's or the
+                           # claimer's key, or that party can spend the lock without the preimage/timeout.
     claimer_pubkey: str    # recipient's ML-DSA hex (or pk_slh(...)): claims with preimage + their sig
     sender_pubkey: str     # funder's ML-DSA hex (or pk_slh(...)): refunds after locktime
     preimage_hash160_hex: str
     refund_locktime: int   # absolute block height (or unix time) for the refund leaf
 
+    def __post_init__(self) -> None:
+        live = {self.claimer_pubkey, self.sender_pubkey}
+        if self.internal_pubkey in live:
+            raise ValueError("HtlcLeg.internal_pubkey is the primary leaf and must be an unspendable key, "
+                             "not the claimer's or sender's key (it would spend the lock alone)")
+
     def descriptor(self) -> str:
-        """The (checksum-less) mr() descriptor; add a checksum via add_checksum(rpc, ...)."""
+        """The (checksum-less) mr() descriptor; add a checksum via add_checksum(rpc, ...).
+
+        Shape: mr(<unspendable primary leaf>,{htlc(H160,claimer),refund(locktime,sender)}). Only the
+        htlc and refund leaves may be spendable; see the internal_pubkey comment above.
+        """
         return (f"mr({self.internal_pubkey},"
                 f"{{htlc({self.preimage_hash160_hex},{self.claimer_pubkey}),"
                 f"refund({self.refund_locktime},{self.sender_pubkey})}})")

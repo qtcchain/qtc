@@ -176,8 +176,9 @@ one chain). No proxy ⇒ no initializer/storage-gap concerns.
 - **Signer rotation:** `rotateSigners(newSet, M)` via the Timelock; the old set is cleared.
 
 ### 5.3 Atomic-swap integrators (Model B, no federation)
-- **Build the QTC leg** as `mr(<internal>, {htlc(<H160>, <claimerPk>), refund(<locktime>, <senderPk>)})`
-  with `H160 = RIPEMD160(SHA256(preimage))`; lock the EVM leg via `WQTCAtomicSwapHTLC.open(...)` under
+- **Build the QTC leg** as `mr(<unspendable>, {htlc(<H160>, <claimerPk>), refund(<locktime>, <senderPk>)})`
+  with `H160 = RIPEMD160(SHA256(preimage))` and an unspendable key as the primary leaf (`mr()` has no
+  key path; a live key there would spend the lock alone); lock the EVM leg via `WQTCAtomicSwapHTLC.open(...)` under
   the **same** `hashlock`. Assemble + import the lock with stock descriptor RPCs:
   `getdescriptorinfo` (add checksum) → `deriveaddresses` (the P2MR lock address) → `importdescriptors`
   (watch for the deposit), then `sendtoaddress` to fund it.

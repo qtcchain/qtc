@@ -27,7 +27,7 @@ What already exists on the QTC side:
   gated at C-002/123000). RPCs: `bridge_buildverifierset`, `bridge_buildrefund`, `bridge_build*`.
 - **Trustless-swap primitives** — `BuildP2MRHTLCLeaf` (hashlock + oracle CSFS), `BuildP2MRRefundLeaf`
   (CLTV timeout + PQ-sig), `BuildP2MRAtomicSwapLeaf` (CTV covenant + PQ-sig), `OP_CHECKSIGFROMSTACK`
-  (`CSFS/qtc` tagged hash), CTV. Descriptors express them: `mr(KEY,{htlc(H160,PK),refund(T,PK)})`.
+  (`CSFS/qtc` tagged hash), CTV. Descriptors express them: `mr(UNSPENDABLE,{htlc(H160,PK),refund(T,PK)})` (the first argument is a spendable primary leaf, not a key path, so it must be an unspendable key).
 - **PSBT** carries everything needed to *spend* these end-to-end: hash preimage fields
   (`hash160_preimages`/`sha256_preimages`), and P2MR fields (`m_p2mr_leaf_script`,
   `m_p2mr_control_block`, `m_p2mr_merkle_root`, `m_p2mr_csfs_msgs/sigs`, `m_p2mr_pq_sigs`). The
