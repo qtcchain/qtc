@@ -115,14 +115,59 @@ type Pipeline struct {
 	// Decode is replaceable for tests (post-sign mutation scenario).
 	Decode func(psbt string) (*Decoded, error)
 
-	mu     sync.Mutex
-	locked map[string]lockedInputs // psbt sha256 -> inputs the build locked
+	mu       sync.Mutex
+	locked   map[string]lockedInputs // psbt sha256 -> inputs the build locked
+	walletMu map[string]*sync.Mutex  // one spend at a time per wallet: evaluate -> build -> record is atomic
 }
 
 func New(cfg *config.Config, r *rpc.Client, ws *wallet.Wallets, pe *policy.Engine, st *store.Store, cs Cosigner) *Pipeline {
-	p := &Pipeline{Cfg: cfg, RPC: r, Wallets: ws, Policy: pe, Store: st, Cosigner: cs, locked: map[string]lockedInputs{}}
+	p := &Pipeline{Cfg: cfg, RPC: r, Wallets: ws, Policy: pe, Store: st, Cosigner: cs, locked: map[string]lockedInputs{}, walletMu: map[string]*sync.Mutex{}}
 	p.Decode = p.decode
 	return p
+}
+
+// lockWallet serialises spends per wallet within this process; the database-level check in
+// Store.AddSpendChecked covers other processes.
+func (p *Pipeline) lockWallet(walletID string) func() {
+	p.mu.Lock()
+	m, ok := p.walletMu[walletID]
+	if !ok {
+		m = &sync.Mutex{}
+		p.walletMu[walletID] = m
+	}
+	p.mu.Unlock()
+	m.Lock()
+	return m.Unlock
+}
+
+// Recover rebuilds the locked-input map from pending approvals after a restart and releases the inputs of
+// approvals that expired while the service was down. Call once at startup.
+func (p *Pipeline) Recover() {
+	for _, a := range p.Store.AllOpenApprovals() {
+		d := DecodedFromMap(a.Decoded)
+		w := p.Store.Wallet(a.WalletID)
+		if w == nil {
+			continue
+		}
+		p.mu.Lock()
+		p.locked[a.PSBTSHA256] = lockedInputs{w.NodeWallet, d.Vin}
+		p.mu.Unlock()
+	}
+	p.ReleaseExpiredApprovals()
+}
+
+// Janitor releases expired approvals on a timer (not only on the next Send) until ctx ends.
+func (p *Pipeline) Janitor(stop <-chan struct{}, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			p.ReleaseExpiredApprovals()
+		}
+	}
 }
 
 func (p *Pipeline) release(h string) {
@@ -150,7 +195,14 @@ func (p *Pipeline) ReleaseExpiredApprovals() {
 	p.mu.Unlock()
 	for _, h := range keys {
 		a := p.Store.Approval(h)
-		if a != nil && !a.Approved && a.ExpiresAt < float64(time.Now().Unix()) {
+		switch {
+		case a == nil:
+			p.release(h)
+		case a.Consumed: // completed by another process (owner CLI); the wallet forgot the lock when it spent
+			p.mu.Lock()
+			delete(p.locked, h)
+			p.mu.Unlock()
+		case !a.Approved && a.ExpiresAt < float64(time.Now().Unix()):
 			p.release(h)
 			_ = p.Store.SetSpendStatus(h, "expired")
 		}
@@ -244,6 +296,18 @@ func (p *Pipeline) Send(req Request) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer p.lockWallet(req.WalletID)()
+	// re-read under the lock: a concurrent request may have frozen the wallet (kill switch) while we waited
+	if w, err = p.Wallets.Get(req.WalletID); err != nil {
+		return nil, err
+	}
+	if w.Frozen {
+		reason := w.FrozenReason
+		if reason == "" {
+			reason = "frozen"
+		}
+		return nil, errs.Froze(reason)
+	}
 	p.ReleaseExpiredApprovals()
 	va, err := p.RPC.Map("validateaddress", req.To)
 	if err != nil {
@@ -291,12 +355,22 @@ func (p *Pipeline) Send(req Request) (*Result, error) {
 	if decision.Decision == policy.NeedsApproval {
 		status = "needs_approval"
 	}
-	if err := p.Store.AddSpend(req.WalletID, h, amount, []string{req.To}, req.Purpose, status); err != nil {
+	doc, _ := p.Policy.Load(req.WalletID)
+	lim := jsonx.M(doc, "limits")
+	if err := p.Store.AddSpendChecked(req.WalletID, h, amount, []string{req.To}, req.Purpose, status,
+		jsonx.I(lim, "per_day_atoms", 0), jsonx.I(lim, "per_day_tx_count", 0)); err != nil {
 		p.release(h)
+		if err == store.ErrLimit { // another process recorded a spend between evaluation and here
+			reason := "per_day_limit"
+			p.Store.Audit("policy.decision", map[string]any{"decision": policy.Deny, "reason": reason, "to": req.To, "amount_atoms": amount, "purpose": req.Purpose}, req.WalletID, req.Actor)
+			if p.Policy.RecordDenial(w, reason) && !w.Frozen {
+				_ = p.Wallets.Freeze(req.WalletID, "kill_switch:denials_per_hour ("+reason+")", "policy")
+			}
+			return &Result{Status: "denied", Reason: reason}, nil
+		}
 		return nil, err
 	}
 	if decision.Decision == policy.NeedsApproval {
-		doc, _ := p.Policy.Load(req.WalletID)
 		ttl := jsonx.I(jsonx.M(doc, "approval"), "ttl_seconds", 900)
 		request := map[string]any{"to": req.To, "amount_atoms": amount, "purpose": req.Purpose, "fee_rate": rate}
 		if err := p.Store.AddApproval(h, req.WalletID, psbt, decoded.Map(), request, ttl); err != nil {

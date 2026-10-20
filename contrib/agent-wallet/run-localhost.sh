@@ -35,14 +35,16 @@ start_pg() {
   [[ -n "$PGBIN" ]] || { echo "postgresql@16 not found (brew install postgresql@16) or set AWS_PG_DSN"; exit 1; }
   mkdir -p "$PGDIR" "$LOGS"
   if [[ ! -f "$PGDIR/pgdata/PG_VERSION" ]]; then
-    "$PGBIN/initdb" -D "$PGDIR/pgdata" -U aws --auth=trust -E UTF8 --no-locale >"$LOGS/initdb.log" 2>&1
+    # scram-sha-256 for every connection: other local users cannot reach the service's tables
+    openssl rand -hex 24 > "$AWS_HOME/.pgpw.tmp"; chmod 600 "$AWS_HOME/.pgpw.tmp"
+    "$PGBIN/initdb" -D "$PGDIR/pgdata" -U aws --auth=scram-sha-256 --pwfile="$AWS_HOME/.pgpw.tmp" -E UTF8 --no-locale >"$LOGS/initdb.log" 2>&1
   fi
   mkdir -p "$PGDIR/sock"
   if ! "$PGBIN/pg_ctl" -D "$PGDIR/pgdata" status >/dev/null 2>&1; then
     "$PGBIN/pg_ctl" -D "$PGDIR/pgdata" -o "-p $PG_PORT -k $PGDIR/sock -c listen_addresses=127.0.0.1" -l "$LOGS/postgres.log" -w start >/dev/null
   fi
   AWS_PG_DSN="postgres://aws@127.0.0.1:$PG_PORT/postgres?sslmode=disable"
-  log "postgres up at 127.0.0.1:$PG_PORT (private cluster, trust auth on loopback)"
+  log "postgres up at 127.0.0.1:$PG_PORT (private cluster, scram-sha-256, password in the service keyring)"
 }
 
 start_node() {
@@ -65,9 +67,10 @@ start_node() {
 
 init_service() {
   if [[ ! -f "$CFG" ]]; then
-    aws init --data-dir "$AWS_HOME/data" --pg-dsn "$AWS_PG_DSN" --rpc-url "http://127.0.0.1:$RPC_PORT" --chain regtest \
-      --listen "$REST" --cosigner-listen "$COSIGNER" --rpc-user aws < "$AWS_HOME/.rpcpw.tmp"
-    rm -f "${AWS_HOME:?}/.rpcpw.tmp"
+    # stdin: line 1 = node rpc password, line 2 = postgres password (both land in the 0600 keyring, never argv)
+    cat "$AWS_HOME/.rpcpw.tmp" "${AWS_HOME}/.pgpw.tmp" 2>/dev/null | aws init --data-dir "$AWS_HOME/data" --pg-dsn "$AWS_PG_DSN" \
+      --rpc-url "http://127.0.0.1:$RPC_PORT" --chain regtest --listen "$REST" --cosigner-listen "$COSIGNER" --rpc-user aws --pg-password-stdin
+    rm -f "${AWS_HOME:?}/.rpcpw.tmp" "${AWS_HOME:?}/.pgpw.tmp"
   fi
 }
 

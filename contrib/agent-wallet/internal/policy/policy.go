@@ -154,16 +154,22 @@ type Trade struct {
 	PriceDeviationBps *int64
 }
 
+type cached struct {
+	doc   map[string]any
+	mtime int64
+	size  int64
+}
+
 type Engine struct {
 	Dir         string
 	AdminSecret string
 	Store       *store.Store
 	mu          sync.Mutex
-	cache       map[string]map[string]any
+	cache       map[string]cached
 }
 
 func NewEngine(dir, adminSecret string, st *store.Store) *Engine {
-	return &Engine{Dir: dir, AdminSecret: adminSecret, Store: st, cache: map[string]map[string]any{}}
+	return &Engine{Dir: dir, AdminSecret: adminSecret, Store: st, cache: map[string]cached{}}
 }
 
 func (e *Engine) Path(walletID string) string { return filepath.Join(e.Dir, walletID+".json") }
@@ -188,12 +194,17 @@ func (e *Engine) Write(walletID string, doc map[string]any) (map[string]any, err
 	return signed, nil
 }
 
-// Load returns the verified policy document for a wallet.
+// Load returns the verified policy document for a wallet. The cache is keyed on the file's mtime and size,
+// so a `policy set` from the owner CLI (another process) takes effect on the next evaluation.
 func (e *Engine) Load(walletID string) (map[string]any, error) {
+	st, err := os.Stat(e.Path(walletID))
+	if err != nil {
+		return nil, errs.New(errs.BadRequest, "policy_missing", "no policy document for %s", walletID)
+	}
 	e.mu.Lock()
-	if d, ok := e.cache[walletID]; ok {
+	if c, ok := e.cache[walletID]; ok && c.mtime == st.ModTime().UnixNano() && c.size == st.Size() {
 		e.mu.Unlock()
-		return d, nil
+		return c.doc, nil
 	}
 	e.mu.Unlock()
 	raw, err := os.ReadFile(e.Path(walletID))
@@ -208,7 +219,7 @@ func (e *Engine) Load(walletID string) (map[string]any, error) {
 		return nil, errs.New(errs.BadRequest, "policy_signature", "policy signature invalid")
 	}
 	e.mu.Lock()
-	e.cache[walletID] = doc
+	e.cache[walletID] = cached{doc: doc, mtime: st.ModTime().UnixNano(), size: st.Size()}
 	e.mu.Unlock()
 	return doc, nil
 }

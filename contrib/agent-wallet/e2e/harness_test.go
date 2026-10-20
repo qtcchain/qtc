@@ -151,6 +151,8 @@ func TestMain(m *testing.M) {
 		csPort := freePort()
 		cfg := config.Default(data)
 		cfg.PgDSN, cfg.RPCURL, cfg.CookiePath, cfg.ConfirmationDepth = pg.DSN, node.URL, node.Cookie, 2
+		_ = os.MkdirAll(data, 0o700)
+		_ = config.NewKeyring(cfg.KeyringPath()).Set("pg_password", pg.Password)
 		cfg.CosignerURL, cfg.CosignerListen = fmt.Sprintf("http://127.0.0.1:%d", csPort), fmt.Sprintf("127.0.0.1:%d", csPort)
 		svc, err := service.New(cfg)
 		if err != nil {
@@ -160,14 +162,16 @@ func TestMain(m *testing.M) {
 		csDir := filepath.Join(data, "cosigner")
 		_ = os.MkdirAll(csDir, 0o700)
 		kr := config.NewKeyring(filepath.Join(csDir, "keyring.json"))
-		for _, n := range []string{"decision_secret", "admin_secret"} {
+		for _, n := range []string{"decision_secret", "admin_secret", "pg_password"} {
 			v, _ := svc.Keyring.Require(n)
 			_ = kr.Set(n, v)
 		}
-		csStore, err := store.Open(pg.DSN, "cosigner")
+		csAuditKey, _ := kr.Ensure("audit_key", 32)
+		csStore, err := store.Open(pg.DSN, "cosigner", pg.Password)
 		if err != nil {
 			panic(err)
 		}
+		csStore.SetAuditKey(csAuditKey)
 		admin, _ := kr.Require("admin_secret")
 		cs := &cosigner.Service{Cfg: cfg, RPC: rpc.New(node.URL, node.Cookie, "", ""), Keyring: kr, Store: csStore,
 			Policy: policy.NewEngine(cfg.PolicyDir(), admin, csStore), WalletLookup: svc.Store.Wallet}

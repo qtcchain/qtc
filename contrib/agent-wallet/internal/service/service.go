@@ -73,10 +73,16 @@ func NewWithSchema(cfg *config.Config, schema string) (*Service, error) {
 	if cfg.PgDSN == "" {
 		return nil, errs.New(errs.Internal, "config", "pg_dsn is required (PostgreSQL connection string)")
 	}
-	st, err := store.Open(cfg.PgDSN, schema)
+	pgpw, _ := kr.Get("pg_password")
+	st, err := store.Open(cfg.PgDSN, schema, pgpw)
 	if err != nil {
 		return nil, errs.New(errs.Internal, "store", "%v", err)
 	}
+	auditKey, err := kr.Ensure("audit_key", 32)
+	if err != nil {
+		return nil, err
+	}
+	st.SetAuditKey(auditKey)
 	pw := cfg.RPCPassword
 	if pw == "" {
 		pw, _ = kr.Get("rpc_password")
@@ -101,6 +107,7 @@ func NewWithSchema(cfg *config.Config, schema string) (*Service, error) {
 		cs = s.Cosigner
 	}
 	s.Spend = spend.New(cfg, r, s.Wallets, s.Policy, st, cs)
+	s.Spend.Recover()
 	return s, nil
 }
 

@@ -3,6 +3,8 @@
 package testpg
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -14,10 +16,20 @@ import (
 )
 
 type Cluster struct {
-	Dir  string
-	Port int
-	DSN  string
-	bin  string
+	Dir      string
+	sock     string
+	Port     int
+	DSN      string // without the password
+	Password string // scram-sha-256 password for role aws (throwaway)
+	bin      string
+}
+
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b)
 }
 
 func FreePort() int {
@@ -49,8 +61,15 @@ func Start(dir string) (*Cluster, error) {
 		return nil, fmt.Errorf("initdb/pg_ctl not found; install postgresql@16 or set AWS_PG_DSN")
 	}
 	data := filepath.Join(dir, "pgdata")
+	pwFile := filepath.Join(dir, "pgpass")
 	if _, err := os.Stat(filepath.Join(data, "PG_VERSION")); err != nil {
-		cmd := exec.Command(initdb, "-D", data, "-U", "aws", "--auth=trust", "-E", "UTF8", "--no-locale")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(pwFile, []byte(randomHex(24)+"\n"), 0o600); err != nil {
+			return nil, err
+		}
+		cmd := exec.Command(initdb, "-D", data, "-U", "aws", "--auth=scram-sha-256", "--pwfile="+pwFile, "-E", "UTF8", "--no-locale")
 		cmd.Env = pgEnv()
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return nil, fmt.Errorf("initdb: %v\n%s", err, out)
@@ -58,14 +77,20 @@ func Start(dir string) (*Cluster, error) {
 	}
 	port := FreePort()
 	c := &Cluster{Dir: data, Port: port, bin: pgctl}
-	sock := filepath.Join(dir, "pgsock")
-	_ = os.MkdirAll(sock, 0o700)
+	// Unix socket paths are capped (~104 bytes on macOS); test temp dirs are long, so keep the socket short.
+	sock, err := os.MkdirTemp(os.TempDir(), "qtcpg-")
+	if err != nil {
+		return nil, err
+	}
+	c.sock = sock
 	opts := fmt.Sprintf("-p %d -k %s -c listen_addresses=127.0.0.1 -c fsync=off -c synchronous_commit=off", port, sock)
 	cmd := exec.Command(pgctl, "-D", data, "-o", opts, "-l", filepath.Join(dir, "postgres.log"), "-w", "start")
 	cmd.Env = pgEnv()
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("pg_ctl start: %v\n%s", err, out)
 	}
+	pwRaw, _ := os.ReadFile(pwFile)
+	c.Password = strings.TrimSpace(string(pwRaw))
 	c.DSN = fmt.Sprintf("postgres://aws@127.0.0.1:%d/postgres?sslmode=disable", port)
 	// wait for readiness
 	for i := 0; i < 50; i++ {
@@ -86,6 +111,9 @@ func (c *Cluster) Stop() {
 	cmd := exec.Command(c.bin, "-D", c.Dir, "-m", "fast", "-w", "stop")
 	cmd.Env = pgEnv()
 	_ = cmd.Run()
+	if c.sock != "" {
+		_ = os.RemoveAll(c.sock)
+	}
 }
 
 // pgEnv pins LC_ALL: on macOS the postmaster aborts with "became multithreaded during startup" when the

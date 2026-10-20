@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/qtcchain/qtc/contrib/agent-wallet/internal/config"
 	"github.com/qtcchain/qtc/contrib/agent-wallet/internal/cosigner"
@@ -114,6 +115,7 @@ func cmdInit(cfgPath string, args []string) {
 	rpcURL := fs.String("rpc-url", "http://127.0.0.1:28790", "node RPC URL")
 	cookie := fs.String("cookie", "", "node .cookie path (operator identity); prefer --rpc-user")
 	rpcUser := fs.String("rpc-user", "", "rpcauth user for the node; its password is read from stdin (one line) into the keyring")
+	pgPwStdin := fs.Bool("pg-password-stdin", false, "read the PostgreSQL password from stdin (the line after the rpc password) into the keyring")
 	chain := fs.String("chain", "regtest", "chain name")
 	listen := fs.String("listen", "127.0.0.1:8792", "REST listen address (loopback)")
 	cosignerListen := fs.String("cosigner-listen", "127.0.0.1:8793", "co-signer listen address (loopback)")
@@ -134,15 +136,26 @@ func cmdInit(cfgPath string, args []string) {
 			die("%v", err)
 		}
 	}
+	stdin := bufio.NewReader(os.Stdin)
 	if *rpcUser != "" {
 		// rpcauth identity (spec §9): the password lives in the 0600 keyring, never in argv or the config
 		cfg.RPCUser = *rpcUser
-		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		line, _ := stdin.ReadString('\n')
 		pw := strings.TrimRight(line, "\r\n")
 		if pw == "" {
 			die("init: --rpc-user needs the password on stdin")
 		}
 		if err := kr.Set("rpc_password", pw); err != nil {
+			die("%v", err)
+		}
+	}
+	if *pgPwStdin {
+		line, _ := stdin.ReadString('\n')
+		pw := strings.TrimRight(line, "\r\n")
+		if pw == "" {
+			die("init: --pg-password-stdin needs the password on stdin")
+		}
+		if err := kr.Set("pg_password", pw); err != nil {
 			die("%v", err)
 		}
 	}
@@ -326,10 +339,10 @@ func cmdAudit(cfgPath string, args []string) {
 	_ = fs.Parse(args[1:])
 	s, _ := svcFor(cfgPath)
 	if args[0] == "verify" {
-		ok, n := s.Store.AuditVerify()
+		ok, n, why := s.Store.AuditVerifyDetail()
 		state := "OK"
 		if !ok {
-			state = "BROKEN"
+			state = "BROKEN: " + why
 		}
 		fmt.Printf("chain %s over %d entries\n", state, n)
 		if !ok {
@@ -352,8 +365,11 @@ func cmdServeRest(cfgPath string) {
 	if err != nil {
 		die("%v", err)
 	}
+	stop := make(chan struct{})
+	go s.Spend.Janitor(stop, 30*time.Second)
 	fmt.Printf("qtc-aws REST on http://%s/v1/ (loopback only)\n", cfg.Listen)
 	waitSignal()
+	close(stop)
 	_ = srv.Close()
 }
 
@@ -368,8 +384,14 @@ func cmdServeCosigner(cfgPath string) {
 	}
 	mainKR := config.NewKeyring(cfg.KeyringPath())
 	kr := config.NewKeyring(filepath.Join(csDir, "keyring.json"))
-	// the co-signer needs the decision secret and the admin secret (to verify policy signatures); nothing else is shared
-	for _, n := range []string{"decision_secret", "admin_secret"} {
+	// the co-signer needs the decision secret, the admin secret (to verify policy signatures) and the database
+	// password; nothing else is shared. It keys its own audit chain.
+	for _, n := range []string{"decision_secret", "admin_secret", "pg_password"} {
+		if n == "pg_password" {
+			if _, ok := mainKR.Get(n); !ok {
+				continue
+			}
+		}
 		if _, ok := kr.Get(n); !ok {
 			v, err := mainKR.Require(n)
 			if err != nil {
@@ -380,11 +402,17 @@ func cmdServeCosigner(cfgPath string) {
 			}
 		}
 	}
-	st, err := store.Open(cfg.PgDSN, "cosigner")
+	pgpw, _ := kr.Get("pg_password")
+	st, err := store.Open(cfg.PgDSN, "cosigner", pgpw)
 	if err != nil {
 		die("%v", err)
 	}
-	main, err := store.Open(cfg.PgDSN, "aws") // read-only use: wallet rows (receive address = change)
+	auditKey, err := kr.Ensure("audit_key", 32)
+	if err != nil {
+		die("%v", err)
+	}
+	st.SetAuditKey(auditKey)
+	main, err := store.Open(cfg.PgDSN, "aws", pgpw) // read-only use: wallet rows (receive address = change)
 	if err != nil {
 		die("%v", err)
 	}

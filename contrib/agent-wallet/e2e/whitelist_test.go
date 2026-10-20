@@ -117,6 +117,8 @@ func TestRPCWhitelist(t *testing.T) {
 		cfg.PgDSN, cfg.RPCURL, cfg.RPCUser, cfg.RPCPassword, cfg.CosignerURL, cfg.ConfirmationDepth = env.PG.DSN, node.URL, "aws", pw, "", 1
 		// separate schema so this service does not share rows with the main fixture
 		cfg.Extra = map[string]any{}
+		_ = os.MkdirAll(cfg.DataDir, 0o700)
+		_ = config.NewKeyring(cfg.KeyringPath()).Set("pg_password", env.PG.Password)
 		svc, err := newServiceWithSchema(cfg, "aws_wl")
 		if err != nil {
 			t.Fatal(err)

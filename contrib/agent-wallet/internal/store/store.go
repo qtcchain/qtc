@@ -4,10 +4,13 @@
 package store
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"hash"
 	"regexp"
 	"sort"
 	"strings"
@@ -48,9 +51,23 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 func now() float64 { return float64(time.Now().UnixNano()) / 1e9 }
 
 type Store struct {
-	db *sql.DB
-	mu sync.Mutex
+	db       *sql.DB
+	mu       sync.Mutex
+	auditKey []byte // HMAC key for the audit chain; a database-only attacker cannot recompute hashes without it
 }
+
+// SetAuditKey keys the audit hash chain (HMAC-SHA256). Must be set before the first Audit call of a process.
+func (s *Store) SetAuditKey(key string) { s.auditKey = []byte(key) }
+
+func (s *Store) hasher() hash.Hash {
+	if len(s.auditKey) > 0 {
+		return hmac.New(sha256.New, s.auditKey)
+	}
+	return sha256.New()
+}
+
+// ErrLimit is returned by AddSpendChecked when the daily limit would be exceeded.
+var ErrLimit = errors.New("daily limit")
 
 var qmark = regexp.MustCompile(`\?`)
 
@@ -62,7 +79,8 @@ func pg(q string) string {
 
 // Open connects to PostgreSQL (DSN: URL or key=value form) and uses the given schema, creating it and
 // the tables when missing. Example DSN: postgres://aws@127.0.0.1:5432/qtc_aws?sslmode=disable
-func Open(dsn, schema string) (*Store, error) {
+// password, when non-empty, overrides the DSN password so it can live in the keyring rather than the config.
+func Open(dsn, schema, password string) (*Store, error) {
 	if !regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`).MatchString(schema) {
 		return nil, fmt.Errorf("bad schema name %q", schema)
 	}
@@ -74,6 +92,9 @@ func Open(dsn, schema string) (*Store, error) {
 		cfg.RuntimeParams = map[string]string{}
 	}
 	cfg.RuntimeParams["search_path"] = schema
+	if password != "" {
+		cfg.Password = password
+	}
 	db := stdlib.OpenDB(*cfg)
 	db.SetMaxOpenConns(4)
 	// DDL under an advisory lock: the service and the co-signer start together and CREATE ... IF NOT EXISTS
@@ -349,6 +370,36 @@ func (s *Store) AddSpend(walletID, psbtSHA string, amount int64, dests []string,
 	return err
 }
 
+// AddSpendChecked inserts the spend only if the wallet's rolling 24 h totals stay within perDayAtoms and
+// perDayCount. Check and insert run in one transaction under a per-wallet advisory lock, so concurrent
+// requests (even from several processes) cannot all pass the daily limit. Returns ErrLimit on exceed.
+func (s *Store) AddSpendChecked(walletID, psbtSHA string, amount int64, dests []string, purpose, status string, perDayAtoms, perDayCount int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext($1))", "spend:"+walletID); err != nil {
+		return err
+	}
+	var sum, cnt int64
+	if err := tx.QueryRow(pg("SELECT COALESCE(SUM(amount_atoms),0), COUNT(*) FROM spends WHERE wallet_id=? AND created_at>=? "+
+		"AND status IN ('broadcast','confirmed','needs_approval','approved','signing')"), walletID, now()-86400).Scan(&sum, &cnt); err != nil {
+		return err
+	}
+	if sum+amount > perDayAtoms || cnt >= perDayCount {
+		return ErrLimit
+	}
+	t := now()
+	if _, err := tx.Exec(pg("INSERT INTO spends(wallet_id,psbt_sha256,txid,amount_atoms,fee_atoms,destinations,purpose,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)"),
+		walletID, psbtSHA, nil, amount, nil, jsonx.Canonical(dests), purpose, status, t, t); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) SetSpendStatus(psbtSHA, status string) error {
 	_, err := s.exec("UPDATE spends SET status=?, updated_at=? WHERE psbt_sha256=?", status, now(), psbtSHA)
 	return err
@@ -481,6 +532,19 @@ func (s *Store) PendingApprovals(walletID string) []*Approval {
 	return out
 }
 
+// AllOpenApprovals returns approvals not yet consumed (pending, expired, or approved-but-not-completed),
+// with decoded inputs, for lock recovery at startup.
+func (s *Store) AllOpenApprovals() []*Approval {
+	rows, _ := s.query("SELECT * FROM approvals WHERE consumed=0")
+	out := make([]*Approval, 0, len(rows))
+	for _, r := range rows {
+		a := rowApproval(r)
+		a.PSBT = ""
+		out = append(out, a)
+	}
+	return out
+}
+
 // ---- swaps (Phase 2 state machine)
 type Swap struct {
 	SwapID   string         `json:"swap_id"`
@@ -553,23 +617,50 @@ func nilIfEmpty(s string) any {
 	return s
 }
 
-// Audit appends an entry and returns its hash.
+func (s *Store) digest(body string) string {
+	h := s.hasher()
+	h.Write([]byte(body))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Audit appends an entry and returns its hash. Tip read, insert and the persisted tip (meta audit_tip /
+// audit_count) happen in one transaction under an advisory lock, so the chain is strictly linear under
+// concurrency and truncation is detectable.
 func (s *Store) Audit(kind string, payload map[string]any, walletID, actor string) string {
 	if payload == nil {
 		payload = map[string]any{}
 	}
 	payload = jsonx.Clone(payload).(map[string]any)
-	last, _ := s.query("SELECT hash FROM audit ORDER BY seq DESC LIMIT 1")
-	prev := zeroHash
-	if len(last) > 0 {
-		prev = str(last[0], "hash")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return ""
 	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("SELECT pg_advisory_xact_lock(7207456)"); err != nil {
+		return ""
+	}
+	prev := zeroHash
+	var count int64
+	_ = tx.QueryRow("SELECT hash FROM audit ORDER BY seq DESC LIMIT 1").Scan(&prev)
+	_ = tx.QueryRow("SELECT COUNT(*) FROM audit").Scan(&count)
 	at := now()
 	body := auditBody(at, kind, nilIfEmpty(walletID), nilIfEmpty(actor), payload, prev)
-	sum := sha256.Sum256([]byte(body))
-	h := hex.EncodeToString(sum[:])
-	_, _ = s.exec("INSERT INTO audit(at,kind,wallet_id,actor,payload,prev_hash,hash) VALUES(?,?,?,?,?,?,?)",
-		at, kind, nilIfEmpty(walletID), nilIfEmpty(actor), jsonx.Canonical(payload), prev, h)
+	h := s.digest(body)
+	if _, err := tx.Exec(pg("INSERT INTO audit(at,kind,wallet_id,actor,payload,prev_hash,hash) VALUES(?,?,?,?,?,?,?)"),
+		at, kind, nilIfEmpty(walletID), nilIfEmpty(actor), jsonx.Canonical(payload), prev, h); err != nil {
+		return ""
+	}
+	tip := s.digest(fmt.Sprintf("tip:%d:%s", count+1, h))
+	for k, v := range map[string]string{"audit_tip": h, "audit_count": fmt.Sprint(count + 1), "audit_tip_mac": tip} {
+		if _, err := tx.Exec(pg("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v"), k, v); err != nil {
+			return ""
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return ""
+	}
 	return h
 }
 
@@ -585,8 +676,15 @@ func (s *Store) AuditExport(sinceSeq, limit int64) []*AuditEntry {
 	return out
 }
 
-// AuditVerify walks the chain; returns ok and the number of verified entries.
+// AuditVerify walks the chain and checks it ends at the persisted, keyed tip; returns ok and the number
+// of verified entries. A rewritten row breaks the walk; a truncated tail or a forged tip breaks the tip check.
 func (s *Store) AuditVerify() (bool, int64) {
+	ok, n, _ := s.AuditVerifyDetail()
+	return ok, n
+}
+
+// AuditVerifyDetail is AuditVerify with the reason for a failure.
+func (s *Store) AuditVerifyDetail() (bool, int64, string) {
 	rows, _ := s.query("SELECT * FROM audit ORDER BY seq")
 	prev := zeroHash
 	var n int64
@@ -594,12 +692,30 @@ func (s *Store) AuditVerify() (bool, int64) {
 		var payload map[string]any
 		_ = jsonx.Decode([]byte(str(r, "payload")), &payload)
 		body := auditBody(f64(r, "at"), str(r, "kind"), r["wallet_id"], r["actor"], payload, prev)
-		sum := sha256.Sum256([]byte(body))
-		if str(r, "prev_hash") != prev || hex.EncodeToString(sum[:]) != str(r, "hash") {
-			return false, n
+		if str(r, "prev_hash") != prev {
+			return false, n, fmt.Sprintf("seq %d: prev_hash does not link to the previous entry", i64(r, "seq"))
+		}
+		if s.digest(body) != str(r, "hash") {
+			return false, n, fmt.Sprintf("seq %d: entry hash mismatch (rewritten row or wrong audit key)", i64(r, "seq"))
 		}
 		prev = str(r, "hash")
 		n++
 	}
-	return true, n
+	tip, hasTip := s.MetaGet("audit_tip")
+	cnt, _ := s.MetaGet("audit_count")
+	mac, _ := s.MetaGet("audit_tip_mac")
+	if n == 0 && !hasTip {
+		return true, 0, ""
+	}
+	switch {
+	case !hasTip:
+		return false, n, "no persisted tip"
+	case tip != prev:
+		return false, n, "persisted tip does not match the last entry (tail truncated or rewritten)"
+	case cnt != fmt.Sprint(n):
+		return false, n, fmt.Sprintf("persisted count %s does not match %d entries", cnt, n)
+	case mac != s.digest(fmt.Sprintf("tip:%d:%s", n, prev)):
+		return false, n, "persisted tip MAC invalid (forged tip or wrong audit key)"
+	}
+	return true, n, ""
 }

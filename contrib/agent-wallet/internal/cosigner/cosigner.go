@@ -239,6 +239,15 @@ func (s *Service) Sign(agentID, psbt string, env spend.Envelope) (string, error)
 	if total > jsonx.I(lim, "per_tx_atoms", 0) {
 		return "", denied("per_tx_limit (cosigner)")
 	}
+	// independent daily-limit check from the co-signer's own record of what it signed (atomic insert)
+	if err := s.Store.AddSpendChecked(walletID, h, total, envDests, "cosign", "broadcast",
+		jsonx.I(lim, "per_day_atoms", 0), jsonx.I(lim, "per_day_tx_count", 0)); err != nil {
+		if err == store.ErrLimit {
+			s.Store.Audit("cosigner.reject", map[string]any{"agent_id": agentID, "reason": "per_day_limit"}, walletID, "cosigner")
+			return "", denied("per_day_limit (cosigner)")
+		}
+		return "", err
+	}
 	if jsonx.S(dest, "mode") == "allowlist" {
 		allow := jsonx.Strs(dest, "allow")
 		for a := range ext {

@@ -48,7 +48,7 @@ cd contrib/agent-wallet
 
 The launcher creates `~/.qtc-aws-localhost/` with a private regtest node (RPC on `127.0.0.1:28790`,
 whitelisted `aws` rpcauth user generated locally, password kept in the 0600 keyring), a private PostgreSQL
-cluster on `127.0.0.1:28794`, the co-signer on `:8793`, the REST API on `:8792`, a funded Tier 1 wallet
+cluster on `127.0.0.1:28794` (scram-sha-256, password in the keyring), the co-signer on `:8793`, the REST API on `:8792`, a funded Tier 1 wallet
 `agent-demo-tier1`, a funded Tier 2 wallet `agent-demo2-tier2`, an agent token (`wallet:read,
 wallet:spend, market:read`) and an owner token.
 
@@ -66,8 +66,9 @@ Amounts are **integers in atoms** (1 QTC = 100,000,000 atoms); floats are reject
 
 ```bash
 go build -o /usr/local/bin/qtc-aws ./cmd/qtc-aws
-qtc-aws --config /etc/qtc-aws/aws.json init --data-dir /var/lib/qtc-aws --pg-dsn 'postgres://aws@127.0.0.1:5432/qtc_aws?sslmode=disable' \
-        --rpc-url http://127.0.0.1:8790 --chain main --rpc-user aws < /path/to/rpc-password   # password on stdin, never argv
+printf '%s\n%s\n' "$RPC_PASSWORD" "$PG_PASSWORD" | qtc-aws --config /etc/qtc-aws/aws.json init --data-dir /var/lib/qtc-aws \
+        --pg-dsn 'postgres://aws@127.0.0.1:5432/qtc_aws?sslmode=disable' --rpc-url http://127.0.0.1:8790 --chain main \
+        --rpc-user aws --pg-password-stdin   # both passwords on stdin (rpc first, then postgres), never argv
 # add the rpcauth line and rpcwhitelist.conf to qtc.conf, then run two services (systemd units):
 qtc-aws --config /etc/qtc-aws/aws.json serve-cosigner
 qtc-aws --config /etc/qtc-aws/aws.json serve-rest
@@ -124,7 +125,20 @@ count → fee rate → confirmations → trade checks → approval threshold. Re
 - **Audit log**: append-only rows with a SHA-256 hash chain (`audit verify`), in PostgreSQL.
 - **Health gate**: no broadcast while the node is in IBD or has no peers (regtest exempt from peers).
 - **Database**: the service and the co-signer share one PostgreSQL database but separate schemas; the
-  co-signer reads wallet rows from the service schema only to learn the change address.
+  co-signer reads wallet rows from the service schema only to learn the change address. Connections use
+  scram-sha-256 with the password held in the keyring (`pg_password`), never in the config or argv.
+- **Concurrency**: spends are serialised per wallet in-process, and the daily limit is re-checked inside the
+  database transaction that records the spend (per-wallet advisory lock), so parallel requests cannot exceed
+  `per_day_atoms` / `per_day_tx_count`. The Tier 2 co-signer keeps its own record of what it signed and
+  re-checks the daily limit independently.
+- **Audit chain**: appends are atomic (advisory lock) and keyed with HMAC-SHA256 (`audit_key` in the keyring),
+  and the tip and count are persisted with a keyed MAC, so a database-only attacker cannot rewrite, fork or
+  truncate history undetected. `audit verify` checks the walk and the tip.
+- **Policy changes take effect live**: the engine re-reads a policy file when its mtime or size changes, so
+  `qtc-aws policy set` from the owner CLI applies to running daemons without a restart.
+- **Lock recovery**: inputs reserved for pending approvals are tracked in the database; on startup the service
+  rebuilds its lock map and releases the inputs of approvals that expired while it was down, and a janitor
+  releases expired approvals every 30 s.
 
 ### Tier 2 and the owner recovery leaf
 
@@ -156,7 +170,9 @@ QTC_BIN=/path/to/build/bin go test ./e2e/ -v   # point at another node build
 ```
 
 `e2e/phase1_test.go` lifecycle, limits across restarts, approval flow and time windows, prompt-injection
-and kill switch, post-sign mutation alert, self-freeze and scopes. `e2e/tier2_test.go` co-signed spend,
+and kill switch, post-sign mutation alert, self-freeze and scopes. `e2e/hardening_test.go` regression tests
+from the 19 Oct 2026 security assessment: daily limit under 20 concurrent sends with a linear audit chain,
+policy change from another process taking effect, locked inputs recovered after a restart. `e2e/tier2_test.go` co-signed spend,
 envelope and policy rejection by the co-signer, backups of both key wallets. `e2e/whitelist_test.go` the
 whitelisted user is denied private-material RPCs, the whitelist covers every RPC the service calls, and
 the Tier 1 lifecycle completes under it. `internal/store` and `internal/policy` carry unit tests.
