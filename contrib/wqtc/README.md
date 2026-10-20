@@ -63,8 +63,12 @@ identical 20-byte value for the QTC descriptor.
 ## QTC-side recipe (Model B)
 1. **Lock address (descriptor):**
    ```
-   mr(<internal_pk>, { htlc(<H160>, <claimer_pk>), refund(<locktime>, <sender_pk>) })
+   mr(<unspendable_pk>, { htlc(<H160>, <claimer_pk>), refund(<locktime>, <sender_pk>) })
    ```
+   - `<unspendable_pk>` = the tree's **primary leaf**. QTC's `mr()` has no key path; its first
+     argument is a spendable single-signature leaf, so it must be a provably unspendable ML-DSA key
+     (never the funder's or claimer's key, or that party could spend the lock alone). The SDK's
+     `HtlcLeg` rejects a primary leaf equal to either party's key.
    - `<H160>` = `RIPEMD160(SHA256(preimage))` (hex, 20 bytes).
    - `<claimer_pk>` = the claimer's ML-DSA/SLH-DSA pubkey (the CSFS "oracle" key — here, the recipient
      themselves, so the claim needs *both* the preimage and the recipient's signature).
