@@ -43,6 +43,13 @@ of that release. `MIN_PEER_PROTO_VERSION` was left at 800002; the height rule li
 `src/node/protocol_version.h` (`V024_PROTOCOL_FLOOR_HEIGHT`) and `net_processing.cpp`. Impact measured
 before the decision: all 25 distinct public peers seen by relay C ran v0.2.0 to v0.2.2.
 
+**Recorded exception (v0.2.5, 13 October 2026):** by owner decision the v0.2.5 release carries a second
+height-triggered floor: protocol 800004, enforced from mainnet height 4000 (about 13 days after the tag at
+the October 2026 block spacing; tip 2075 on 13 October) against every peer below it, so that all nodes run
+the wallet and testnet-parameter fixes of that release. The floors stack (`V025_PROTOCOL_FLOOR_HEIGHT`,
+`MIN_V025_PROTOCOL_VERSION` in `src/node/protocol_version.h`; `RequiredPeerProtocolVersionAt` in
+`net_processing.cpp`): at a given height the highest floor already reached applies.
+
 The floor retires *protocols*, not people: anyone can run the current software and keep mining. It is not used to
 exclude participants, and it cannot distinguish releases that share a protocol version.
 

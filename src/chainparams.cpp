@@ -389,6 +389,10 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
             ParseRegTestNonNegativeInt32Arg(args, "-regtestmatmultimewarpreconcileheight");
     }
 
+    if (args.IsArgSet("-opreturnraiseheight")) {
+        options.opreturn_raise_height = ParseRegTestNonNegativeInt32Arg(args, "-opreturnraiseheight");
+    }
+
     for (const std::string& arg : args.GetArgs("-testactivationheight")) {
         const auto found{arg.find('@')};
         if (found == std::string::npos) {

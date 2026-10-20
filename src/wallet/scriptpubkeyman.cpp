@@ -2851,7 +2851,7 @@ bool DescriptorScriptPubKeyMan::AddDescriptorKeyWithDB(WalletBatch& batch, const
     }
 }
 
-bool DescriptorScriptPubKeyMan::SetupDescriptorGeneration(WalletBatch& batch, const CExtKey& master_key, OutputType addr_type, bool internal)
+bool DescriptorScriptPubKeyMan::SetupDescriptorGeneration(WalletBatch& batch, const CExtKey& master_key, OutputType addr_type, bool internal, int64_t creation_time)
 {
     LOCK(cs_desc_man);
     assert(m_storage.IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
@@ -2862,6 +2862,7 @@ bool DescriptorScriptPubKeyMan::SetupDescriptorGeneration(WalletBatch& batch, co
     }
 
     m_wallet_descriptor = GenerateWalletDescriptor(master_key.Neuter(), addr_type, internal);
+    if (creation_time > 0) m_wallet_descriptor.creation_time = creation_time;
 
     // Store the master private key, and descriptor
     if (!AddDescriptorKeyWithDB(batch, master_key.key, master_key.key.GetPubKey())) {
@@ -2878,7 +2879,7 @@ bool DescriptorScriptPubKeyMan::SetupDescriptorGeneration(WalletBatch& batch, co
     return true;
 }
 
-bool DescriptorScriptPubKeyMan::SetupPQDescriptorGeneration(WalletBatch& batch, Span<const unsigned char> pq_seed, bool internal)
+bool DescriptorScriptPubKeyMan::SetupPQDescriptorGeneration(WalletBatch& batch, Span<const unsigned char> pq_seed, bool internal, int64_t creation_time)
 {
     LOCK(cs_desc_man);
     assert(m_storage.IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
@@ -2889,6 +2890,7 @@ bool DescriptorScriptPubKeyMan::SetupPQDescriptorGeneration(WalletBatch& batch, 
     }
 
     m_wallet_descriptor = GeneratePQWalletDescriptor(pq_seed, internal);
+    if (creation_time > 0) m_wallet_descriptor.creation_time = creation_time;
 
     // Store PQ seed for this descriptor (no ECDSA key needed); encrypted wallets store it
     // authenticated-encrypted under the master key and never in plaintext.

@@ -2088,7 +2088,14 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
 
         // No need to scan block if it was created before the wallet birthday.
         // Uses chain max time and twice the grace period to adjust time for block time variability.
-        if (block.chain_time_max >= m_birth_time.load() - (TIMESTAMP_WINDOW * 2)) {
+        // A block whose chain time trails the wall clock by more than TIMESTAMP_WINDOW is scanned
+        // regardless: after a stall, templates are clamped to MTP+12h, so a live chain can trail real
+        // time by days, and a wall-clock birth time (an imported key's timestamp, or a wallet created
+        // elsewhere) would otherwise skip every block it connects until a manual rescan (#31). This
+        // also scans blocks replayed during initial block download; that work is small next to
+        // validating them.
+        const bool chain_trails_clock = int64_t{block.chain_time_max} < GetTime() - TIMESTAMP_WINDOW;
+        if (chain_trails_clock || block.chain_time_max >= m_birth_time.load() - (TIMESTAMP_WINDOW * 2)) {
             // Scan block
             for (size_t index = 0; index < block.data->vtx.size(); index++) {
                 SyncTransaction(block.data->vtx[index], TxStateConfirmed{block.hash, block.height, static_cast<int>(index)});
@@ -2690,6 +2697,15 @@ void CWallet::MaybeUpdateBirthTime(int64_t time)
     if (time < birthtime) {
         m_birth_time = time;
     }
+}
+
+int64_t CWallet::ChainClampedTime() const
+{
+    const int64_t now = GetTime();
+    if (!HaveChain()) return now;
+    const std::optional<int64_t> tip_time_max = chain().getTipMaxTime();
+    if (!tip_time_max || *tip_time_max <= 0) return now;
+    return std::min(now, *tip_time_max);
 }
 
 /**
@@ -5438,7 +5454,7 @@ DescriptorScriptPubKeyMan& CWallet::SetupDescriptorScriptPubKeyMan(WalletBatch& 
             throw std::runtime_error(std::string(__func__) + ": Could not encrypt new descriptors");
         }
     }
-    spk_manager->SetupDescriptorGeneration(batch, master_key, output_type, internal);
+    spk_manager->SetupDescriptorGeneration(batch, master_key, output_type, internal, ChainClampedTime());
     DescriptorScriptPubKeyMan* out = spk_manager.get();
     uint256 id = spk_manager->GetID();
     AddScriptPubKeyMan(id, std::move(spk_manager));
@@ -5484,7 +5500,7 @@ DescriptorScriptPubKeyMan& CWallet::SetupPQDescriptorScriptPubKeyMan(WalletBatch
             throw std::runtime_error(std::string(__func__) + ": Could not encrypt new descriptors");
         }
     }
-    spk_manager->SetupPQDescriptorGeneration(batch, pq_seed, internal);
+    spk_manager->SetupPQDescriptorGeneration(batch, pq_seed, internal, ChainClampedTime());
     DescriptorScriptPubKeyMan* out = spk_manager.get();
     uint256 id = spk_manager->GetID();
     AddScriptPubKeyMan(id, std::move(spk_manager));

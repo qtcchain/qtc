@@ -840,7 +840,11 @@ BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_matmul_activation)
     BOOST_CHECK(consensus.enforce_BIP94);
     BOOST_CHECK_EQUAL(consensus.nKAWPOWHeight, std::numeric_limits<int>::max());
     BOOST_CHECK(consensus.fReducedDataLimits);
-    BOOST_CHECK_EQUAL(consensus.nMaxOpReturnBytes, 83U);
+    BOOST_CHECK_EQUAL(consensus.nMaxOpReturnBytes, 1'004U);       // mainnet's cap, in force from height 2290
+    BOOST_CHECK_EQUAL(consensus.nMaxOpReturnBytesLegacy, 83U);
+    BOOST_CHECK_EQUAL(consensus.nOpReturnRaiseHeight, 2290);
+    BOOST_CHECK_EQUAL(consensus.MaxOpReturnBytesAt(2289), 83U);
+    BOOST_CHECK_EQUAL(consensus.MaxOpReturnBytesAt(2290), 1'004U);
     BOOST_CHECK_EQUAL(consensus.nMaxTxoutScriptPubKeyBytes, 34U);
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacing, 600);
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacingFastMs, 250);
@@ -2361,17 +2365,17 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_hardening_anchor_consistency)
     const auto consensus = params->GetConsensus();
 
     // Mainnet v2 (Oct 2026). v0.2.1 (security review H3) added the first v2 anchor (checkpoint 300);
-    // v0.2.3 re-pinned it at height 1823 (kept as a checkpoint) and v0.2.4 at height 1895, read from fleet
-    // node C on 2026-10-12: minimum chain work = work at that block, assume-valid = that block, chain-tx
-    // statistics from getchaintxstats over the 1896 blocks below tip 1897. No assumeutxo snapshots.
-    BOOST_CHECK_EQUAL(consensus.nMinimumChainWork.GetHex(), "00000000000000000000000000000000000000000000000000000019e0623e2c");
-    BOOST_CHECK_EQUAL(consensus.defaultAssumeValid.GetHex(), "bbc9f64eee6ff9f9c69114e892f2e00a7859d3bcb1ea49b7f34c669053792227");
-    BOOST_CHECK_EQUAL(params->TxData().nTime, 1791794985);
-    BOOST_CHECK_EQUAL(params->TxData().tx_count, 1898);
-    BOOST_CHECK_CLOSE(params->TxData().dTxRate, 0.003090222769856637, 1e-9);
+    // v0.2.3 re-pinned it at height 1823, v0.2.4 at 1895 (both kept as checkpoints) and v0.2.5 at height 2102,
+    // read from fleet node C on 2026-10-13: minimum chain work = work at that block, assume-valid = that
+    // block, chain-tx statistics from getchaintxstats over the 2103 blocks below tip 2104. No assumeutxo snapshots.
+    BOOST_CHECK_EQUAL(consensus.nMinimumChainWork.GetHex(), "000000000000000000000000000000000000000000000000000000201a1324e7");
+    BOOST_CHECK_EQUAL(consensus.defaultAssumeValid.GetHex(), "8644a35d137fd993670d6c1dc1205cfed15155182d13b0b20f7b50e849a26b6a");
+    BOOST_CHECK_EQUAL(params->TxData().nTime, 1791895083);
+    BOOST_CHECK_EQUAL(params->TxData().tx_count, 2105);
+    BOOST_CHECK_CLOSE(params->TxData().dTxRate, 0.002952461577987525, 1e-9);
 
     const auto& checkpoints = params->Checkpoints().mapCheckpoints;
-    BOOST_REQUIRE_EQUAL(checkpoints.size(), 4U);
+    BOOST_REQUIRE_EQUAL(checkpoints.size(), 5U);
     const auto it_0 = checkpoints.find(0);
     BOOST_REQUIRE(it_0 != checkpoints.end());
     const auto it_300 = checkpoints.find(300);
@@ -2382,10 +2386,13 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_hardening_anchor_consistency)
     BOOST_CHECK_EQUAL(it_1823->second.GetHex(), "cfc093e05f14041b85c57e3648c4659b03a9971be78f12f50cc1cff1e0314d20");
     const auto it_1895 = checkpoints.find(1895);
     BOOST_REQUIRE(it_1895 != checkpoints.end());
-    BOOST_CHECK_EQUAL(it_1895->second.GetHex(), consensus.defaultAssumeValid.GetHex());
-    // The minimum chain work must stay reachable: strictly below the v2 chain's work at height 1897
-    // (0x19ef068a48 on 2026-10-12, node C).
-    BOOST_CHECK(UintToArith256(consensus.nMinimumChainWork) < UintToArith256(uint256{"00000000000000000000000000000000000000000000000000000019ef068a48"}));
+    BOOST_CHECK_EQUAL(it_1895->second.GetHex(), "bbc9f64eee6ff9f9c69114e892f2e00a7859d3bcb1ea49b7f34c669053792227");
+    const auto it_2102 = checkpoints.find(2102);
+    BOOST_REQUIRE(it_2102 != checkpoints.end());
+    BOOST_CHECK_EQUAL(it_2102->second.GetHex(), consensus.defaultAssumeValid.GetHex());
+    // The minimum chain work must stay reachable: strictly below the v2 chain's work at height 2104
+    // (0x202a373057 on 2026-10-13, node C).
+    BOOST_CHECK(UintToArith256(consensus.nMinimumChainWork) < UintToArith256(uint256{"000000000000000000000000000000000000000000000000000000202a373057"}));
     BOOST_CHECK_EQUAL(it_0->second.GetHex(), consensus.hashGenesisBlock.GetHex());
     BOOST_CHECK_EQUAL(
         it_0->second.GetHex(),

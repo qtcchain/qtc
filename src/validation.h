@@ -534,7 +534,8 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
  *  witness v2 P2MR or pay-to-anchor and within nMaxTxoutScriptPubKeyBytes; OP_RETURN outputs within nMaxOpReturnBytes.
  *  The block assembler applies this same function when selecting transactions, so the two can no longer disagree
  *  (the anchor-output bug found on the testnet burn-in, 2026-09-26, came from a drifted copy). */
-bool CheckReducedDataOutputLimits(const CTransaction& tx, BlockValidationState& state, const Consensus::Params& consensus_params);
+bool CheckReducedDataOutputLimits(const CTransaction& tx, BlockValidationState& state, const Consensus::Params& consensus_params,
+                                  std::optional<int> height = std::nullopt);
 
 /** Check a block is completely valid from start to finish (only works on top of our current best block) */
 bool TestBlockValidity(BlockValidationState& state,
