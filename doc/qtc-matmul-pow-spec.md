@@ -58,10 +58,11 @@ or equivalent to reject compilation on big-endian targets.
 | **Noise rank** | r = 8 | Controls security/denoise overhead; independent of b |
 | **Trust model** | Four-tier: mining / consensus-validating / economic / light (SPV) | Explicit node tiers with defined Phase 2 validation scope (§3.6, §12.1) |
 | **Verification DoS** | Two-phase validation with per-peer rate limits | Cheap header checks gate expensive transcript recomputation |
-| **Block time** | 90 s steady-state; 0.25 s fast-mining phase (h < 50,000) | Fast bootstrap (~3.5 h) then long intervals for propagation/verification headroom |
-| **Halving interval** | 525,000 blocks | Bitcoin-style infinite geometric series: 20 × 525k × 2 = 21M cap |
-| **Initial subsidy** | 20 QTC | Yields exactly 21,000,000 QTC total supply with 525k halving |
-| **Supply cap** | 21,000,000 QTC | Hard cap enforced by `MoneyRange()` and subsidy function (§11.4) |
+| **Block time** | 600 s (10 minutes) from genesis; no fast-mining phase (`nFastMineHeight = 0`) | Bitcoin's interval gives propagation/verification headroom for O(n³) Phase 2; ASERT governs from block 0 (§11.1) |
+| **Halving interval** | 210,000 blocks | Bitcoin's schedule verbatim: 50 × 210k × 2 = 21M mined |
+| **Initial subsidy** | 50 QTC | Yields 21,000,000 QTC of mined supply with the 210k halving |
+| **Treasury allocation** | 2,000,000 QTC minted once in block 1 (mainnet v2) | `nTreasuryPremineHeight = 1`, `nTreasuryPremineAmount = 2,000,000 * COIN`; total supply 23,000,000 QTC (§11.4.4) |
+| **Supply cap** | `nMaxMoney = 21,000,000 QTC` per amount; 23,000,000 QTC total issuance | `MoneyRange()` bounds every single amount; total issuance = mined 21M + treasury 2M (§11.4) |
 | **Block capacity** | SegWit-style weight limit (24M WU consensus and policy default) | Scales throughput via weight accounting; penalizes UTXO-heavy bytes; compatible with modern tx formats (§14) |
 
 ### 1.2 What Changed in v2
@@ -87,6 +88,13 @@ This revision addresses critical review feedback:
     reducing SHA-256 overhead from 30-100% to under 1% (Section 8.3.1)
 
 ### 1.3 What Changed in v3
+
+> **Historical note (2026-10-12)**: the monetary and schedule values quoted in
+> items 16–20, 27 and 28 below (20 QTC, 525,000-block halving, 90 s blocks,
+> 0.25 s fast-mining phase, 3600 s half-life) describe the pre-launch design
+> as it stood when v3 was written. The shipped chain uses Bitcoin's schedule
+> with no fast-mining phase. §1.3.1 lists the reconciliation; §5.2.2, §5.3,
+> §11.4 and §11.5 are normative.
 
 This revision addresses remaining consensus/security gaps identified in v2 review:
 
@@ -186,13 +194,36 @@ This revision addresses remaining consensus/security gaps identified in v2 revie
 30. **Block capacity auditor invariants (§17.5.8, §17.5.9)**: Weight, sigops,
     size, and fast-phase scheduling invariant tables added.
 
+#### 1.3.1 Shipped Parameter Reconciliation (2026-10-12)
+
+The monetary and schedule sections of this document were reconciled against
+the shipped consensus parameters (`src/consensus/params.h`,
+`src/kernel/chainparams.cpp`, release notes 0.2.0). No code changed; the
+document now states what ships.
+
+| Parameter | Pre-launch design (v3 text) | Shipped (mainnet / testnet / signet) | Shipped (regtest) |
+|-----------|-----------------------------|--------------------------------------|-------------------|
+| `nInitialSubsidy` | 20 QTC | **50 QTC** | 50 QTC |
+| `nSubsidyHalvingInterval` | 525,000 | **210,000** | 150 |
+| `nMaxMoney` | 21,000,000 QTC | 21,000,000 QTC (per-amount bound) | 21,000,000 QTC |
+| Treasury allocation | none | **2,000,000 QTC at height 1 (mainnet only)** | none unless `-regtesttreasurypremine*` |
+| Total issuance | 21,000,000 QTC | **23,000,000 QTC** (21M mined + 2M treasury) | 21,000,000 QTC mined |
+| `nPowTargetSpacing` / `nPowTargetSpacingNormal` | 90 s | **600 s** | 90 s |
+| `nFastMineHeight` | 50,000 | **0** (no fast-mining phase) | 0 |
+| `nPowTargetSpacingFastMs`, `nFastMineDifficultyScale` | 250 ms, 4–6 | 250 ms, 6 (inert) | 250 ms, 4 (inert) |
+| `nMatMulAsertHeight` | 50,000 | **0** (ASERT from genesis) | 0 |
+| `nMatMulAsertHalfLife` | 3,600 s | **172,800 s** (2 days ≈ 288 blocks) | 14,400 s |
+| `nMatMulAsertBootstrapFactor` | 40 | 1 (inert with a genesis anchor) | 1 |
+| `nMatMulMaxFutureMtpDrift` | — | 43,200 s (half-life / 4) | — |
+| Genesis `nBits` | calibrated, ≠ powLimit | **`compact(powLimit)` = `0x1e011da5`** (powLimit is the hard floor) | `compact(powLimit)` |
+
 ### 1.4 Existing Architecture Context
 
 QTC is a Bitcoin Knots-derived blockchain node with:
 
 - **Current PoW**: MatMul (AI-native Proof-of-Work; replaces former KAWPOW)
-- **Difficulty**: ASERT — stateless exponential retargeting with 3600s half-life (from block 50,000)
-- **Block time**: 90 seconds steady-state (`nPowTargetSpacingNormal`); 0.25 second fast-mining phase for h < 50,000 (`nPowTargetSpacingFastMs`, 250ms). See §5.1, §11.5.
+- **Difficulty**: ASERT — stateless exponential retargeting with a 172,800 s (2-day) half-life, anchored at genesis (`nMatMulAsertHeight = 0`)
+- **Block time**: 600 seconds (`nPowTargetSpacing = nPowTargetSpacingNormal = 600`) from block 0. The fast-mining mechanism (`nPowTargetSpacingFastMs`, `nFastMineHeight`) is retained in `Consensus::Params` but disabled on every shipped network (`nFastMineHeight = 0`). See §5.1, §11.5.
 - **Block header**: MatMul header includes `nNonce64` (64-bit), `matmul_digest`
   (256-bit), `matmul_dim` (16-bit), `seed_a` (256-bit), `seed_b` (256-bit).
   See §6 for full definition. (Replaces KAWPOW's `mix_hash` field.)
@@ -501,7 +532,7 @@ deep* its validation window extends.
 
 | Tier | Phase 2 scope | Trust assumption | Typical operator |
 |------|--------------|------------------|-----------------|
-| **Consensus-validating node** (Tier 1, "full") | ALL blocks at chain tip; full recompute from genesis (or from last assumevalid during IBD, then all new blocks forever). `nMatMulValidationWindow` (default: 1000, ~41.7 hours at 90s) bounds the minimum tip window for operational use. | Trustless for validated range | Miners, exchanges, protocol developers |
+| **Consensus-validating node** (Tier 1, "full") | ALL blocks at chain tip; full recompute from genesis (or from last assumevalid during IBD, then all new blocks forever). `nMatMulValidationWindow` (default: 1000, ~6.9 days at 600 s) bounds the minimum tip window for operational use. | Trustless for validated range | Miners, exchanges, protocol developers |
 | **Economic node** (Tier 2, **not** "full") | None — Phase 1 only (digest < target + dimension bounds) for PoW; full UTXO/script validation for all transactions. Relies on assumevalid and full-node majority for transcript correctness. | Trusts full-node majority for transcript correctness | Merchants, wallets, infrastructure |
 | **Light / SPV node** (Tier 3) | None — Phase 1 header check only (digest < target + dimension bounds). No UTXO validation. | Trusts full-node majority for transcript correctness | Mobile wallets, read-only explorers |
 
@@ -515,19 +546,19 @@ normal economic participation.
 #### 3.5.2 Practical Feasibility of Continuous Phase 2 Validation
 
 At n=512 on a modern CPU (single-threaded), one Phase 2 verification takes
-approximately 0.5--2 seconds. At a 90-second steady-state block time, this
-is **0.3--1.3% CPU utilization** for continuous tip validation. During the
-fast-mining phase (0.25s blocks), utilization is 200--800% — a single CPU core
-cannot keep up. Fast-phase tip validation requires either GPU acceleration
-or deferred batch verification. This is acceptable because the fast phase
-lasts only ~3.5 hours and all blocks remain Phase 1-validated immediately.
+approximately 0.5--2 seconds. At the 600-second block time, this is
+**0.08--0.33% CPU utilization** for continuous tip validation. No shipped
+network has a fast-mining phase (`nFastMineHeight = 0`); the 0.25 s column
+below is retained only to document the cost a network would face if it enabled
+one, in which case a single CPU core could not keep up and tip validation would
+require GPU acceleration or deferred batch verification (§10.3.1).
 
-| Hardware | Est. Phase 2 time (n=512) | CPU util at 90s blocks | CPU util at 0.25s blocks (fast phase) |
-|----------|--------------------------|------------------------|---------------------------------------|
-| Modern x86 (e.g., Zen 4) single-threaded | ~0.5s | ~0.3% | ~200% |
-| Modern ARM (e.g., Apple M2) single-threaded | ~0.7s | ~0.5% | ~280% |
-| Older x86 (e.g., Haswell-era) single-threaded | ~1.5--2.0s | ~1.0--1.3% | ~600--800% (cannot keep up) |
-| Any CPU with GPU offload | < 0.1s | < 0.2% | < 40% |
+| Hardware | Est. Phase 2 time (n=512) | CPU util at 600s blocks | CPU util at 0.25s blocks (fast phase, not shipped) |
+|----------|--------------------------|-------------------------|---------------------------------------------------|
+| Modern x86 (e.g., Zen 4) single-threaded | ~0.5s | ~0.08% | ~200% |
+| Modern ARM (e.g., Apple M2) single-threaded | ~0.7s | ~0.12% | ~280% |
+| Older x86 (e.g., Haswell-era) single-threaded | ~1.5--2.0s | ~0.25--0.33% | ~600--800% (cannot keep up) |
+| Any CPU with GPU offload | < 0.1s | < 0.02% | < 40% |
 
 Even the worst-case consumer hardware scenario (older CPU, no GPU) stays well
 under 5% CPU utilization. The consensus-validating (Tier 1) node tier is therefore viable on
@@ -608,7 +639,7 @@ scripts/
 |------|--------|
 | `src/consensus/params.h` | Add matmul params (b, r, n, q, activation) |
 | `src/primitives/block.h` | Replace KAWPOW fields with matmul fields |
-| `src/pow.h` / `pow.cpp` | `CheckMatMulProofOfWork()`, `SolveMatMul()`, DGW for matmul |
+| `src/pow.h` / `pow.cpp` | `CheckMatMulProofOfWork()`, `SolveMatMul()`, ASERT for matmul (DGW is KAWPOW-era legacy only) |
 | `src/validation.cpp` | Matmul validation (no KAWPOW branch) |
 | `src/rpc/mining.cpp` | Matmul block template + solve |
 | `src/node/miner.h/.cpp` | Block template matmul fields |
@@ -639,8 +670,8 @@ uint32_t nMatMulFieldModulus{0x7FFFFFFFU}; // q = 2^31 − 1 (M31 Mersenne prime
 
 // Node tier validation window (§3.6, §12.1)
 uint32_t nMatMulValidationWindow{1000};        // Blocks of Phase 2 validation for Tier 1 (consensus-validating) nodes
-                                               // Default 1000 = ~41.7 hours at 90s steady-state
-                                               // (during fast phase: 1000 blocks = ~4.2 minutes)
+                                               // Default 1000 = ~6.9 days (166.7 hours) at 600 s blocks
+                                               // (regtest: 10 blocks = 15 minutes at 90 s)
                                                // Consensus-validating nodes ignore this (validate all)
                                                // Light/SPV nodes skip Phase 2 entirely
 
@@ -649,12 +680,12 @@ uint32_t nMatMulMaxPendingVerifications{4};  // Max concurrent expensive verific
 uint32_t nMatMulPeerVerifyBudgetPerMin{8};   // Max expensive verifications per peer per minute
                                               //
                                               // Rationale for default value (8):
-                                              //   Steady state (90s blocks): ~0.4 blocks/min arrival rate;
-                                              //     budget of 8 provides 20x headroom for burst absorption
+                                              //   Steady state (600 s blocks): ~0.1 blocks/min arrival rate;
+                                              //     budget of 8 provides 80x headroom for burst absorption
                                               //     (Poisson clustering, small reorgs, reconnection catch-up).
-                                              //   Fast phase (0.25s blocks): ~240 blocks/min; budget of 8 naturally
-                                              //     enforces Phase 2 deferral (§10.3.1) at the rate-limit layer
-                                              //     without special-case scheduling code.
+                                              //   If a network enabled a fast phase (0.25s blocks, ~240 blocks/min;
+                                              //     no shipped network does), the budget of 8 would naturally
+                                              //     enforce Phase 2 deferral (§10.3.1) at the rate-limit layer.
                                               //   Attack bound: worst case 8 × 2.0s = 16s CPU/min per attacker
                                               //     peer (~27% single-core on older hardware); bounded further
                                               //     by nMatMulMaxPendingVerifications=4 concurrency cap and
@@ -671,18 +702,29 @@ bool fMatMulStrictPunishment{false};          // Network maturity flag (section 
                                               // Always overridden to false on testnet/regtest
 
 // --- Monetary policy (§11.4) ---
-CAmount nMaxMoney{21'000'000 * COIN};         // Hard supply cap; MoneyRange() enforced everywhere
-int32_t nSubsidyHalvingInterval{525'000};     // Blocks between halvings
-CAmount nInitialSubsidy{20 * COIN};           // Genesis block reward; 20 * 525000 * 2 = 21M
+CAmount nMaxMoney{21'000'000 * COIN};         // Per-amount bound (== MAX_MONEY); MoneyRange() enforced everywhere
+int32_t nSubsidyHalvingInterval{210'000};     // Blocks between halvings (Bitcoin's schedule); 150 on regtest
+CAmount nInitialSubsidy{50 * COIN};           // Genesis block reward; 50 * 210000 * 2 = 21M mined
                                               // Bitcoin-style infinite halving: sum = nInitialSubsidy * nSubsidyHalvingInterval * 2
+int32_t nTreasuryPremineHeight{INT32_MAX};    // Mainnet v2: 1. INT32_MAX disables the rule (testnet, signet, regtest default)
+CAmount nTreasuryPremineAmount{0};            // Mainnet v2: 2'000'000 * COIN, minted once on top of the block-1 subsidy
+CScript treasuryPremineScript{};              // Mainnet v2: P2MR script of the ceremony treasury address (§11.4.4)
 
 // --- Target spacing schedule (§11.5) ---
-int64_t nPowTargetSpacingNormal{90};          // Steady-state: 90 seconds between blocks
-int64_t nPowTargetSpacingFastMs{250};         // Fast-mining phase: 250 milliseconds (0.25s) between blocks
-int32_t nFastMineHeight{50'000};              // First height at which normal spacing applies
-                                              // Heights [0, nFastMineHeight) use nPowTargetSpacingFastMs
+int64_t nPowTargetSpacing{600};               // 600 seconds between blocks (Bitcoin); 90 on regtest
+int64_t nPowTargetSpacingNormal{600};         // Steady-state spacing used by GetTargetSpacing(); 90 on regtest
+int64_t nPowTargetSpacingFastMs{250};         // Fast-mining phase spacing (250 ms). INERT: nFastMineHeight == 0 everywhere
+int32_t nFastMineHeight{0};                   // First height at which normal spacing applies. 0 on every shipped
+                                              // network, so no height uses nPowTargetSpacingFastMs.
+                                              // Heights [0, nFastMineHeight) would use nPowTargetSpacingFastMs
                                               // Heights >= nFastMineHeight use nPowTargetSpacingNormal
-int32_t nFastMineDifficultyScale{4};          // Scales bootstrap difficulty by 4x for 0.25s target
+int32_t nFastMineDifficultyScale{6};          // Bootstrap difficulty scale for a fast phase. INERT (4 on regtest)
+
+// --- ASERT difficulty (§11.1, §11.6) ---
+int32_t nMatMulAsertHeight{0};                // ASERT anchor height; MUST equal nFastMineHeight (0 = from genesis)
+int64_t nMatMulAsertHalfLife{172'800};        // 2 days = 288 blocks at 600 s (Bitcoin Cash tuning); 14'400 on regtest
+uint32_t nMatMulAsertBootstrapFactor{1};      // One-time ease at nMatMulAsertHeight; inert with a genesis anchor
+int64_t nMatMulMaxFutureMtpDrift{43'200};     // Timestamp-shock bound = half-life / 4 (mainnet, testnet, signet)
 ```
 
 **Consensus helper** (must be identical in all implementations):
@@ -741,15 +783,28 @@ uint32_t nDefaultMempoolMaxSizeMB{2048};       // Default mempool size (MB)
 
 #### 5.2.2 Monetary Policy and Target Spacing
 
-| Network | Fast height | Fast spacing | Normal spacing | Halving interval | Initial subsidy | Max supply |
-|---------|-------------|-------------|---------------|-----------------|----------------|-----------|
-| mainnet | 50,000 | 0.25 s (250ms) | 90 s | 525,000 | 20 QTC | 21,000,000 QTC |
-| testnet | 50,000 | 0.25 s (250ms) | 90 s | 525,000 | 20 QTC | 21,000,000 QTC |
-| regtest | 0 | 90 s | 90 s | 150 | 20 QTC | 21,000,000 QTC |
+| Network | Fast height | Fast spacing | Normal spacing | Halving interval | Initial subsidy | Treasury allocation | Mined supply | Total supply |
+|---------|-------------|-------------|---------------|-----------------|----------------|--------------------|--------------|--------------|
+| mainnet | 0 (none) | 250 ms (inert) | 600 s | 210,000 | 50 QTC | 2,000,000 QTC at height 1 | 21,000,000 QTC | 23,000,000 QTC |
+| testnet | 0 (none) | 250 ms (inert) | 600 s | 210,000 | 50 QTC | none | 21,000,000 QTC | 21,000,000 QTC |
+| signet | 0 (none) | 250 ms (inert) | 600 s (`-signetblocktime`) | 210,000 | 50 QTC | none | 21,000,000 QTC | 21,000,000 QTC |
+| regtest | 0 (none) | 250 ms (inert) | 90 s | 150 | 50 QTC | none (opt-in via `-regtesttreasurypremine{height,amount,script}`) | 21,000,000 QTC | 21,000,000 QTC |
 
-**Regtest note**: `nFastMineHeight = 0` means regtest has no fast-mining
-phase (all blocks use normal spacing). `nSubsidyHalvingInterval = 150` allows
-rapid halving testing. All other monetary invariants still hold.
+**No fast-mining phase**: `nFastMineHeight = 0` on every network, so every
+block from genesis uses `nPowTargetSpacingNormal` and ASERT retargets from
+block 0 (`nMatMulAsertHeight = 0`). `nPowTargetSpacingFastMs` and
+`nFastMineDifficultyScale` remain in `Consensus::Params` but are inert.
+
+**Regtest note**: `nSubsidyHalvingInterval = 150` allows rapid halving
+testing (`feature_qtc_subsidy_schedule.py` mines two full halvings). The
+90 s regtest spacing keeps functional tests fast. All other monetary
+invariants still hold.
+
+**Mainnet treasury allocation (v2 chain, 2026-10-05)**: block 1's coinbase
+MUST carry exactly one additional output of 2,000,000 QTC to
+`treasuryPremineScript` (`bad-cb-treasury-premine` otherwise); that amount is
+added to the block-1 subsidy only (§11.4.4). The 50 QTC / 210,000-block
+schedule is unchanged, so total issuance is 23,000,000 QTC.
 
 #### 5.2.3 Block Capacity (Weight-Based)
 
@@ -775,19 +830,25 @@ INVARIANT: nMatMulValidationWindow >= 100         (minimum window for economic s
 INVARIANT: n, b, r are per-network constants      (miners MUST NOT vary per block)
 
 // --- Monetary policy invariants ---
-INVARIANT: nInitialSubsidy == 20 * COIN          (20 QTC per block at genesis)
-INVARIANT: nSubsidyHalvingInterval == 525000      (halving every 525k blocks on mainnet)
-INVARIANT: nMaxMoney == 21'000'000 * COIN         (hard supply cap)
+INVARIANT: nInitialSubsidy == 50 * COIN          (50 QTC per block at genesis; all networks)
+INVARIANT: nSubsidyHalvingInterval == 210000      (halving every 210k blocks on mainnet/testnet/signet; 150 on regtest)
+INVARIANT: nMaxMoney == 21'000'000 * COIN         (per-amount bound; MoneyRange())
 INVARIANT: nInitialSubsidy * nSubsidyHalvingInterval * 2 == nMaxMoney
-           // ^^^ Both sides in satoshis: (20*COIN) * 525000 * 2 == 21'000'000*COIN
+           // ^^^ Both sides in satoshis: (50*COIN) * 210000 * 2 == 21'000'000*COIN (mainnet/testnet/signet)
+INVARIANT: nTreasuryPremineHeight == 1 && nTreasuryPremineAmount == 2'000'000 * COIN   (mainnet only)
+INVARIANT: TreasuryPremineActiveAt(h) only for h == nTreasuryPremineHeight          (minted exactly once)
+INVARIANT: total issuance == 21'000'000 * COIN mined + nTreasuryPremineAmount        (23,000,000 QTC on mainnet)
 
 // --- Target spacing schedule invariants ---
-INVARIANT: nPowTargetSpacingFastMs == 250         (250ms / 0.25-second blocks during fast phase)
-INVARIANT: nPowTargetSpacingNormal == 90          (90-second blocks at steady state)
-INVARIANT: nFastMineHeight == 50000               (fast phase: blocks [0, 50000))
-INVARIANT: nFastMineDifficultyScale == 6          (bootstrap difficulty scaled 6x for 0.25s target on mainnet)
-INVARIANT: GetTargetSpacing(h, p) == 0.25 for all h in [0, 50000)
-INVARIANT: GetTargetSpacing(h, p) == 90   for all h >= 50000
+INVARIANT: nPowTargetSpacing == nPowTargetSpacingNormal   (600 on mainnet/testnet/signet; 90 on regtest)
+INVARIANT: nFastMineHeight == 0                   (no fast-mining phase on any shipped network)
+INVARIANT: nMatMulAsertHeight == nFastMineHeight  (ASERT anchored at genesis)
+INVARIANT: nPowTargetSpacingFastMs == 250         (retained; inert while nFastMineHeight == 0)
+INVARIANT: nFastMineDifficultyScale == 6          (mainnet/testnet/signet; 4 on regtest; inert)
+INVARIANT: GetTargetSpacing(h, p) == 600  for all h >= 0   (mainnet/testnet/signet)
+INVARIANT: GetTargetSpacing(h, p) == 90   for all h >= 0   (regtest)
+INVARIANT: nMatMulAsertHalfLife == 172800         (mainnet/testnet/signet; 14400 on regtest)
+INVARIANT: nMatMulMaxFutureMtpDrift == nMatMulAsertHalfLife / 4   (43,200 s on mainnet)
 
 // --- Block capacity invariants (SegWit-style weight) ---
 INVARIANT: nMaxBlockWeight == 24'000'000       (consensus weight ceiling)
@@ -835,26 +896,29 @@ TEST: matmul_params_b_and_r_independent
 
 TEST: monetary_params_defaults
   GIVEN: Default Params (mainnet)
-  THEN: nInitialSubsidy == 20 * COIN
-  AND: nSubsidyHalvingInterval == 525000
+  THEN: nInitialSubsidy == 50 * COIN
+  AND: nSubsidyHalvingInterval == 210000
   AND: nMaxMoney == 21'000'000 * COIN
 
 TEST: monetary_params_cap_identity
   GIVEN: Default Params
   THEN: nInitialSubsidy/COIN * nSubsidyHalvingInterval * 2 == nMaxMoney/COIN
-  // This is the mathematical identity: 20 * 525000 * 2 == 21,000,000
+  // This is the mathematical identity: 50 * 210000 * 2 == 21,000,000
 
 TEST: target_spacing_fast_phase
   GIVEN: Default Params (mainnet)
-  THEN: GetTargetSpacing(0, params) == 0.25
-  AND: GetTargetSpacing(1, params) == 0.25
-  AND: GetTargetSpacing(49999, params) == 0.25
+  THEN: nPowTargetSpacingFastMs == 250
+  AND: nFastMineHeight == 0
+  AND: GetTargetSpacing(0, params) == 600.0        // no fast phase on mainnet
+  WHEN: a copy sets nFastMineHeight = 50000       // legacy schedule exercised on a copy
+  THEN: GetTargetSpacing(0, copy) == 0.25
+  AND: GetTargetSpacing(49999, copy) == 0.25
+  AND: GetTargetSpacing(50000, copy) == 600.0
 
 TEST: target_spacing_normal_phase
   GIVEN: Default Params (mainnet)
-  THEN: GetTargetSpacing(50000, params) == 90
-  AND: GetTargetSpacing(50001, params) == 90
-  AND: GetTargetSpacing(1000000, params) == 90
+  THEN: GetTargetSpacing(50000, params) == 600.0
+  AND: GetTargetSpacing(1000000, params) == 600.0
 
 TEST: target_spacing_regtest_no_fast_phase
   GIVEN: CreateChainParams(ChainType::REGTEST)
@@ -2852,12 +2916,13 @@ three-layer defense against verification-cost DoS attacks:
 | Global hard limit | `nMatMulMaxPendingVerifications` | 4 | Caps the number of Phase 2 verifications executing concurrently across all peers. This is the ultimate CPU-time bound. |
 | Per-peer punitive limit | `nMatMulPhase2FailBanThreshold` | 3 | Permanently removes peers that repeatedly send Phase-2-invalid blocks. Bounds total attacker impact to `3 * T_phase2` seconds of CPU per Sybil peer. |
 
-**Why 8**: At steady-state (90s blocks, ~0.4 blocks/min), a budget of 8
-provides 20x headroom above normal demand, absorbing Poisson burst arrivals
-and small reorgs without throttling honest peers. During the fast-mining phase
-(0.25s blocks, ~240 blocks/min), the budget naturally limits Phase 2 throughput to
-~8/min per peer, which enforces the Phase 2 deferral policy (Section 10.3.1)
-at the rate-limiting layer without requiring height-dependent scheduling logic.
+**Why 8**: At the 600 s block time (~0.1 blocks/min), a budget of 8
+provides 80x headroom above normal demand, absorbing Poisson burst arrivals
+and small reorgs without throttling honest peers. On a network that enabled a
+fast-mining phase (0.25s blocks, ~240 blocks/min; none shipped does), the
+budget would naturally limit Phase 2 throughput to ~8/min per peer, enforcing
+the Phase 2 deferral policy (Section 10.3.1) at the rate-limiting layer
+without requiring height-dependent scheduling logic.
 Under attack, worst-case CPU cost per malicious peer is 8 * 2.0s = 16 seconds
 per minute (~27% of a single core on older hardware), and the concurrency cap
 of 4 provides the hard ceiling regardless of peer count.
@@ -3074,6 +3139,11 @@ and the development team can diagnose and patch before escalating to strict mode
 
 #### 10.3.1 Fast-Phase Phase 2 Scheduling (h < nFastMineHeight)
 
+> **Not active on any shipped network.** `nFastMineHeight = 0` on mainnet,
+> testnet, signet and regtest (§5.2.2), so the range `h < nFastMineHeight` is
+> empty and Phase 2 runs at the tip for every block at the 600 s spacing. The
+> rules below are retained for any network that enables a fast phase.
+
 During 0.25-second blocks, Tier 1 (consensus-validating) nodes may not be able
 to complete Phase 2 verification for every arriving block in real time on
 CPU-only hardware (see §3.5.2 utilization table). The following rules apply:
@@ -3085,11 +3155,11 @@ CPU-only hardware (see §3.5.2 utilization table). The following rules apply:
    fast-mining phase. The queue MUST be bounded by
    `nMatMulMaxPendingVerifications * FAST_PHASE_QUEUE_MULTIPLIER` (suggested:
    multiplier = 50, giving a queue depth of 200 blocks).
-3. **After the transition to 90-second blocks** (h ≥ `nFastMineHeight`), the
+3. **After the transition to normal-spacing blocks** (h ≥ `nFastMineHeight`), the
    Phase 2 verifier MUST drain the deferred queue and restore "Phase 2 at
-   tip" behavior. With 90s inter-block time, the verifier can process ~75–300
-   deferred blocks per new block interval (at 0.5–2s per verification), so
-   catch-up completes within minutes.
+   tip" behavior. With a 600 s inter-block time, the verifier can process
+   ~300–1,200 deferred blocks per new block interval (at 0.5–2s per
+   verification), so catch-up completes within one or two intervals.
 4. **GPU-accelerated Tier 1 nodes** (< 0.1s per Phase 2) can verify every
    fast-phase block in real time and do not need deferred scheduling.
 5. **Tier 2 (economic) nodes** never perform Phase 2 and are unaffected.
@@ -3255,74 +3325,91 @@ TEST: validation_max_concurrent_verifications
 ### 11.1 ASERT for All MatMul Difficulty Adjustment
 
 > **DESIGN INVARIANT**: MatMul networks use ASERT exclusively for all
-> difficulty adjustment after the fast-mining bootstrap phase. DarkGravityWave
+> difficulty adjustment from `nMatMulAsertHeight` (= `nFastMineHeight` = 0 on
+> every shipped network, i.e. from genesis). DarkGravityWave
 > (DGW) is NOT used for MatMul mining. DGW was deliberately replaced by ASERT
 > to avoid convergence, oscillation, and warmup issues inherent to DGW's
 > 180-block averaging window. Do not reintroduce DGW for MatMul mining without
 > explicit project approval.
 
-With a fresh genesis, the chain enters the fast-mining bootstrap phase
-(blocks 0..nFastMineHeight-1) at fixed genesis-derived difficulty. From
-`nFastMineHeight` onward, ASERT governs all retargeting as a stateless,
-path-independent exponential algorithm.
+With a fresh genesis and `nFastMineHeight = 0`, there is no bootstrap phase:
+ASERT governs all retargeting from block 1 onward as a stateless,
+path-independent exponential algorithm anchored at genesis. On a network that
+set `nFastMineHeight > 0`, blocks `0..nFastMineHeight-1` would hold the
+genesis-derived difficulty and ASERT would take over at `nFastMineHeight`
+(which MUST equal `nMatMulAsertHeight`).
 
-**Variable target spacing**: The target inter-block time is height-dependent
-(see §5.1, §11.5). ASERT handles this via its anchor-based design — it
-measures elapsed time vs. expected time from the anchor block.
+Shipped ASERT parameters (mainnet, testnet, signet): half-life
+`nMatMulAsertHalfLife = 172,800 s` (2 days ≈ 288 blocks at 600 s),
+`nMatMulAsertBootstrapFactor = 1`, no retune or half-life upgrade heights,
+and a timestamp-shock bound `nMatMulMaxFutureMtpDrift = 43,200 s`
+(half-life / 4). Regtest uses a 14,400 s half-life.
 
-### 11.2 Genesis Difficulty: Conservative Start (Not powLimit)
+**Variable target spacing**: `GetTargetSpacing(height)` is height-dependent
+in principle (see §5.1, §11.5); with `nFastMineHeight = 0` it is the constant
+`nPowTargetSpacingNormal`. ASERT handles either case via its anchor-based
+design — it measures elapsed time vs. expected time from the anchor block.
 
-**Problem with naive powLimit**: acceptance probability ≈ 1.0, blocks found in
-milliseconds, 180 blocks of ultra-fast emission before difficulty adjustment catches up.
+### 11.2 Genesis Difficulty: powLimit Is the Sized Hard Floor
 
-**Fix**: Start with a calibrated initial difficulty:
+**Problem with a naive (trivial) powLimit**: acceptance probability ≈ 1.0,
+blocks found in milliseconds, and ultra-fast early emission before difficulty
+adjustment catches up.
+
+**Shipped design (QTC Option B, launch-safety decisions D1/D3/D5)**: instead
+of a trivial floor plus a calibrated genesis target, `powLimit` itself is
+sized so that a single reference GPU holds the 600 s schedule *at the floor*,
+and genesis `nBits` equals `compact(powLimit)`:
 
 ```cpp
-// Genesis nBits chosen so that:
-// - Expected solve time ≈ GetTargetSpacing(0) = nPowTargetSpacingFastMs / 1000.0 = 0.25 seconds
-// - On reference hardware (single modern GPU)
-// - With n=512, b=16 matrix computation
+// Mainnet/testnet/signet:
+//   powLimit = 0x011da5 * 2^216  (compact 0x1e011da5)   -- launch floor D5
+//   genesis nBits == compact(powLimit)                    -- MUST hold (rpc GetTarget
+//                                                            aborts on getblockheader 0 otherwise)
+// Sized 2026-09-10 / signed off 2026-09-25 so that one RTX 6000 Ada alone
+// holds the 600 s target at the floor (n=512, oracle v2, digest v4).
+// Consensus clamps any easier ASERT output to powLimit, so the floor bounds
+// the fastest sustainable emission.
 //
-// Calibrated via benchmark: one matmul attempt takes ~T_attempt seconds.
-// Expected attempts for 0.25s block = 0.25 / T_attempt.
-// Initial target = powLimit / (0.25 / T_attempt).
-// nFastMineDifficultyScale (4) scales bootstrap difficulty for the 0.25s target.
-//
-// NOTE: Genesis difficulty targets the FAST-PHASE spacing (0.25s), not the
-// steady-state spacing (90s). ASERT handles the transition to 90s blocks
-// at height 50,000 via its bootstrap factor.
-//
+// nFastMineDifficultyScale (6) is retained but inert: nFastMineHeight == 0.
 // This is set as a constant in chainparams, NOT computed dynamically.
 ```
 
-During the fast-mining phase (blocks 0..nFastMineHeight-1), genesis-derived
-difficulty is used unchanged (no retargeting). This prevents both ultra-fast
-and ultra-slow early chain growth.
+ASERT retargets from block 1 (anchor at genesis, `nMatMulAsertBootstrapFactor
+= 1`), so there is no held-difficulty window and no bootstrap transition.
+Regtest uses an all-ones `powLimit` with `fPowNoRetargeting = true` unless
+`-test=matmuldgw` / ASERT options are enabled.
 
 ### 11.3 Tests for Difficulty
 
 ```
-TEST: genesis_difficulty_not_powlimit
-  GIVEN: Genesis block
-  THEN: nBits != powLimit.GetCompact()
-  AND: nBits represents a non-trivial target
+TEST: mainnet_genesis_nbits_equals_powlimit_compact
+  GIVEN: Mainnet genesis block
+  THEN: nBits == powLimit.GetCompact() == 0x1e011da5
+  AND: powLimit is a non-trivial target (sized floor, §11.2)
 
-TEST: fast_phase_holds_bootstrap_difficulty
-  GIVEN: Chain height < nFastMineHeight
+TEST: asert_mainnet_option_b_no_fast_phase_retargets_from_genesis
+  GIVEN: Mainnet params (nFastMineHeight == 0, nMatMulAsertHeight == 0)
+  WHEN: GetNextWorkRequired for block 1
+  THEN: ASERT output anchored at genesis (no held bootstrap difficulty)
+
+TEST: asert_fast_phase_holds_bootstrap_difficulty
+  GIVEN: A params copy with nFastMineHeight > 0, chain height < nFastMineHeight
   WHEN: GetNextWorkRequired
   THEN: Returns genesis-derived bootstrap nBits (no retargeting)
+  // Exercised on a copy only; no shipped network has a fast phase.
 
-TEST: asert_activates_at_fast_mine_height
-  GIVEN: Chain at nFastMineHeight
+TEST: asert_activation_bootstrap_factor_eases_target
+  GIVEN: A params copy with nFastMineHeight > 0, chain at nFastMineHeight
   WHEN: GetNextWorkRequired
   THEN: Returns ASERT bootstrap (parent_target × bootstrap_factor)
 
 TEST: asert_hashrate_step_up
-  GIVEN: Stable chain, then 2x hashrate (45s blocks)
+  GIVEN: Stable chain, then 2x hashrate (300s blocks)
   THEN: ASERT increases difficulty
 
 TEST: asert_hashrate_step_down
-  GIVEN: Stable chain, then 0.5x hashrate (180s blocks)
+  GIVEN: Stable chain, then 0.5x hashrate (1200s blocks)
   THEN: ASERT decreases difficulty
 
 TEST: asert_path_independence
@@ -3332,8 +3419,10 @@ TEST: asert_path_independence
 
 ### 11.4 Block Subsidy
 
-The block subsidy follows a Bitcoin-style infinite halving series, producing
-an exact hard cap of 21,000,000 QTC.
+The block subsidy follows Bitcoin's halving series verbatim (50 coins,
+halving every 210,000 blocks), producing 21,000,000 QTC of mined supply. On
+mainnet v2 a one-time 2,000,000 QTC treasury allocation is minted in block 1
+on top of that schedule (§11.4.4), for a total issuance of 23,000,000 QTC.
 
 #### 11.4.1 Consensus Definition
 
@@ -3342,7 +3431,7 @@ CAmount GetBlockSubsidy(int32_t height, const Consensus::Params& p) {
     int halvings = height / p.nSubsidyHalvingInterval;
 
     // Standard safety bound: after 64 halvings, subsidy is sub-satoshi.
-    // (20 * COIN) >> 64 == 0 for any sane COIN value.
+    // (50 * COIN) >> 64 == 0 for any sane COIN value.
     if (halvings >= 64) return 0;
 
     CAmount subsidy = p.nInitialSubsidy >> halvings;  // integer halving
@@ -3352,31 +3441,35 @@ CAmount GetBlockSubsidy(int32_t height, const Consensus::Params& p) {
 
 **Design notes**:
 
-- The initial subsidy is **20 QTC** (= `20 * COIN`).
-- The halving interval is **525,000 blocks**.
+- The initial subsidy is **50 QTC** (= `50 * COIN`).
+- The halving interval is **210,000 blocks** (150 on regtest).
 - The infinite geometric series converges to:
-  `20 × 525,000 × (1 + 1/2 + 1/4 + ...) = 20 × 525,000 × 2 = 21,000,000 QTC`.
-- Integer division truncation ensures the sum never exceeds 21M; in practice
-  the total is `21,000,000 - (525,000 * 20 / 2^64)` ≈ 21M minus dust.
+  `50 × 210,000 × (1 + 1/2 + 1/4 + ...) = 50 × 210,000 × 2 = 21,000,000 QTC`.
+- Integer division truncation ensures the mined sum never exceeds 21M; in
+  practice the total is 21M minus dust (as in Bitcoin, ≈ 20,999,999.98 QTC).
+- `GetBlockSubsidy()` is the pure schedule. The consensus amount a block may
+  claim is `GetBlockSubsidyForBlock()`, which adds `nTreasuryPremineAmount` at
+  `nTreasuryPremineHeight` only (§11.4.4). The empty-block subsidy penalty
+  fields exist but are disabled (`INT32_MAX`) on every shipped network.
 - The `halvings >= 64` guard is a safety bound. At 64 halvings the subsidy
   has been right-shifted to zero regardless of COIN precision.
 
 #### 11.4.2 Issuance Schedule
 
-| Halving | Block range | Subsidy/block | Cumulative (QTC) | Phase |
-|---------|-------------|---------------|-------------------|-------|
-| 0 | 0 – 524,999 | 20 | 10,500,000 | Includes fast-mining (0–49,999) |
-| 1 | 525,000 – 1,049,999 | 10 | 15,750,000 | Steady state |
-| 2 | 1,050,000 – 1,574,999 | 5 | 18,375,000 | Steady state |
-| 3 | 1,575,000 – 2,099,999 | 2.5 | 19,687,500 | Steady state |
-| 4 | 2,100,000 – 2,624,999 | 1.25 | 20,343,750 | Steady state |
-| … | … | … | → 21,000,000 | Asymptotic approach to cap |
+| Halving | Block range | Subsidy/block | Cumulative mined (QTC) | Cumulative total incl. treasury (QTC, mainnet) |
+|---------|-------------|---------------|------------------------|-----------------------------------------------|
+| 0 | 0 – 209,999 | 50 | 10,500,000 | 12,500,000 |
+| 1 | 210,000 – 419,999 | 25 | 15,750,000 | 17,750,000 |
+| 2 | 420,000 – 629,999 | 12.5 | 18,375,000 | 20,375,000 |
+| 3 | 630,000 – 839,999 | 6.25 | 19,687,500 | 21,687,500 |
+| 4 | 840,000 – 1,049,999 | 3.125 | 20,343,750 | 22,343,750 |
+| … | … | … | → 21,000,000 | → 23,000,000 |
 
-**Fast-mining phase emission**: The first 50,000 blocks (heights 0–49,999)
-are mined at 0.25-second intervals at the initial 20 QTC subsidy, producing
-exactly **1,000,000 QTC** in approximately **3.5 hours**. This is 4.76%
-of the total supply. The remaining 475,000 blocks in halving epoch 0 are
-mined at 90-second intervals over approximately **2.26 years**.
+Each halving epoch of 210,000 blocks at the 600 s target lasts
+126,000,000 s ≈ **3.99 years**, so the schedule matches Bitcoin's in both
+height and wall-clock terms. There is no fast-mining emission: block 0 is
+the only block mined outside ASERT control, and block 1 carries the
+treasury allocation (mainnet only).
 
 #### 11.4.3 Cap Enforcement
 
@@ -3396,80 +3489,133 @@ Cap enforcement requirements:
 3. **UTXO set**: No UTXO may have `nValue > nMaxMoney`.
 4. **Cumulative check (test-only)**: A test MUST verify that
    `Σ GetBlockSubsidy(h) for h = 0 .. ∞` converges to exactly `nMaxMoney`
-   (within integer truncation rounding).
+   (within integer truncation rounding). `nMaxMoney` bounds each individual
+   amount, not total issuance: with the mainnet treasury allocation the total
+   issuance is `nMaxMoney + nTreasuryPremineAmount` = 23,000,000 QTC.
 
-### 11.5 Fast-Mining Phase Schedule
+#### 11.4.4 Treasury Allocation (Mainnet v2)
 
-For heights **0 through 49,999**, the consensus target inter-block time is
-**0.25 seconds** (250ms). For heights **≥ 50,000**, the consensus target inter-block
-time is **90 seconds**. This is a consensus rule.
+Owner decision 2026-10-03, live on the v2 chain since 2026-10-05
+(release notes 0.2.0):
+
+| Field | Mainnet | testnet / signet / regtest |
+|-------|---------|---------------------------|
+| `nTreasuryPremineHeight` | 1 | `INT32_MAX` (rule disabled; regtest may opt in via `-regtesttreasurypremine{height,amount,script}`) |
+| `nTreasuryPremineAmount` | 2,000,000 QTC | 0 |
+| `treasuryPremineScript` | P2MR (witness v2) of `qtc1ztrwsedmxswv4q0kuzw5avlw0yxntucaz89vtmvkluds5u4332ntqwq3gct` | empty |
+
+Rules (`GetBlockSubsidyForBlock()`, `ConnectBlock()`):
+
+1. At exactly `nTreasuryPremineHeight` the coinbase MUST carry one output of
+   `nTreasuryPremineAmount` paying `treasuryPremineScript`; the block is
+   rejected with `bad-cb-treasury-premine` otherwise.
+2. `nTreasuryPremineAmount` is added to the block subsidy at that height
+   only; the coinbase value bound becomes
+   `GetBlockSubsidy(1) + nTreasuryPremineAmount + fees`.
+3. No other height is affected; `GetBlockSubsidy()` itself is unchanged.
+4. `TreasuryPremineActiveAt(h)` is false whenever the height is `INT32_MAX`,
+   the amount is 0, or the script is empty, so the rule is inert on networks
+   that do not configure it.
+
+### 11.5 Target Spacing Schedule (No Fast-Mining Phase)
+
+The consensus target inter-block time is **600 seconds** (10 minutes) at
+every height on mainnet, testnet and signet, and **90 seconds** on regtest.
+This is a consensus rule (`GetTargetSpacing()`, §5.1).
 
 ```
 Target spacing schedule (consensus-critical):
-  height ∈ [0, 50000)  → target = 0.25 seconds  (fast-mining phase, 250ms)
-  height ∈ [50000, ∞)  → target = 90 seconds    (steady-state)
+  mainnet / testnet / signet:  height ∈ [0, ∞) → target = 600 seconds
+  regtest:                     height ∈ [0, ∞) → target = 90 seconds
 ```
 
-**Rationale**: The fast-mining phase serves as a rapid bootstrap:
+`Consensus::Params` still carries the fast-mining mechanism
+(`nPowTargetSpacingFastMs = 250`, `nFastMineDifficultyScale`,
+`nFastMineHeight`), but **`nFastMineHeight = 0` on every shipped network**,
+so the fast range `[0, nFastMineHeight)` is empty and no block ever uses the
+250 ms spacing. The pre-launch design's 50,000-block / 0.25 s bootstrap was
+dropped under QTC Option B (launch-safety decisions D1–D5): ASERT governs
+from genesis against a sized hard floor (§11.2), which removes the 360x
+spacing transition, the bootstrap factor, and the fast-phase verification
+load (§3.5.2, §10.3.1).
 
-- **Duration**: ~12,500 seconds ≈ 3.47 hours at target spacing.
-- **Emission**: 50,000 × 20 = 1,000,000 QTC (4.76% of supply).
-- **Security**: The fast phase uses the same MatMul PoW — no reduced
-  security. The bootstrap difficulty targets 0.25-second blocks.
-  `nFastMineDifficultyScale{4}` scales bootstrap difficulty for the 4x faster target.
-- **Transition**: At height 50,000 the target spacing changes from 0.25s to 90s.
-  ASERT activates with a bootstrap factor to ease difficulty for the 360x
-  increase in target spacing, then converges smoothly via its exponential
-  retargeting algorithm.
+**Rationale for 600 s**:
 
-**The fast-mining phase does NOT change the halving schedule.** The halving
-interval is measured in blocks (525,000), not time. The first halving
-occurs at block 525,000 regardless of how fast those blocks were produced.
+- **Verification headroom**: a CPU-only Tier 1 node spends 0.08--0.33% of a
+  core on Phase 2 at n=512 (§3.5.2); propagation of ~200 KiB blocks is a
+  negligible fraction of the interval.
+- **Bitcoin-equivalent cadence**: 210,000-block halvings land every
+  ≈ 3.99 years (§11.4.2); the ASERT half-life of 172,800 s is 288 blocks.
+- **Floor sizing**: the launch `powLimit` was sized so one reference GPU
+  sustains 600 s at the floor (§11.2).
 
-#### 11.5.1 Timestamp Rules During Fast Phase
+**The target spacing does NOT change the halving schedule.** The halving
+interval is measured in blocks (210,000), not time. The first halving
+occurs at block 210,000 regardless of how fast those blocks were produced.
 
-The Bitcoin-inherited timestamp acceptance rules **are unchanged** during the
-fast-mining phase:
+A network that sets `nFastMineHeight > 0` would use
+`nPowTargetSpacingFastMs` for heights below it and `nPowTargetSpacingNormal`
+from `nFastMineHeight` onward, with ASERT activating at
+`nMatMulAsertHeight == nFastMineHeight` (§11.6). None of the shipped
+networks does.
+
+#### 11.5.1 Timestamp Rules
+
+The Bitcoin-inherited timestamp acceptance rules apply at every height,
+supplemented by the ASERT drift bound:
 
 1. **Median-Time-Past (MTP)**: A block's `nTime` must be strictly greater than
-   the median of the previous 11 blocks' timestamps. At 0.25-second target
-   spacing, the MTP advances by ~0.25 seconds per block — this is tight but
-   satisfies the rule as long as miners use accurate clocks.
+   the median of the previous 11 blocks' timestamps. At 600 s spacing this
+   leaves ample room; a fast phase (0.25 s spacing, not shipped) would make
+   it tight and require accurate miner clocks.
 2. **Future time limit**: A block's `nTime` must not exceed the node's local
    time + `MAX_FUTURE_BLOCK_TIME` (7200 seconds = 2 hours). This is
    unchanged and provides ample margin.
-3. **nTime monotonicity**: The consensus rules do NOT require strictly
-   increasing `nTime` (only > MTP). At 0.25-second spacing, multiple consecutive
-   blocks may have the same `nTime` if they are mined within the same
-   wall-clock second. This is valid — σ (and thus the PoW instance) still
-   differs because `hashPrevBlock` changes.
+3. **Future-MTP drift bound**: a block's `nTime` may not exceed the parent's
+   MTP by more than `nMatMulMaxFutureMtpDrift = 43,200 s` (half-life / 4,
+   active from genesis via `nMatMulMaxFutureMtpDriftHeight = 0`). Because
+   the 11-block median lags ~5 blocks, the chain clock can advance at most
+   drift/6 per block; a bound of one target spacing would freeze post-stall
+   ASERT easing (regtest stall simulation, 2026-09-07), hence the quarter
+   half-life.
+4. **nTime monotonicity**: The consensus rules do NOT require strictly
+   increasing `nTime` (only > MTP). Consecutive blocks may share an `nTime`;
+   σ (and thus the PoW instance) still differs because `hashPrevBlock`
+   changes.
 
-**Implementation note**: Miners during the fast phase SHOULD use
-`GetAdjustedTime()` (NTP-synchronized) for `nTime` to avoid MTP violations.
-A miner whose clock is off by more than ~5 seconds may produce blocks that
-peers reject for failing MTP.
+**Implementation note**: Miners SHOULD use `GetAdjustedTime()`
+(NTP-synchronized) for `nTime` to avoid MTP violations.
 
-### 11.6 ASERT Transition at Fast-Mining Boundary
+### 11.6 ASERT Anchoring and Phase Boundaries
 
 > **Note**: DGW (DarkGravityWave) is NOT used for MatMul difficulty adjustment.
 > The `ExpectedDgwTimespan()` function is retained for KAWPOW-era legacy
-> networks only. For MatMul, ASERT handles the fast-to-steady transition.
+> networks only; its unit tests (§11.7) only pin that it sums
+> `GetTargetSpacing()` over 180 intervals (180 × 600 s = 108,000 s on mainnet).
 
-At height `nFastMineHeight` (50,000), ASERT activates with a one-time
-bootstrap factor (`nMatMulAsertBootstrapFactor = 40`) that eases difficulty
-from the fast-phase level to accommodate the 360x increase in target spacing
-(from 0.25s to 90s). ASERT then converges to steady-state difficulty via
-its exponential, stateless retargeting algorithm.
+On every shipped network `nMatMulAsertHeight = nFastMineHeight = 0`: the
+ASERT anchor is the genesis block, `nMatMulAsertBootstrapFactor = 1` is
+inert (the activation branch `next_height == nMatMulAsertHeight` is never
+reached), and no retune or half-life-upgrade height is scheduled
+(`nMatMulAsertRetuneHeight`, `nMatMulAsertRetune2Height`,
+`nMatMulAsertHalfLifeUpgradeHeight` are all `INT32_MAX`). Difficulty for
+block 1 onward is the stateless ASERT output with half-life 172,800 s
+(14,400 s on regtest), clamped to `powLimit` (§11.2).
+
+The pre-launch design activated ASERT at height 50,000 with a bootstrap
+factor of 40 to absorb the 360x spacing step from a 0.25 s fast phase; that
+transition no longer exists.
 
 #### 11.6.1 ASERT Phase Boundaries
 
-| Height range | Difficulty algorithm | Notes |
-|-------------|---------------------|-------|
-| h < nFastMineHeight | Fixed bootstrap difficulty | Genesis-derived, no retargeting |
-| h == nFastMineHeight | ASERT bootstrap | parent_target × bootstrap_factor |
-| h == nMatMulAsertRetuneHeight | ASERT retune 1 | One-time hardening (÷ factor) |
-| h == nMatMulAsertRetune2Height | ASERT retune 2 | One-time ratio scaling (num/den) |
-| h > nMatMulAsertRetune2Height | ASERT steady-state | Stateless exponential retargeting |
+| Height range | Difficulty algorithm | Shipped networks |
+|-------------|---------------------|------------------|
+| h < nFastMineHeight | Fixed bootstrap difficulty (genesis-derived, no retargeting) | Empty range (`nFastMineHeight = 0`) |
+| h == nFastMineHeight == nMatMulAsertHeight | ASERT anchor; bootstrap `parent_target × bootstrap_factor` | h = 0 (genesis); factor 1, inert |
+| h == nMatMulAsertRetuneHeight | ASERT retune 1: one-time hardening (÷ factor) | Disabled (`INT32_MAX`) |
+| h == nMatMulAsertRetune2Height | ASERT retune 2: one-time ratio scaling (num/den) | Disabled (`INT32_MAX`) |
+| h == nMatMulAsertHalfLifeUpgradeHeight | Half-life switch, continuous at the boundary | Disabled (`INT32_MAX`) |
+| all other h ≥ 1 | ASERT steady-state: stateless exponential retargeting, clamped to `powLimit` | Every block from 1 onward |
 
 **Implementation warning**: Do not reintroduce DGW for MatMul mining. ASERT
 was chosen specifically because its path-independent, stateless design avoids
@@ -3479,67 +3625,84 @@ averaging window.
 ### 11.7 Tests for Monetary Policy and Scheduling
 
 ```
-TEST: subsidy_height_0_is_20
+TEST: subsidy_height_0_is_20                      // name retained from the pre-launch design
   GIVEN: height = 0, default mainnet params
-  THEN: GetBlockSubsidy(0, params) == 20 * COIN
+  THEN: GetBlockSubsidy(0, params) == 50 * COIN
 
-TEST: subsidy_halves_at_525k
+TEST: subsidy_halves_at_525k                      // name retained; asserts the 210,000 schedule
   GIVEN: default mainnet params
-  THEN: GetBlockSubsidy(524999, params) == 20 * COIN
-  AND: GetBlockSubsidy(525000, params) == 10 * COIN
-  AND: GetBlockSubsidy(1049999, params) == 10 * COIN
-  AND: GetBlockSubsidy(1050000, params) == 5 * COIN
+  THEN: GetBlockSubsidy(209999, params) == 50 * COIN
+  AND: GetBlockSubsidy(210000, params) == 25 * COIN
+  AND: GetBlockSubsidy(419999, params) == 25 * COIN
+  AND: GetBlockSubsidy(420000, params) == 12.5 * COIN   // CAmount{1'250'000'000}
 
 TEST: subsidy_zero_after_64_halvings
   GIVEN: default mainnet params
-  THEN: GetBlockSubsidy(525000 * 64, params) == 0
-  AND: GetBlockSubsidy(525000 * 100, params) == 0
+  THEN: GetBlockSubsidy(210000 * 64, params) == 0
+  AND: GetBlockSubsidy(210000 * 100, params) == 0
 
-TEST: subsidy_fast_phase_total_is_1m
+TEST: subsidy_first_50k_blocks_total_is_2_5m
   GIVEN: default mainnet params
   WHEN: sum = Σ GetBlockSubsidy(h, params) for h = 0 .. 49999
-  THEN: sum == 1'000'000 * COIN
-  // All 50,000 blocks are in halving epoch 0 (before block 525,000)
-  // so each earns 20 QTC: 50,000 × 20 = 1,000,000
+  THEN: sum == 2'500'000 * COIN
+  // All 50,000 blocks are in halving epoch 0 (before block 210,000)
+  // so each earns 50 QTC: 50,000 × 50 = 2,500,000. (The treasury allocation
+  // is not part of GetBlockSubsidy(); see GetBlockSubsidyForBlock(), §11.4.4.)
 
 TEST: max_supply_never_exceeded
   GIVEN: default mainnet params
-  WHEN: total = Σ GetBlockSubsidy(h, params) for h = 0 .. 525000*64
+  WHEN: total = Σ GetBlockSubsidy(h, params) for h = 0 .. 210000*64
   THEN: total <= 21'000'000 * COIN
   AND: total > 20'999'999 * COIN  // within 1 QTC of cap (integer truncation)
 
-TEST: dgw_fast_phase_targets_250ms
-  GIVEN: height = 500, default mainnet params
-  THEN: ExpectedDgwTimespan(500, params) == 45
-  // All 180 blocks in window are fast-phase: (180 × 250) / 1000 = 45s
+TEST: treasury_premine_minted_once_at_height_1
+  GIVEN: default mainnet params
+  THEN: TreasuryPremineActiveAt(1) == true
+  AND: TreasuryPremineActiveAt(0) == false AND TreasuryPremineActiveAt(2) == false
+  AND: GetBlockSubsidyForBlock(1, block, prev, params) == 50 * COIN + 2'000'000 * COIN
+  AND: a block-1 coinbase without the 2'000'000 QTC output to treasuryPremineScript
+       is rejected with bad-cb-treasury-premine
 
-TEST: dgw_post_phase_targets_90s
+TEST: empty_block_subsidy_caps_activate_at_130k_strict_at_130500_and_end_at_132k
+  GIVEN: default mainnet params
+  THEN: nEmptyBlockSubsidyPenaltyHeight == INT32_MAX (never active on QTC mainnet)
+  // The historical penalty window is exercised on a copy of the params only.
+
+TEST: dgw_fast_phase_targets_250ms                // legacy ExpectedDgwTimespan; name retained
+  GIVEN: height = 500, default mainnet params (nFastMineHeight == 0)
+  THEN: ExpectedDgwTimespan(500, params) == 108000
+  // 180 intervals × 600 s. A copy with nFastMineHeight = 50000 yields 45:
+  // (180 × 250) / 1000 = 45s, pinning the legacy fast-phase arithmetic.
+
+TEST: dgw_post_phase_targets_90s                  // name retained
   GIVEN: height = 60000, default mainnet params
-  THEN: ExpectedDgwTimespan(60000, params) == 16200
-  // All 180 blocks in window are steady-state: 180 × 90s = 16,200s
+  THEN: ExpectedDgwTimespan(60000, params) == 108000
+  // All 180 intervals are at the 600 s spacing: 180 × 600 = 108,000s
 
-TEST: dgw_boundary_mixed_timespan
+TEST: dgw_boundary_targets_normal_timespan
   GIVEN: height = 50090, default mainnet params
-  THEN: ExpectedDgwTimespan(50090, params) == (90 * 0.25 + 90 * 90)
-  // Window spans [49910, 50089]: 90 fast-phase + 90 steady-state
-  // = 22.5 + 8100 = 8122.5s
+  THEN: ExpectedDgwTimespan(50090, params) == 108000
+  // No fast phase, so the former 49,910..50,089 "mixed" window is uniform
 
 TEST: dgw_boundary_transition_start
   GIVEN: height = 50000, default mainnet params
-  THEN: ExpectedDgwTimespan(50000, params) == 45
-  // Window is [49820, 49999]: all fast-phase blocks, so (180 × 250) / 1000 = 45
+  THEN: ExpectedDgwTimespan(50000, params) == 108000
 
 TEST: dgw_boundary_transition_end
   GIVEN: height = 50180, default mainnet params
-  THEN: ExpectedDgwTimespan(50180, params) == 16200
-  // Window is [50000, 50179]: all steady-state blocks, so 180 × 90 = 16200
+  THEN: ExpectedDgwTimespan(50180, params) == 108000
 
 TEST: money_range_enforces_cap
-  GIVEN: default mainnet params
-  THEN: MoneyRange(21'000'000 * COIN, params) == true
-  AND: MoneyRange(21'000'001 * COIN, params) == false
-  AND: MoneyRange(-1, params) == false
-  AND: MoneyRange(0, params) == true
+  GIVEN: MAX_MONEY == 21'000'000 * COIN (src/consensus/amount.h)
+  THEN: MoneyRange(21'000'000 * COIN) == true
+  AND: MoneyRange(21'000'001 * COIN) == false
+  AND: MoneyRange(-1) == false
+  AND: MoneyRange(0) == true
+
+FUNCTIONAL: feature_qtc_subsidy_schedule.py (regtest)
+  GIVEN: regtest (nInitialSubsidy == 50 QTC, nSubsidyHalvingInterval == 150)
+  WHEN: 300 blocks are mined (two full halvings)
+  THEN: every empty coinbase pays exactly 50 QTC >> (height // 150)
 ```
 
 ---
@@ -3548,11 +3711,11 @@ TEST: money_range_enforces_cap
 
 Because Phase 2 verification is O(n³) per block -- concretely ~134 million
 multiply-add operations at n=512 -- the trust model cannot treat verification as
-free. At 90-second steady-state blocks a CPU-only full verifier must sustain
-134M operations per 90 seconds for tip verification (during the fast-mining
-phase at 0.25-second blocks, this rises to 536M operations per second — requiring
-GPU or deferred batch verification). GPU-enabled verification shifts the
-hardware baseline entirely. The protocol therefore defines **four explicit node
+free. At 600-second blocks a CPU-only full verifier must sustain
+134M operations per 600 seconds for tip verification. (A fast-mining phase
+at 0.25-second blocks would raise this to 536M operations per second and
+require GPU or deferred batch verification; no shipped network has one.)
+GPU-enabled verification shifts the hardware baseline entirely. The protocol therefore defines **four explicit node
 tiers** with different Phase 2 validation scopes, hardware expectations, and
 trust assumptions.
 
@@ -3566,7 +3729,7 @@ described in earlier drafts and referenced in §3.6.
 | Tier | Name | Phase 2 Scope | Phase 1 Scope | Trust Assumption | Typical Operator |
 |------|------|--------------|---------------|------------------|-----------------|
 | **0** | **Mining node** | Every candidate block at tip (performs full Solve including transcript computation for every nonce attempt) | All | Trustless (produces and verifies proofs) | Miners, mining pools |
-| **1** | **Consensus-validating node** | Recomputes Phase 2 for all blocks in the last `MATMUL_VALIDATION_WINDOW` blocks (default 1000 = ~41.7 hours at 90s steady-state). Uses `assumevalid` for older blocks during IBD, then validates every new block at tip indefinitely. **This is the minimum to be a "full node."** | All | Trustless for validated range; trusts checkpoint hash for deep history | Exchanges, protocol developers, security auditors |
+| **1** | **Consensus-validating node** | Recomputes Phase 2 for all blocks in the last `MATMUL_VALIDATION_WINDOW` blocks (default 1000 = ~6.9 days at 600 s blocks). Uses `assumevalid` for older blocks during IBD, then validates every new block at tip indefinitely. **This is the minimum to be a "full node."** | All | Trustless for validated range; trusts checkpoint hash for deep history | Exchanges, protocol developers, security auditors |
 | **2** | **Economic node** | Phase 1 only for new blocks + `assumevalid` for all history. Does NOT recompute Phase 2. Trusts that the majority of Tier 0 and Tier 1 nodes have verified recent blocks. | All | Trusts full-node majority for transcript correctness | Merchants, wallets, block explorers, infrastructure |
 | **3** | **SPV / Light node** | None | Header chain only (`matmul_digest < target` + dimension bounds) | Trusts full-node majority for both transcript correctness and transaction inclusion | Mobile wallets, read-only explorers, embedded devices |
 
@@ -3637,12 +3800,11 @@ IBD, uses `assumevalid` for blocks below the hard-coded checkpoint, then
 validates Phase 2 for the last `MATMUL_VALIDATION_WINDOW` blocks. Once synced,
 it validates every subsequent tip block with Phase 2 forever.
 
-- **Phase 2 frequency**: Once per block (every ~90 seconds at steady state;
-  every ~0.25 seconds during fast-mining phase, which requires GPU or deferred
-  batch verification for real-time tip tracking).
-- **Hardware**: Mid-range CPU sufficient at steady state. A single-threaded
+- **Phase 2 frequency**: Once per block (every ~600 seconds on mainnet;
+  every 90 seconds on regtest).
+- **Hardware**: Mid-range CPU sufficient. A single-threaded
   Phase 2 at n=512 takes ~0.5--2.0s depending on CPU generation. At
-  90-second blocks, this is 0.3--1.3% CPU utilization — comfortable on
+  600-second blocks, this is 0.08--0.33% CPU utilization — comfortable on
   consumer hardware. GPU is optional (reduces Phase 2 to < 0.1s).
 - **Trust posture**: Trustless for the validated range. Trusts the
   `assumevalid` checkpoint hash for deep history (same as Bitcoin Core).
@@ -3679,8 +3841,8 @@ Requests Merkle inclusion proofs from full-node peers on demand.
 
 - **Phase 2 frequency**: Zero.
 - **Hardware**: Mobile-class (ARM Cortex-A53 or equivalent, 256+ MiB RAM).
-  Storage under 1 GiB (headers only: ~182 bytes/block, ~38 MiB/year at
-  90-second steady-state blocks).
+  Storage under 1 GiB (headers only: ~182 bytes/block, ~9.1 MiB/year at
+  600-second blocks).
 - **Trust posture**: Trusts full-node majority for both transcript correctness
   and transaction inclusion. Identical to Bitcoin SPV.
 - **Use cases**: Mobile wallets, embedded devices, read-only explorers,
@@ -3688,18 +3850,18 @@ Requests Merkle inclusion proofs from full-node peers on demand.
 
 ### 12.2 Hardware Requirements per Tier
 
-The following are rough estimates for steady-state operation at n=512, b=16,
-90-second block time on mainnet. Mining hardware requirements depend on
-network difficulty and are not bounded by the protocol. During the
-fast-mining phase (0.25s blocks, heights 0–49,999), Tier 1 nodes require
-GPU or deferred batch verification to keep up.
+The following are rough estimates for operation at n=512, b=16,
+600-second block time on mainnet. Mining hardware requirements depend on
+network difficulty and are not bounded by the protocol; note that the launch
+`powLimit` was sized so a single RTX 6000 Ada holds the 600 s target at the
+floor (§11.2). There is no fast-mining phase on any shipped network.
 
 | Tier | CPU | GPU | RAM | Disk | Network |
 |------|-----|-----|-----|------|---------|
 | **0 -- Mining** | High-core-count modern CPU (Zen 4, 16+ cores) OR any CPU with GPU offload | Strongly recommended: CUDA (Ampere+) or Apple Metal (M1+) | 4+ GiB | 50+ GiB (chain + UTXO) | Low-latency broadband |
-| **1 -- Consensus** | Mid-range CPU (4-core Zen 2 / Haswell or better). Must verify 1 block/90s at n=512. ~0.3--1.3% single-threaded CPU at steady state. | Optional; reduces Phase 2 to < 0.1s. Required during fast-mining phase for real-time tracking. | 2+ GiB | 50+ GiB (chain + UTXO) | Broadband |
+| **1 -- Consensus** | Mid-range CPU (4-core Zen 2 / Haswell or better). Must verify 1 block/600s at n=512. ~0.08--0.33% single-threaded CPU. | Optional; reduces Phase 2 to < 0.1s. | 2+ GiB | 50+ GiB (chain + UTXO) | Broadband |
 | **2 -- Economic** | Any modern CPU (Phase 1 is microseconds) | Not needed | 1+ GiB | 50+ GiB (chain + UTXO) or ~5 GiB pruned | Standard broadband |
-| **3 -- SPV** | Mobile-class (ARM Cortex-A53 or equivalent) | Not needed | 256+ MiB | < 1 GiB (headers: ~38 MiB/year at 90s blocks) | Any (including cellular) |
+| **3 -- SPV** | Mobile-class (ARM Cortex-A53 or equivalent) | Not needed | 256+ MiB | < 1 GiB (headers: ~9.1 MiB/year at 600s blocks) | Any (including cellular) |
 
 #### 12.2.1 Feasibility of Tier 1 on Consumer Hardware
 
@@ -3707,26 +3869,24 @@ At n=512, one Phase 2 verification = one full O(n³) canonical matmul
 recomputation (~134M field multiply-adds). Concrete timings on representative
 hardware:
 
-| Hardware | Est. Phase 2 Time (n=512) | CPU Util. at 90s Blocks | CPU Util. at 0.25s Blocks (fast phase) | Tier 1 Feasible? |
-|----------|--------------------------|--------------------------|----------------------------------------|------------------|
-| Modern x86 (Zen 4, single thread) | ~0.5s | ~0.3% | ~200% | Steady-state yes; fast phase needs GPU or deferred |
-| Modern ARM (Apple M2, single thread) | ~0.7s | ~0.5% | ~280% | Steady-state yes; fast phase needs GPU or deferred |
-| Older x86 (Haswell-era, single thread) | ~1.5--2.0s | ~1.0--1.3% | ~600--800% | Steady-state only; fast phase needs GPU or deferred |
-| Low-end ARM (RPi 4, single thread) | ~4--6s | ~2.7--4% | N/A (cannot keep up) | Steady-state only |
-| Any CPU with GPU offload | < 0.1s | < 0.1% | < 40% | Yes (trivial) |
+| Hardware | Est. Phase 2 Time (n=512) | CPU Util. at 600s Blocks | Tier 1 Feasible? |
+|----------|--------------------------|---------------------------|------------------|
+| Modern x86 (Zen 4, single thread) | ~0.5s | ~0.08% | Yes |
+| Modern ARM (Apple M2, single thread) | ~0.7s | ~0.12% | Yes |
+| Older x86 (Haswell-era, single thread) | ~1.5--2.0s | ~0.25--0.33% | Yes |
+| Low-end ARM (RPi 4, single thread) | ~4--6s | ~0.7--1.0% | Yes |
+| Any CPU with GPU offload | < 0.1s | < 0.02% | Yes (trivial) |
 
-**The critical threshold (steady state)**: a Tier 1 node must complete Phase 2
-verification within the block interval (90 seconds) on average. Any hardware
-that can perform 134M field multiply-adds in under ~75 seconds (leaving margin
+**The critical threshold**: a Tier 1 node must complete Phase 2
+verification within the block interval (600 seconds) on average. Any hardware
+that can perform 134M field multiply-adds in under ~500 seconds (leaving margin
 for network latency, transaction validation, and disk I/O) qualifies.
 
-**Fast-mining phase (h < 50,000)**: At 0.25-second blocks (~240 blocks/min),
-single-threaded CPU verification cannot keep up in real-time for any hardware.
-During this phase, Tier 1 nodes should either use GPU-accelerated verification
-or accept a deferred verification queue that catches up once the steady-state
-transition occurs at height 50,000. All blocks are still Phase 1-validated
-immediately (microsecond checks), so the node remains economically secure
-during the catch-up period.
+**Fast-mining phase (not shipped)**: a network with `nFastMineHeight > 0`
+and 0.25-second blocks (~240 blocks/min) would exceed single-threaded CPU
+verification on any hardware and would need GPU-accelerated verification or
+the deferred queue of §10.3.1. `nFastMineHeight = 0` everywhere, so this does
+not apply to QTC mainnet, testnet, signet or regtest.
 
 **GPU is NOT required for any validation tier.** GPU acceleration changes the
 mining economics (Tier 0) but does not change the minimum hardware baseline for
@@ -3752,17 +3912,16 @@ when a Tier 1 node resumes after an extended offline period.
 
 #### 12.3.2 Default Value Rationale
 
-The default is **1000 blocks** (~41.7 hours at 90-second steady-state
-block intervals; ~4.2 minutes during the fast-mining phase):
+The default is **1000 blocks** (~6.9 days at 600-second block intervals):
 
 | Factor | Analysis |
 |--------|----------|
-| **Time span (steady state)** | 1000 blocks × 90s = 90,000s = ~25.0 hours. Covers more than a full day. Sufficient to detect any attack mounted within recent history. |
-| **Time span (fast phase)** | 1000 blocks × 0.25s = 250s = ~4.2 minutes. The window covers a very short real-time period during fast-mining, but this is acceptable because the fast phase has low economic value per block (only 20 QTC) and the chain is young. |
-| **DGW safety margin** | DarkGravityWave uses a 180-block averaging window. `MATMUL_VALIDATION_WINDOW` must exceed this so the node independently verifies every block that feeds into the current difficulty calculation. 1000 provides >5x margin. |
+| **Time span** | 1000 blocks × 600s = 600,000s = ~166.7 hours ≈ 6.9 days. Covers almost a week. Sufficient to detect any attack mounted within recent history. |
+| **Time span (fast phase)** | Not applicable: `nFastMineHeight = 0` on every shipped network. (A 0.25 s fast phase would shrink the window to ~4.2 minutes of wall-clock time.) |
+| **Difficulty-window margin** | ASERT's mainnet half-life is 172,800 s ≈ 288 blocks; the legacy DGW averaging window is 180 blocks. `MATMUL_VALIDATION_WINDOW` exceeds both, so the node independently verifies every block that materially feeds into the current difficulty. 1000 provides >3x margin over the half-life. |
 | **Reorg coverage** | The longest plausible reorg under normal conditions is well under 180 blocks. 1000 blocks provides an extreme safety margin against deep reorgs. |
 | **IBD catch-up cost** | A newly-joining Tier 1 node must verify 1000 blocks from scratch. At ~1.5s per block (older single-threaded CPU), this is ~25 minutes — acceptable as a one-time IBD cost. |
-| **Ongoing cost** | After IBD, the node verifies exactly 1 block per 90 seconds at steady state. The window only affects IBD and recovery-from-long-offline scenarios. |
+| **Ongoing cost** | After IBD, the node verifies exactly 1 block per 600 seconds. The window only affects IBD and recovery-from-long-offline scenarios. |
 | **Checkpoint gap** | The `assumevalid` checkpoint is a release-time constant. Between software releases, the window ensures the node independently validates all blocks the checkpoint does not cover. With a 1000-block window and monthly releases, any gap is always covered. |
 | **v1 storage** | 1000 × 64 bytes (two seeds) = 64 KB. Negligible. |
 
@@ -3770,9 +3929,9 @@ block intervals; ~4.2 minutes during the fast-mining phase):
 
 | Network | `nMatMulValidationWindow` | Time Span | Rationale |
 |---------|--------------------------|-----------|-----------|
-| mainnet | 1000 | ~25.0 hours (steady state) | Production safety margin; >5x DGW window |
-| testnet | 500 | ~12.5 hours (steady state) | Faster IBD for testing; still covers DGW window (180 blocks) |
-| regtest | 10 | ~25 minutes (at 90s blocks) | Fast iteration; sufficient for functional test coverage |
+| mainnet | 1000 | ~6.9 days (600 s blocks) | Production safety margin; >3x ASERT half-life (288 blocks), >5x legacy DGW window |
+| testnet | 500 | ~3.5 days (600 s blocks) | Faster IBD for testing; still covers the ASERT half-life (288 blocks) |
+| regtest | 10 | 15 minutes (at 90s blocks) | Fast iteration; sufficient for functional test coverage |
 
 #### 12.3.4 Invariants
 
@@ -3786,7 +3945,7 @@ INVARIANT: nMatMulValidationWindow >= DGW_PAST_BLOCKS (180)
 
 INVARIANT: nMatMulValidationWindow >= 100
     Rationale: Hard floor to prevent misconfiguration. A window smaller
-    than 100 blocks (~100 minutes) provides negligible independent
+    than 100 blocks (~16.7 hours at 600 s) provides negligible independent
     verification and should not be called "full."
 ```
 
@@ -3932,9 +4091,8 @@ perpetually, not just for the portion below the checkpoint.
 #### 12.4.4 Tier 3 -- SPV / Light Node IBD
 
 1. **Header download only**: Fetch the header chain (182 bytes per block).
-   At steady-state (~210,384 blocks/year at 90s), this is ~38 MiB/year of
-   header data. Year 1 includes the fast-mining phase's 50,000 additional
-   blocks (~9 MiB), totaling ~47 MiB for year 1.
+   At 600 s spacing (~52,560 blocks/year), this is ~9.1 MiB/year of
+   header data. There is no fast-mining phase, so year 1 is no larger.
 2. **Phase 1 validation**: Validate `matmul_digest < target` and dimension
    bounds for every header.
 3. **No block bodies**: Does not download transactions or maintain a UTXO set.
@@ -3944,7 +4102,7 @@ perpetually, not just for the portion below the checkpoint.
    Merkle proofs for watched addresses.
 
 **Estimated IBD time** (1-year chain):
-- Header download: ~47 MiB over network (year 1), ~38 MiB/year thereafter
+- Header download: ~9.1 MiB/year over network (~52,560 headers × 182 bytes)
 - Phase 1 validation: < 1 second total
 - Total: **seconds to minutes** depending on network speed
 
@@ -4274,8 +4432,8 @@ per-network configurability.
 #### 14.2.3 Rationale and Scope
 
 - **Weight** is the primary scaling knob (throughput). Raising
-  `nMaxBlockWeight` from Bitcoin's 4M to 24M gives QTC ~6x the transaction
-  capacity at steady-state 90s blocks.
+  `nMaxBlockWeight` from Bitcoin's 4M to 24M gives QTC ~6x Bitcoin's
+  transaction capacity at the same 600 s block interval.
 - **SigOps cost** prevents "cheap bytes but expensive validation"
   constructions. Scaled proportionally with weight (6x Bitcoin's 80,000).
 - **Serialized size cap** is a hard transport/memory safety guard. Set at
@@ -4315,9 +4473,10 @@ For large-weight blocks, nodes SHOULD:
 - Maintain reasonable orphan/rescan limits to avoid bandwidth collapse.
 - Use `blockreconstructionextratxn` to improve compact block hit rates.
 
-This is a policy and operational requirement, not a consensus rule. Compact
-block relay is especially important during the fast-mining phase when block
-intervals are 0.25 seconds.
+This is a policy and operational requirement, not a consensus rule. (It
+would matter most on a network with a 0.25 s fast-mining phase; none shipped
+has one. Note also that compact-block serving is disabled for blocks carrying
+the Freivalds product payload, see §13.3.)
 
 #### 14.3.4 Operational Note: Default Tuning
 
@@ -4328,15 +4487,15 @@ deployment. Operators should be aware of the following trade-offs:
   the full consensus allowance by default. Operators on constrained links
   may lower this via `-blockmaxweight` to reduce orphan risk.
 - **`nDefaultMempoolMaxSizeMB` = 2048 MB**: This is aggressive relative to
-  the upstream Bitcoin Core default (300 MB). At 90s blocks with 24M WU
-  policy weight, the mempool can buffer ~20 minutes of peak transaction
-  volume at this size. Operators on memory-constrained systems SHOULD lower
-  this via `-maxmempool=300` (or similar) and accept more frequent evictions.
-  The 2 GB default is targeted at Tier 1 infrastructure nodes with ample RAM.
-- **Fast-phase implications**: During 0.25s blocks, mempool turnover is ~600×
-  faster than steady-state. The 2 GB default prevents premature eviction
-  during the fast phase when blocks clear rapidly. After the fast phase ends,
-  operators may reduce `maxmempool` without consequence.
+  the upstream Bitcoin Core default (300 MB). At 600 s blocks with 24M WU
+  policy weight, the mempool can buffer roughly 85 full blocks (~14 hours) of
+  peak transaction volume at this size. Operators on memory-constrained
+  systems SHOULD lower this via `-maxmempool=300` (or similar) and accept
+  more frequent evictions. The 2 GB default is targeted at Tier 1
+  infrastructure nodes with ample RAM.
+- **Fast-phase implications**: none on shipped networks (`nFastMineHeight =
+  0`). On a network with 0.25 s blocks, mempool turnover would be ~2,400×
+  faster and the 2 GB default would guard against premature eviction.
 
 ### 14.4 v1 Block Size (Seeded Matrices)
 
@@ -4365,28 +4524,31 @@ consume ~8.12M WU, leaving ~15.9M WU for transactions within consensus limits.
 
 ### 14.6 Bandwidth and Storage Under Weight Limits
 
-#### 14.6.1 Steady-State (90s blocks, ~210,384 blocks/year)
+#### 14.6.1 Steady-State (600 s blocks, ~52,560 blocks/year)
 
 | Version | Typical block | Bandwidth | Annual storage |
 |---------|--------------|-----------|---------------|
-| v1 (seeded, policy default) | ~200 KiB | 1.3 KiB/s | ~42 GiB/year |
-| v1 (seeded, consensus max) | ~4 MB | 27 KiB/s | ~840 GiB/year |
-| v2 (n=512) | ~2.2 MiB | 15 KiB/s | ~460 GiB/year |
-| v2 (n=256) | ~712 KiB | 4.7 KiB/s | ~148 GiB/year |
+| v1 (seeded, policy default) | ~200 KiB | 0.33 KiB/s | ~10.5 GiB/year |
+| v1 (seeded, consensus max) | ~4 MB | 6.7 KiB/s | ~210 GiB/year |
+| v2 (n=512) | ~2.2 MiB | 3.75 KiB/s | ~115 GiB/year |
+| v2 (n=256) | ~712 KiB | 1.2 KiB/s | ~37 GiB/year |
 
 v1 at policy defaults is bandwidth-viable for any home connection (even
 cellular). v1 at consensus max requires broadband. v2 at n=512 requires
 broadband but is feasible.
 
-#### 14.6.2 Fast-Mining Phase (0.25s blocks, h < 50,000)
+#### 14.6.2 Fast-Mining Phase (not shipped)
 
-| Version | Typical block | Bandwidth | Phase duration |
-|---------|--------------|-----------|---------------|
+No shipped network has a fast-mining phase (`nFastMineHeight = 0`, §11.5),
+so the steady-state figures of §14.6.1 apply from genesis. For reference, a
+network that enabled 0.25 s blocks would see:
+
+| Version | Typical block | Bandwidth | Phase duration (50,000 blocks) |
+|---------|--------------|-----------|-------------------------------|
 | v1 (seeded) | ~200 KiB | 800 KiB/s (~6.4 Mbps) | ~3.5 hours |
 
-During the fast-mining phase, v1 bandwidth peaks at ~800 KiB/s, which is
-well within broadband capability but not suitable for cellular connections.
-This is a transient condition lasting only ~3.5 hours.
+That would be well within broadband capability but not suitable for cellular
+connections.
 
 #### 14.6.3 Capacity Planning Guidance (Non-Consensus)
 
@@ -4584,16 +4746,18 @@ TEST: mining_template_can_use_consensus_max
 
 ---
 
-### Milestone 8: Difficulty Adjustment (DGW, Fresh Genesis)
+### Milestone 8: Difficulty Adjustment (ASERT, Fresh Genesis)
 
-**Deliverables**: Modified `pow.cpp`; `matmul_dgw_tests.cpp`
+**Deliverables**: Modified `pow.cpp`; `matmul_dgw_tests.cpp`,
+`matmul_subsidy_tests.cpp`, `feature_qtc_subsidy_schedule.py`
 
 **Exit criteria**:
-- [x] Genesis difficulty calibrated (not powLimit)
-- [x] First 180 blocks use genesis difficulty (no DGW adjustment)
-- [x] DGW activates at height 181
+- [x] Genesis `nBits == compact(powLimit)` on mainnet and testnet; `powLimit` is the sized hard floor (§11.2)
+- [x] ASERT retargets from block 1 with a genesis anchor (`nMatMulAsertHeight = nFastMineHeight = 0`); no held-difficulty window
+- [x] Half-life 172,800 s on mainnet/testnet/signet, 14,400 s on regtest; invalid params fail closed to the hardest target
 - [x] Step-up/step-down convergence
 - [x] Oscillation resilience
+- [x] Subsidy schedule: 50 QTC, halving every 210,000 blocks (150 on regtest); cumulative mined supply ≤ 21,000,000 QTC
 
 ```bash
 ./build-qtc/bin/test_qtc --run_test=matmul_dgw_tests
@@ -4625,15 +4789,17 @@ python3 test/functional/mining_matmul_basic.py
 `matmul_pow_readiness.sh`
 
 **Exit criteria**:
-- [x] 100+ blocks on regtest
+- [x] 100+ blocks on regtest (90 s target spacing, `nFastMineHeight = 0`, ASERT from genesis under `-test=matmuldgw`)
 - [x] Multi-node sync (2+ nodes agree on tip)
 - [x] Invalid blocks rejected, peers penalized
 - [x] DoS rate limits work across peers
 - [x] AssumeValid IBD path tested
+- [x] Regtest subsidy schedule end-to-end: 300 blocks across two halvings pay 50 → 25 → 12.5 QTC (`feature_qtc_subsidy_schedule.py`); no treasury allocation unless `-regtesttreasurypremine*` is set
 - [x] JSON artifacts for production audit
 
 ```bash
 python3 test/functional/feature_qtc_matmul_consensus.py
+python3 test/functional/feature_qtc_subsidy_schedule.py
 python3 test/functional/p2p_matmul_dos_mitigation.py
 bash scripts/matmul_pow_readiness.sh
 ```
@@ -4698,9 +4864,10 @@ Note: `matmul_field_tests` includes 14 `from_oracle` / `FromSeed` pinned
 test vector and byte-exact derivation tests (SS7.4.8). `matmul_noise_tests`
 includes 11 noise seed derivation byte-exact tests with pinned vectors
 (SS8.2.3). `matmul_params_tests` includes 6 monetary policy and target
-spacing tests (§5.4). `matmul_dgw_tests` includes 5 schedule-aware DGW
-timespan tests (§11.7). `matmul_subsidy_tests` includes 6 subsidy/issuance
-tests (§11.7). `matmul_block_capacity_tests` includes 6 weight/sigops/size
+spacing tests (§5.4). `matmul_dgw_tests` includes 5 legacy
+`ExpectedDgwTimespan` tests (§11.7; the function is KAWPOW-era only) plus the
+genesis-`nBits`/ASERT suite. `matmul_subsidy_tests` includes 7
+subsidy/issuance tests (§11.7). `matmul_block_capacity_tests` includes 6 weight/sigops/size
 validation tests (§5.4, §14.7).
 
 ### 16.2 Functional Tests (Python)
@@ -4760,13 +4927,13 @@ bash scripts/matmul_pow_readiness.sh
 - [x] Genesis difficulty prevents ultra-fast early emission (M8)
 - [x] Dimension bounds enforced before any computation (M7)
 - [x] Cross-platform determinism verified (x86 + ARM same results) (M4)
-- [x] `GetTargetSpacing(height)` returns 0.25 for h < 50,000 and 90.0 for h ≥ 50,000 (§5.1, §11.5)
-- [x] `GetBlockSubsidy(height)` returns 20 * COIN for h < 525,000, halves correctly (§11.4)
+- [x] `GetTargetSpacing(height)` returns 600.0 at every height on mainnet (90.0 on regtest); `nFastMineHeight == 0` (§5.1, §11.5)
+- [x] `GetBlockSubsidy(height)` returns 50 * COIN for h < 210,000, halves correctly (§11.4)
 - [x] `MoneyRange()` rejects amounts > 21,000,000 * COIN (§11.4.3)
-- [x] Coinbase output ≤ `GetBlockSubsidy(height) + fees` enforced in `ConnectBlock` (§11.4.3)
-- [x] Cumulative issuance across all halvings ≤ 21,000,000 QTC (§11.4.2)
-- [x] DGW uses `ExpectedDgwTimespan(height)` not fixed `nPowTargetSpacing * 180` (§11.6)
-- [x] MTP and future-time-limit rules unchanged during fast phase (§11.5.1)
+- [x] Coinbase output ≤ `GetBlockSubsidyForBlock(height) + fees` enforced in `ConnectBlock`; block 1 on mainnet must carry the 2,000,000 QTC treasury output (§11.4.3, §11.4.4)
+- [x] Cumulative mined issuance across all halvings ≤ 21,000,000 QTC; total issuance 23,000,000 QTC on mainnet (§11.4.2)
+- [x] Legacy `ExpectedDgwTimespan(height)` sums `GetTargetSpacing()`, not a fixed `nPowTargetSpacing * 180` (§11.6)
+- [x] MTP, future-time-limit and `nMatMulMaxFutureMtpDrift` rules apply from genesis (§11.5.1)
 - [x] `GetBlockWeight(block) <= nMaxBlockWeight` enforced in ContextualCheckBlock (§14.2)
 - [x] `GetBlockSigOpsCost(block) <= nMaxBlockSigOpsCost` enforced (§14.2)
 - [x] `GetSerializeSize(block) <= nMaxBlockSerializedSize` enforced (§14.2)
@@ -4856,23 +5023,24 @@ following hold. References point to the authoritative section for each.
 | Invariant | Reference |
 |-----------|-----------|
 | `nMaxMoney = 21,000,000 * COIN`. No transaction output, UTXO value, or coinbase may exceed this. | §5.1, §11.4.3 |
-| `nInitialSubsidy = 20 * COIN`. `nSubsidyHalvingInterval = 525,000`. The identity `20 × 525,000 × 2 = 21,000,000` holds. | §5.1, §5.3 |
+| `nInitialSubsidy = 50 * COIN`. `nSubsidyHalvingInterval = 210,000` (150 on regtest). The identity `50 × 210,000 × 2 = 21,000,000` holds. | §5.1, §5.3 |
 | `GetBlockSubsidy(h) = nInitialSubsidy >> (h / nSubsidyHalvingInterval)`. Returns 0 when halvings ≥ 64. | §11.4.1 |
-| Coinbase output value ≤ `GetBlockSubsidy(height) + total_fees`. Enforced in `ConnectBlock()`. | §11.4.3 |
+| `GetBlockSubsidyForBlock(h) = GetBlockSubsidy(h) + nTreasuryPremineAmount` iff `TreasuryPremineActiveAt(h)`; mainnet: h = 1, 2,000,000 QTC, exactly one output to `treasuryPremineScript` (`bad-cb-treasury-premine` otherwise). | §11.4.4 |
+| Coinbase output value ≤ `GetBlockSubsidyForBlock(height) + total_fees`. Enforced in `ConnectBlock()`. | §11.4.3 |
 | `MoneyRange(v)` returns true iff `0 ≤ v ≤ nMaxMoney`. Applied to all CTxOut values. | §11.4.3 |
-| Cumulative `Σ GetBlockSubsidy(h)` for all h converges to ≤ `nMaxMoney` (within integer truncation). | §11.4.2 |
+| Cumulative `Σ GetBlockSubsidy(h)` for all h converges to ≤ `nMaxMoney` (within integer truncation); total mainnet issuance is `nMaxMoney + nTreasuryPremineAmount` = 23,000,000 QTC. | §11.4.2 |
 
 #### 17.5.7 Target Spacing Schedule
 
 | Invariant | Reference |
 |-----------|-----------|
-| `GetTargetSpacing(h) = 0.25` for h < 50,000; `= 90.0` for h ≥ 50,000. This is a consensus function (returns `double`). | §5.1, §11.5 |
-| `nPowTargetSpacingFastMs = 250`, `nPowTargetSpacingNormal = 90`, `nFastMineHeight = 50,000`, `nFastMineDifficultyScale = 6` (mainnet). | §5.3 |
-| DGW uses `ExpectedDgwTimespan(h) = Σ_{k=1..180} GetTargetSpacing(h-k)`, NOT a fixed constant. | §11.6 |
-| At steady state (h ≥ 50,180): `ExpectedDgwTimespan = 180 × 90 = 16,200s`. | §11.6.2 |
-| During fast phase (h < 50,000): `ExpectedDgwTimespan = (180 × 250) / 1000 = 45s`. | §11.6.2 |
-| The fast-mining phase does NOT change the halving schedule. Halving is by block height, not time. | §11.5 |
-| MTP and future-time-limit rules are unchanged during fast phase. Multiple consecutive blocks may share the same `nTime`. | §11.5.1 |
+| `GetTargetSpacing(h) = 600.0` for every h ≥ 0 on mainnet/testnet/signet (`90.0` on regtest). This is a consensus function (returns `double`). | §5.1, §11.5 |
+| `nPowTargetSpacing = nPowTargetSpacingNormal = 600`, `nFastMineHeight = 0`, `nMatMulAsertHeight = 0` (mainnet/testnet/signet). `nPowTargetSpacingFastMs = 250` and `nFastMineDifficultyScale = 6` are present but inert. | §5.3 |
+| `nMatMulAsertHalfLife = 172,800 s` (14,400 s on regtest); `nMatMulAsertBootstrapFactor = 1`; no retune / half-life-upgrade heights. | §11.1, §11.6 |
+| `nMatMulMaxFutureMtpDrift = 43,200 s` (= half-life / 4) from genesis. | §11.5.1 |
+| Legacy `ExpectedDgwTimespan(h) = Σ_{k=1..180} GetTargetSpacing(h-k)` = 180 × 600 = 108,000 s on mainnet at every h; NOT used for MatMul retargeting. | §11.6, §11.7 |
+| No fast-mining phase exists on any shipped network; the halving schedule is by block height (210,000), not time. | §11.5 |
+| MTP and future-time-limit rules are Bitcoin's; consecutive blocks may share the same `nTime`. | §11.5.1 |
 
 #### 17.5.8 Block Capacity (Weight-Based)
 
@@ -4890,8 +5058,8 @@ following hold. References point to the authoritative section for each.
 | Invariant | Reference |
 |-----------|-----------|
 | Phase 1 MUST be applied immediately to every block at all heights (no deferral). | §10.3.1 |
-| Phase 2 MAY be deferred during fast phase (h < 50,000) via a bounded queue. | §10.3.1 |
-| After transition to 90s blocks, the Phase 2 queue MUST drain and restore tip-tracking behavior. | §10.3.1 |
+| Phase 2 MAY be deferred during a fast phase (h < `nFastMineHeight`) via a bounded queue. Not applicable on shipped networks (`nFastMineHeight = 0`). | §10.3.1 |
+| After transition to normal-spacing blocks, the Phase 2 queue MUST drain and restore tip-tracking behavior. | §10.3.1 |
 | A deferred Phase 2 failure triggers the same graduated punishment as a real-time failure. | §10.3.1, §10.2 |
 
 > **Audit instruction**: An independent auditor should verify each row in the
@@ -4931,7 +5099,7 @@ following hold. References point to the authoritative section for each.
 | Dependency | Status | Notes |
 |------------|--------|-------|
 | SHA-256 / SHA-256d (`hash.h`, `CSHA256`, `CHash256`) | Stable | Oracle derivation (single SHA-256) and transcript digest (SHA-256d) |
-| ASERT difficulty | Stable | Stateless exponential retargeting from block 50,000 |
+| ASERT difficulty | Stable | Stateless exponential retargeting from genesis (half-life 172,800 s) |
 | Boost Test | Stable | Unit tests |
 | Python functional framework | Stable | Integration tests |
 | CMake 3.22+ / C++20 | Stable | Build system |
@@ -5012,7 +5180,7 @@ cryptographic impossibility:
 | **M31** | Mersenne prime 2^31 − 1 = 2,147,483,647; the consensus field modulus |
 | **σ** | Random oracle seed derived from block header (excludes matmul_digest) |
 | **z** | Transcript hash (= matmul_digest); the PoW output compared to target |
-| **ASERT** | Absolutely Scheduled Exponentially Rising Targets — stateless per-block difficulty adjustment (3600s half-life from block 50,000) |
+| **ASERT** | Absolutely Scheduled Exponentially Rising Targets — stateless per-block difficulty adjustment (172,800 s half-life, anchored at genesis; 14,400 s on regtest) |
 | **Phase 1** | Cheap header validation (microseconds); gates Phase 2 |
 | **Phase 2** | Expensive transcript recomputation (O(n³)); only after Phase 1 passes |
 | **v** | Compression vector — b² pseudorandom field elements derived from σ; used for inner-product compression of intermediates (Section 8.3.1) |
@@ -6051,8 +6219,9 @@ Tier 0 and Tier 1 nodes can use the GPU for Phase 2 verification:
 
 The kernel is identical for mining and verification. Mining loops over nonces;
 verification runs once. GPU verification of one block at n=512 takes the same
-50–200 ms as one mining attempt — feasible for both 0.25-second fast-phase
-and 90-second steady-state blocks.
+50–200 ms as one mining attempt — trivially feasible at 600-second blocks
+(and would remain feasible even at a 0.25-second fast phase, which no shipped
+network has).
 
 ---
 
@@ -6345,12 +6514,15 @@ QTC consensus and wallet policy now assume a P2MR-only transaction profile:
 4. Address encoding uses Bech32m witness v2 (`qtc1z...` on mainnet).
 5. `getblocktemplate` includes PQ metadata (`pq_info`) alongside MatMul fields.
 
-Block-capacity and timing parameters for QTC are:
-- Target spacing: 90 seconds (`nPowTargetSpacingNormal=90`)
+Block-capacity, timing and monetary parameters for QTC are:
+- Target spacing: 600 seconds (`nPowTargetSpacing = nPowTargetSpacingNormal = 600`; 90 on regtest); no fast-mining phase (`nFastMineHeight = 0`)
+- Difficulty: ASERT from genesis, half-life 172,800 s, floor `0x1e011da5`
+- Subsidy: 50 QTC, halving every 210,000 blocks (150 on regtest); 21,000,000 QTC mined
+- Treasury allocation: 2,000,000 QTC minted once in mainnet block 1; total supply 23,000,000 QTC
 - Consensus max serialized block size: 24,000,000 bytes
 - Consensus max weight: 24,000,000 WU
 - Consensus max sigops cost: 480,000
 
-*Document version: 4.2.0*
-*Last updated: 2026-02-12*
+*Document version: 4.3.0*
+*Last updated: 2026-10-12 (monetary/schedule parameters reconciled with shipped chainparams, §1.3.1)*
 *Authors: QTC Core Contributors*
