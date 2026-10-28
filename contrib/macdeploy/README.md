@@ -75,3 +75,9 @@ for the build process to remain somewhat deterministic. Here's how it works:
   included script. Detached signatures are available from this [repository](https://github.com/bitcoin-core/bitcoin-detached-sigs).
 - Builders feed the unsigned app + detached signature back into Guix, which combines the
   pieces into a deterministic ZIP.
+
+## Verifying a published macOS release
+
+`verify-macos-release.sh` checks the Apple code signature, notarization and (with `--sums`) the SHA-256 of a QTC
+`.dmg`, `-signed.zip` or `-signed.tar.gz`, or of an unpacked directory, without executing anything from it. See
+[`doc/macos-release-verification.md`](/doc/macos-release-verification.md).
