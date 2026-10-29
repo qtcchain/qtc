@@ -65,9 +65,11 @@ gpg --import qtc-release-signing.asc
 gpg --fingerprint release@qtc.gold
 #   72DD 01B8 E4BD 52FF BE1D  6576 1E28 9F6E CD6C BF30
 
-# 2. Verify the list, then the archive you downloaded
+# 2. Verify the list, then the archive you downloaded. The list names each file under its build
+#    directory, so strip that prefix; the line for your file must print OK.
 gpg --verify SHA256SUMS.asc SHA256SUMS
-sha256sum -c --ignore-missing SHA256SUMS
+sed 's#  [^/]*/#  #' SHA256SUMS | sha256sum -c --ignore-missing          # Linux
+sed 's#  [^/]*/#  #' SHA256SUMS | shasum -a 256 -c --ignore-missing      # macOS (its own sha256sum checks nothing)
 
 # 3. Unpack
 tar -xzf qtc-<version>-x86_64-linux-gnu.tar.gz
@@ -76,6 +78,11 @@ tar -xzf qtc-<version>-x86_64-linux-gnu.tar.gz
 
 `contrib/verify-binaries/verify.py` automates steps 1–2. Do not run a binary whose checksum is not in a list you
 verified yourself; the key fingerprint is published on two independent domains for that reason.
+
+On macOS the `.dmg` is signed with an Apple Developer ID and notarized; `contrib/macdeploy/verify-macos-release.sh`
+checks that signature and what is inside the image without running it, and
+[`doc/macos-release-verification.md`](doc/macos-release-verification.md) explains each check, including the ones
+(`spctl -t exec`, `stapler validate` on a bare executable) that cannot pass for command-line tools.
 
 ## Run a node
 
