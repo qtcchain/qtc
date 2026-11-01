@@ -109,10 +109,11 @@ ParityQuote v1
 `floor_wei_per_gas = eth_fee_gwei_e6 × 10^3 × eth_usd_e6 / qtc_usd_e6`
 (gwei of QTC = gwei of ETH × ETH/USD ÷ QTC/USD; a gwei is 10⁹ wei).
 
-Worked example, 26 October 2026 23:21 UTC: Ethereum base fee 0.045 gwei plus median tip 0.012 gwei
-= 0.057 gwei; ETH/USD 2,309; QTC/USD 31.30 (qtc.markets adjusted price for 26 October 2026, subject
-to the latest market price). Floor = 0.057 × 2,309 / 31.30 = **4.2 gwei of QTC** per gas. An ERC-20
-transfer (65,000 gas) then costs 0.000273 QTC ≈ US$0.0086 on both chains. The QTC side of every
+Worked example, 1 November 2026 00:08 UTC: Ethereum median base fee 0.034 gwei plus median tip
+0.005 gwei over the last 100 blocks = 0.039 gwei; ETH/USD 2,253; QTC/USD 32.77 (qtc.markets adjusted
+price for 31 October 2026, subject to the latest market price). Floor = 0.039 × 2,253 / 32.77 =
+**2.7 gwei of QTC** per gas. An ERC-20 transfer (65,000 gas) then costs 0.000176 QTC ≈ US$0.0058 on
+both chains. The QTC side of every
 figure in this section moves with the QTC price; the dollar side is Ethereum's.
 
 #### 5.1.2 Bounds every verifier checks (section 9.2 item 8)
@@ -145,7 +146,7 @@ Until `ParityQuote` is implemented in the batcher, the engine and the verifier, 
 `BASE_FEE_FLOOR_STATIC`, a chain parameter in the verifier bundle, computed with the formula of
 5.1.1 at release time and stated in the release notes with its inputs and timestamp. Changing it is
 a planned upgrade at an L1 height (`FEE_FLOOR_ACTIVATION_HEIGHT`), testnet first. Value proposed for
-the first activation: 4.2 gwei of QTC (inputs above), to be recomputed from the latest market price
+the first activation: 2.7 gwei of QTC (inputs above), to be recomputed from the latest market price
 on the day the activation height is set.
 
 #### 5.1.5 What this policy does and does not do
@@ -567,7 +568,7 @@ parameter, not a constant, so it can be re-tuned by a planned upgrade.
 | `FORCED_TX_BOND` | 100,000 sats | Pays L2 gas for a forced transaction |
 | `MLDSA44_VERIFY_GAS` | 8,000 (provisional) | Calibrated on testnet |
 | `FEE_FLOOR_POLICY` | `eth-parity-v1` (owner decision 26 Oct 2026) | Section 5.1; static interim until the quote path ships |
-| `BASE_FEE_FLOOR_STATIC` | 4.2 gwei of QTC (26 Oct 2026 inputs, QTC US$31.30) | Re-set at each release from the parity formula at the latest market price |
+| `BASE_FEE_FLOOR_STATIC` | 2.7 gwei of QTC (31 Oct 2026 inputs, QTC US$32.77) | Re-set at each release from the parity formula at the latest market price |
 | `ETH_FEE_WINDOW` | 100 Ethereum blocks (≈ 20 min) | Median of base fee + median tip |
 | `PRICE_MIN_SOURCES` | 2 | Independent ETH/USD and QTC/USD sources |
 | `QUOTE_MAX_AGE` | 3,600 s | Older quote halts derivation rather than guessing |
