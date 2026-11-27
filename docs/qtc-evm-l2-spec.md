@@ -30,6 +30,9 @@ plug into), cross-rollup messaging, MEV auctions, shared sequencing.
   the QTC-EVM chain without talking to the sequencer, the federation or any committee.
 - **Fail closed.** When data is missing or an anchor is malformed, derivation halts at the last
   good batch; it never guesses.
+- **Trust is stated, not implied.** At v1 the federation holds the reserve and decides when a
+  withdrawal is paid. Until the exit milestones of section 10.5 are met, QTC-EVM is a federated
+  bridge with explicit custody and withdrawal-liveness risk and is described as one.
 - **Reorg handling is keyed by block hash, never by height** (the lesson of the September ASERT
   verifier incident).
 
@@ -58,7 +61,7 @@ be revisited when mainnet hashrate changes by an order of magnitude.
 |---|---|---|
 | Sequencer | Liveness only | Orders L2 transactions, produces L2 blocks every `L2_BLOCK_TIME`, gives soft confirmations |
 | Batcher | Liveness only | Compresses L2 blocks into batches, posts data and anchors to QTC |
-| Federation (attestors, M-of-N) | Custody of locked QTC; correctness of withdrawals until proofs exist | Signs epoch statements and withdrawal batches with ML-DSA-44; rotates via `BridgeVerifierSetCommitment` |
+| Federation (attestors, M-of-N) | Custody of locked QTC; correctness and liveness of withdrawals until proofs and enforced exits exist (section 10.5) | Signs epoch statements and withdrawal batches with ML-DSA-44; rotates via `BridgeVerifierSetCommitment` |
 | Derivation node | None | Reads QTC, reconstructs the L2 chain, drives an execution engine |
 | Execution engine | None | Unmodified EVM (reth fork `qtc-reth`) behind the Engine API |
 | Data-availability committee (interim only) | Availability only | Stores batch data and signs availability certificates while witness-space DA is not yet used |
@@ -254,8 +257,9 @@ federation cannot alter it after committing. 4. The release is `round-down` to w
 What CTV gives at launch, stated plainly: once the federation has committed a withdrawal batch,
 its execution is permissionless and censorship-proof. What it does not give: forcing the
 federation to commit in the first place. That requires roadmap Stage C (`OP_CHECKANCHORPROOF`)
-and is tracked in section 15. Watchers alert when a finalized batch has withdrawals and no
-commitment output appears within `WITHDRAWAL_SLA` blocks.
+and is tracked in sections 10.5 and 15. Watchers alert when a finalized batch has withdrawals
+and no commitment output appears within `WITHDRAWAL_SLA` blocks. The alert is not a deadline:
+nothing on chain follows from it.
 
 ### 10.4 Invariants (checked continuously by watchers)
 
@@ -263,6 +267,129 @@ commitment output appears within `WITHDRAWAL_SLA` blocks.
 - Every `Deposit` event matches exactly one inbox UTXO; every inbox UTXO with `SAFE_DEPTH` has a
   `Deposit` within `INBOX_DEADLINE`.
 - Every finalized `Withdrawal` appears in exactly one committed withdrawal batch.
+
+### 10.5 Custody, withdrawal liveness and the exit milestones
+
+Added 2026-11-26 after a review of the trust the withdrawal path places in the federation. It
+restates limits that sections 10.3 and 14 already admit, makes the public description of the
+system normative, and fixes what has to be shown, publicly, before that description may change.
+
+**What v1 guarantees, mechanism by mechanism.**
+
+| Mechanism | Guarantees | Does not guarantee |
+|---|---|---|
+| Depositor refund leaf (8.4, 10.2) | A deposit that is never credited returns to the depositor after `DEPOSIT_TIMEOUT`, with nobody's cooperation | Anything once the deposit is credited and swept into the reserve |
+| Forced inclusion (7, 9.2 item 6) | An inbox transaction, a call to `L2Bridge.withdraw` included, is in a batch by the deadline or every derivation node rejects the sequencer's batches | That batches are posted at all: a sequencer that stops halts the chain. Any movement of reserve funds on QTC. A forced `withdraw` burns the L2 balance and leaves a claim that only the federation can pay |
+| CTV commitment (10.3) | Once a withdrawal batch is committed, anyone can execute it and the federation cannot alter it | That the commitment is ever created |
+| `WITHDRAWAL_SLA` watcher (10.3, 13) | A public alert when a finalized batch has withdrawals and no commitment 36 QTC blocks after finality | Any consequence on chain. It is an alarm, not a deadline, and no recovery path opens when it fires |
+| Derivation nodes and watchers (9, 10.4) | Detection: an invalid batch, a wrong withdrawal template or a broken invariant stops honest nodes and raises alerts | Prevention: a federation quorum can still sign a release that the L2 state does not justify |
+| Registry recovery leaf (8.3, leaf C) | The federation can recover the registry after a timeout | Anything for users |
+
+**Residual trust at v1.** Three things rest on named parties and on nothing else:
+
+1. *Custody.* A quorum of the federation controls the reserve. It can release funds the L2
+   state does not justify. The loss is bounded only by the size of the reserve.
+2. *Withdrawal liveness.* A quorum can withhold the commitment of section 10.3 indefinitely.
+   Nothing at protocol level forces the commitment or replaces the federation in creating it.
+3. *Sequencing liveness.* One sequencer posts batches. If it stops, no L2 transaction is
+   processed, a `withdraw` included. Forced inclusion makes a censoring batch invalid; it does
+   not produce a batch.
+
+**Description (normative).** Until the four exit milestones below are met and their evidence is
+published, QTC-EVM is a **federated bridge with explicit custody and withdrawal-liveness risk**.
+Specifications, papers, websites, wallet text and announcements produced by the project MUST use
+that description or one that names both risks, and MUST NOT call bridged funds trustless,
+non-custodial or self-custodial, nor say they can be recovered without the federation or the
+operator, nor that users have a unilateral exit. Phases 3 and 4 of section 18 ship under this
+description. The architecture is a route to reducing the trust; a roadmap is not the guarantee.
+
+**Exit milestones.** The description may change only when all four hold, each with evidence
+anyone can check.
+
+**E1. Enforced unilateral exits.** Roadmap Stage C (`OP_CHECKANCHORPROOF`, section 15) is
+active on QTC mainnet, the reserve sits under an exit leaf, and an addendum to this
+specification is published with the code. The roadmap describes Stage C for attested ledgers in
+general. For QTC-EVM the addendum MUST settle five points that design leaves open:
+
+- *What an exit authenticates against.* Inside `verification_root` an anchor commits two
+  roots: `post_state`, an EVM state root that QTC script cannot open, and `withdrawal_root`, a
+  plain Merkle tree of the withdrawals recorded in the batch. An exit can therefore cover a
+  withdrawal already recorded in an anchored batch. It cannot cover a balance that was never
+  withdrawn, and once the sequencer has stopped no new `withdraw` can be recorded. Either the
+  anchor gains an exit root over balances, or batches that contain only inbox transactions
+  become postable by anyone after a sequencer timeout. The choice defines *eligible funds*.
+  Value held inside a contract is eligible only through what that contract lets its users
+  withdraw.
+- *Who vouches for the root.* After Stage B, QTC validates an anchor's structure and
+  continuity, not its contents, and an anchor is posted with the batcher's key alone (8.3,
+  leaf B). An exit leaf that trusted any matured anchor would let the holder of that key anchor
+  a fabricated root and empty the reserve. Exits must rest on a stated assumption: a federation
+  attestation of each anchored root (a later refusal then cannot block exits against roots
+  already attested), a challenge window with fraud proofs, or validity proofs (Stage D). The
+  addendum names the one chosen and what stays trusted under it.
+- *Value limits enforced by consensus.* An exit pays exactly the proven amount and returns the
+  rest of the reserve output to the reserve script, and each leaf exits once.
+- *Time bounds.* Anchor maturity, the minimum age of the anchor exited against, the challenge
+  window, and the worst-case time from a user's first action to funds on QTC.
+- *Migration.* Existing reserve outputs move under the exit leaf. That move needs the
+  federation once, and it is complete and checkable on chain before E2 is attempted.
+
+Evidence: the activation height, the consensus code and tests in `qtcchain/qtc`, the addendum,
+and the reserve outputs' scripts on chain.
+
+**E2. An independently reproduced recovery drill.** On the public testnet first, then on
+mainnet with real value. From a published QTC height the sequencer and batcher are stopped and
+the federation signs nothing and commits nothing. A person with no affiliation to the project,
+using only published software and instructions, recovers eligible funds to a QTC wallet they
+control. Evidence: the start height, their transaction ids, the instructions, and a second
+unaffiliated party repeating them.
+
+**E3. Independent data recovery.** A fresh derivation node, given this specification, a QTC
+node and the published chain parameters, reconstructs the L2 state and the exit proofs with
+every project server unreachable. That requires: all batch data in witness-space carriers on
+QTC for the whole history (8.2); the parameters (genesis, registry start, key schedule,
+descriptors) published with a hash that is itself on QTC; a derivation mode that refuses the
+data-availability fallback and reports, per batch, where its data came from; a tool that
+outputs the exit proof for an account; and a stated bound on the time a full reconstruction
+takes on stated hardware. Evidence: a third party's
+run log, a head equal to the other verifiers', and the proofs used in E2. This is the principle
+of section 2 ("the posted data is the chain") shown, not asserted.
+
+**E4. Adversarial testing and external review.** Demonstrated rejection of: an invalid
+withdrawal or exit claim; a second exit, or an exit and a normal withdrawal, for the same leaf;
+an exit against a root that predates the holder's own later spend; exits and federation
+withdrawal batches competing for one reserve output; and each of these across QTC reorgs up to
+`REORG_WINDOW`. An external review covers the exit opcode, the reserve scripts, `L2Bridge`,
+the derivation rules and the federation's signing software. Findings and fixes are published.
+
+**What does not count.** A normal withdrawal demonstration, an audit, and two verifiers with
+matching heads are each useful evidence. None of them, alone or together, shows recovery while
+the federation refuses.
+
+**Status on 2026-11-26.**
+
+| Milestone | Status |
+|---|---|
+| E1 | Not started. Stages B and C are roadmap items with no consensus code. The five points are open |
+| E2 | Not possible by construction. The only unilateral path exercised is the refund of an uncredited deposit, on the devnet |
+| E3 | Not met. The batcher has posted every testnet batch in witness carriers, so the data is on QTC. The verifier has read none of it from there: none of the 5,266 batch derivations in its testnet log took its data from QTC. Carrier assembly rejects a batch that spans more than one carrier, and the fallback store hides the failure. It works on the devnet, where a batch fits one carrier. No fallback-free mode and no exit-proof tool exist, and the time of a full re-derivation is neither bounded nor recently measured |
+| E4 | Partly. Double credit, phantom credit and censorship were drilled on the devnet. The rest of section 17 item 4 is not recorded as run, the testnet bridge has carried no deposit, and no external review has been completed |
+
+Two implementation gaps sit under the table of guarantees above. Forced inclusion covers
+deposits only: the inbox payload's calldata is ignored, so a `withdraw` cannot be forced yet.
+And the witness-carrier defect in the E3 row means that today a derivation node does depend on
+the operator's data store, against the principle of section 2.
+
+**Decisions this section needs from the owner**, in addition to section 19:
+
+1. A cap on the reserve at mainnet launch and the rule for raising it. Under the description
+   above the cap is the bound on what users can lose (proposed: a cap, raised only on evidence).
+2. Publication, before launch, of who the federation is: members, threshold, their
+   independence and how keys are held. The stated risk is a risk in those parties.
+3. Whether pending withdrawals, their age and every `WITHDRAWAL_SLA` breach are shown on a
+   public page, so that withholding is visible to anyone (proposed: yes).
+4. Which answers to the first two points of E1 the project commits to, and whether Stage C is
+   pursued for QTC-EVM at all. If it is not, the description above is permanent and is said so.
 
 ## 11. Post-quantum accounts
 
@@ -331,7 +458,7 @@ parameter, not a constant, so it can be re-tuned by a planned upgrade.
 | Sequencer censors | Forced inclusion; non-compliant batches are invalid under derivation | Chain halts until a compliant batch is posted |
 | Sequencer equivocates (two unsafe chains) | Only anchored batches are canonical; registry UTXO chain prevents two anchors | Users who acted on soft confirmations may see them reverted |
 | Sequencer posts an invalid state root | Every derivation node re-executes; v1 halts, v2 skips via fraud proof | Liveness loss until the operator or federation posts a valid batch |
-| Federation withholds withdrawals | CTV-committed batches are permissionless once committed; watchers alert on SLA | Cannot force commitment before Stage C |
+| Federation withholds withdrawals | CTV-committed batches are permissionless once committed; watchers alert on SLA | Cannot force commitment before Stage C: users who withdrew hold a claim only the federation can pay (section 10.5) |
 | Federation key compromise (classical or quantum) | ML-DSA-44 keys; rotation by `BridgeVerifierSetCommitment`; M-of-N threshold | A quorum compromise can mis-release reserve funds; bounded by reserve size per epoch |
 | L1 reorg | Hash-keyed window, rollback to fork point; deposits credited only at `SAFE_DEPTH`, withdrawals at `FINALITY_DEPTH` | Reorgs deeper than `REORG_WINDOW` halt the chain for manual recovery |
 | Data withholding (DAC interim) | Nodes refuse to advance without data | Halt, not fork; removed entirely by witness-space carriage |
@@ -393,6 +520,11 @@ long-running jobs, per the owner's standing rule.
 | 2 | Public testnet on QTC testnet; DAC interim; forced inclusion; CTV-committed withdrawals | Items 3, 4, 5, 7 green; 30 days without derivation divergence between independent nodes |
 | 3 | Mainnet as a federated rollup; witness-space carriage; watchers and alerting on the fleet | Reserve invariants hold for 30 days; two independent derivation operators |
 | 4 | Fraud proofs; then validity proofs after the Stage D soft fork | Separate specifications |
+
+No phase in this table changes how QTC-EVM is described. Phases 3 and 4 ship as a federated
+bridge with explicit custody and withdrawal-liveness risk. That description changes only when
+the exit milestones E1 to E4 of section 10.5 are met, which needs the roadmap's Stage B and
+Stage C soft forks and is tracked apart from these phases.
 
 ## 19. Decisions required from the owner
 
